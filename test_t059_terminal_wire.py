@@ -84,10 +84,13 @@ class WireTests(unittest.TestCase):
         return P.read_message(out)
 
     def manifest(self):
+        # A synthetic id, not this machine's: the manifest here is a fixture, and an
+        # unpacked extension's real id encodes its load path, so publishing one would
+        # be publishing local configuration that means nothing anywhere else.
         path = os.path.join(self.state, 'host_manifest.json')
         with open(path, 'w', encoding='utf-8') as handle:
             json.dump({'allowed_origins':
-                       ['chrome-extension://idnigcjefglcebmfmahodnhkahlogboe/']},
+                       ['chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/']},
                       handle)
         return path
 

@@ -92,12 +92,31 @@ Get-ChildItem -Filter 'test_*.mjs' | ForEach-Object { node $_.FullName }
 git status --short
 git grep --cached -nIE 'Administrator|[A-Z]:\\Users|gh[pousr]_[A-Za-z0-9]{20,}|BEGIN [A-Z ]*PRIVATE KEY' -- `
   '*.py' '*.mjs' '*.js' '*.json' '*.html' '*.cs' '*.ps1'
+
+# 3. every extension id that appears must be synthetic
+git grep --cached -nIoE 'chrome-extension://[a-p]{32}' -- '*.py' '*.mjs' '*.js' '*.json' '*.html' '*.cs' '*.ps1'
 ```
 
-An empty result from the last command is the gate. It is restricted to source and config
-extensions on purpose: documentation legitimately *describes* the patterns being avoided
-(this file does), and a gate that fires on its own text gets ignored. If it prints
-anything, stop and fix the cause rather than committing around it.
+Command 2 must print nothing. Command 3 must print **only** ids you can justify as
+synthetic — and "synthetic" means self-evidently so: a single repeated letter, or a
+sequence. A real unpacked id looks random precisely because it is a hash of the load path,
+so anything random-looking is a leak.
+
+Why an allowlist by inspection rather than a pattern: Chrome ids are base16 mapped onto
+`a`–`p`, so *every* valid id matches `[a-p]{32}`, real and fake alike. A regex that rejects
+real ids must reject the synthetic ones too, which makes it useless. The check therefore
+prints candidates and a human judges them.
+
+Both patterns exist because both were real leaks in this repository: absolute paths with a
+user name in two host modules, and a genuine unpacked-extension id in
+`test_t059_terminal_wire.py` — which shipped in the first published commit despite a
+report claiming it had been replaced. The report was wrong because the scan it cited did not
+look for ids at all. That is the failure this section is written to prevent: a gate you
+believe in but never actually ran.
+
+The extension list is restricted to source and config on purpose: documentation
+legitimately *describes* the patterns being avoided (this file does), and a gate that fires
+on its own text gets ignored.
 
 Publish with a normal fast-forward push. **Never force-push** and never rewrite a shared
 branch — this repository's history is the record of which rule was wrong and when.
