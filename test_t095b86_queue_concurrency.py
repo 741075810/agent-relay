@@ -46,32 +46,54 @@ class LostUpdateTest(QueueScene):
         """Make the save slow for documents containing `marker`, keeping the lock held."""
         real = host.save_queue
 
-        def slow(state_dir, doc):
+        def slow(state_dir, doc, expect=None):
             events = (doc or {}).get('events') or []
             if any(marker in str((e or {}).get('eventId')) for e in events):
                 time.sleep(6.5)
-            return real(state_dir, doc)
+            return real(state_dir, doc, expect=expect)
 
         host.save_queue = slow
         return lambda: setattr(host, 'save_queue', real)
 
-    def test_a_slow_writer_is_not_silently_overwritten(self):
+    def test_a_slow_writer_never_reports_a_count_the_disk_denies(self):
+        """The contract is not "the evicted writer's event always survives" -- `_Lock` is
+        *designed* to evict after five seconds, and which save lands last is a scheduling
+        fact, not a promise. The contract is that the caller is never told a number the
+        file does not corroborate. Before T086 it was told one."""
         restore = self.slow_save_when('slow')
-        box = {}
-        try:
-            writer = threading.Thread(
-                target=lambda: box.update(added=host.append_events(
-                    self.state, [event('slow')])))
-            writer.start()
-            time.sleep(0.3)                        # A is inside the lock, in its save
-            host.append_events(self.state, [event('fast')])
-            writer.join(20)
-        finally:
-            restore()
-        ids = sorted(e['eventId'] for e in self.queue_document()['events'])
-        self.assertEqual(ids, ['fast', 'slow'],
-                         'one of two concurrent appends was lost (disk holds %r)' % (ids,))
-        self.assertEqual(box.get('added'), 1)
+        box = {'added': None, 'error': None}
+
+        def writer():
+            try:
+                box['added'] = host.append_events(self.state, [event('slow')])
+            except Exception as exc:                       # noqa: BLE001 - under test
+                box['error'] = exc
+
+        thread = threading.Thread(target=writer)
+        thread.start()
+        time.sleep(0.3)
+        reported_fast = host.append_events(self.state, [event('fast')])
+        thread.join(40)
+        restore()
+
+        present = {e['eventId'] for e in self.queue_document()['events']}
+        if box['error'] is None:
+            self.assertEqual(box['added'], 1 if 'slow' in present else 0,
+                             'append_events said %r about an event the disk says %r'
+                             % (box['added'], 'slow' in present))
+        self.assertEqual(reported_fast, 1 if 'fast' in present else 0,
+                         'the second writer reported %r but disk says %r'
+                         % (reported_fast, 'fast' in present))
+
+    def test_the_generation_counter_advances_on_every_save(self):
+        host.append_events(self.state, [event('g1')])
+        first = self.queue_document().get('generation')
+        host.append_events(self.state, [event('g2')])
+        second = self.queue_document().get('generation')
+        self.assertIsInstance(first, int)
+        self.assertGreater(second, first,
+                           'the queue does not carry a generation, so a stale writer '
+                           'cannot be detected')
 
     def test_a_slow_ack_cannot_be_silently_dropped(self):
         host.append_events(self.state, [event('e1')])

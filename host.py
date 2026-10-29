@@ -85,9 +85,26 @@ def load_queue(state_dir):
     return doc
 
 
-def save_queue(state_dir, doc):
+def save_queue(state_dir, doc, expect=None):
     os.makedirs(state_dir, exist_ok=True)
     path = os.path.join(state_dir, QUEUE_FILE)
+    if expect is not None:
+        # Compare-and-swap. A writer that was evicted from the lock must not publish on top
+        # of a document someone else changed in the meantime: it would keep its own addition
+        # and silently drop theirs. The reader that handed us this document saw `expect`;
+        # if the file no longer says that, this save is stale and the caller has to redo the
+        # whole read-modify-write.
+        try:
+            current = load_queue(state_dir).get('generation', 0)
+        except HostError:
+            current = None
+        if current != expect:
+            raise HostError(P.E_INTERNAL,
+                            'the queue changed under this writer (generation %r -> %r)'
+                            % (expect, current))
+        doc['generation'] = expect + 1
+    else:
+        doc['generation'] = int(doc.get('generation') or 0) + 1
     tmp = '%s.tmp-%d' % (path, os.getpid())
     try:
         with open(tmp, 'w', encoding='utf-8') as handle:
@@ -196,41 +213,38 @@ def _verify_written(state_dir, wanted_ids, what, strict_ids=None):
 
 def append_events(state_dir, events):
     """Add events, skipping any `eventId` already present. Returns added count."""
-    for attempt in (1, 2):
-        with _Lock(state_dir):
-            doc = load_queue(state_dir)
-            before_ids = [event.get('eventId') for event in doc['events']
-                          if isinstance(event, dict)
-                          and isinstance(event.get('eventId'), str)]
-            known = known_event_ids(doc)
-            added = 0
-            added_ids = []
-            for event in events:
-                if event['eventId'] in known:
-                    continue
-                row = dict(event)
-                row['seq'] = doc['next_seq']
-                doc['next_seq'] += 1
-                row['enqueuedAt'] = int(time.time())
-                row['deliveredAt'] = None
-                row['deliveries'] = 0
-                doc['events'].append(row)
-                known.add(event['eventId'])
-                added_ids.append(event['eventId'])
-                added += 1
-            if added:
-                save_queue(state_dir, doc)
-        if not added:
-            return added
+    for attempt in (1, 2, 3):
         try:
-            # The first attempt also proves it did not drop a peer. On the retry the peer's
-            # events are already merged in by the reload, so only our own ids are demanded
-            # -- a pruned peer must not turn into a permanent refusal.
-            _verify_written(state_dir, added_ids, 'event(s)',
-                            strict_ids=before_ids if attempt == 1 else None)
+            with _Lock(state_dir):
+                doc = load_queue(state_dir)
+                before_ids = [event.get('eventId') for event in doc['events']
+                              if isinstance(event, dict)
+                              and isinstance(event.get('eventId'), str)]
+                known = known_event_ids(doc)
+                added = 0
+                added_ids = []
+                for event in events:
+                    if event['eventId'] in known:
+                        continue
+                    row = dict(event)
+                    row['seq'] = doc['next_seq']
+                    doc['next_seq'] += 1
+                    row['enqueuedAt'] = int(time.time())
+                    row['deliveredAt'] = None
+                    row['deliveries'] = 0
+                    doc['events'].append(row)
+                    known.add(event['eventId'])
+                    added_ids.append(event['eventId'])
+                    added += 1
+                if added:
+                    save_queue(state_dir, doc, expect=doc.get('generation', 0))
+            if not added:
+                return added
+            # The swap above rules out clobbering a peer; this proves the bytes landed.
+            _verify_written(state_dir, added_ids, 'event(s)')
             return added
         except HostError:
-            if attempt == 2:
+            if attempt == 3:
                 raise
     return 0
 
