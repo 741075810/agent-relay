@@ -274,10 +274,10 @@ def scan_tree(root, explicit=None, walk=False):
     return findings
 
 
-def report(findings, excused, as_json, stale=()):
+def report(findings, excused, as_json, stale=(), partial=False):
     if as_json:
         print(json.dumps({'findings': findings, 'excused': excused,
-                          'stale': list(stale)}, indent=2))
+                          'stale': list(stale), 'partial': partial}, indent=2))
         return
     for item in excused:
         print('  excused  %-28s %s:%d  (%s)'
@@ -290,8 +290,9 @@ def report(findings, excused, as_json, stale=()):
         print('  STALE    %-28s %s  (excuses nothing; remove or update it)'
               % (item['rule'], item['path']))
     print('')
-    print('hygiene: %d unexplained, %d excused with a reason, %d stale'
-          % (len(findings), len(excused), len(stale)))
+    print('hygiene: %d unexplained, %d excused with a reason, %d stale%s'
+          % (len(findings), len(excused), len(stale),
+             '  (staleness not judged on a partial scan)' if partial else ''))
 
 
 # --------------------------------------------------------------------- self-test
@@ -393,8 +394,11 @@ def main(argv=None):
     findings = scan_tree(root, args.paths, walk=args.walk)
     allowlist = load_allowlist(root)
     kept, excused = allowlisted(findings, allowlist)
-    stale = stale_entries(allowlist, findings)
-    report(kept, excused, args.json, stale)
+    # Staleness is a property of the tree, not of this invocation: judging it on a
+    # `--paths` subset would declare every entry for every other file stale.
+    partial = bool(args.paths)
+    stale = [] if partial else stale_entries(allowlist, findings)
+    report(kept, excused, args.json, stale, partial)
     return 1 if (kept or stale) else 0
 
 

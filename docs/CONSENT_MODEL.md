@@ -232,3 +232,49 @@ same act as adopting a new one, and only the first is done silently.
 assertions are load-bearing by reverting each half of the fix in turn and requiring the
 suite to go red — seven mutations, seven red runs. A test that passes with and without the
 fix is a comment.
+
+## Asking why no notice went out
+
+```powershell
+python -B tools/notify_doctor.py            # reads state/, writes nothing
+python -B tools/notify_doctor.py --json
+python -B tools/notify_doctor.py --now 2027-01-15T08:00:00Z
+```
+
+The chain has four stages visible on disk and one that is not:
+
+| stage | file | what it answers |
+|---|---|---|
+| origin | `terminal-origin.json` | has the host read this turn at all |
+| source | `terminal-source.json` | is it still pending, or acked, or dropped at the baseline cap |
+| arm | `terminal-arm.json` | was the extension armed for it, and how long ago |
+| queue | `queue.json` | was it enqueued, was it deliverable, did any consumer take it |
+| — | the extension's LevelDB | **not read**; reported as `extension_store_not_read` |
+
+Findings are graded, and the grade is the point. `blocker` means the chain broke: an armed
+turn with no queue event (`armed_but_not_enqueued`), a deliverable event nobody took
+(`waiting_for_consumer`), an armed window that has already passed over pending turns
+(`arm_stale`), or a snapshot timestamped in the future (`clock_skew`). `expected` means
+silence is correct here: pending turns that arrived after the snapshot
+(`pending_not_armed`), a turn past the baseline cap (`baseline_truncated`), an event marked
+undeliverable (`suppressed_by_gate`), nothing pending and nothing armed
+(`nothing_to_send`). `chain_intact` is true when there is no blocker.
+
+That distinction exists because the first version of the tool reported a just-ended turn —
+pending, and therefore not yet inside any armed snapshot — as a fault. Three quarters of
+its findings would have been normal operation, and a diagnostic that cries wolf at normal
+operation is read once and then ignored, which leaves the operator exactly where they
+started but with a tool they no longer trust.
+
+**Time.** Every numeric timestamp in these artifacts is epoch **seconds**; the extension
+side stores **milliseconds**, and `queue.json` events carry `createdAt` as a 20-character
+ISO-8601 UTC string. `to_ms` normalises by magnitude in one place and records which unit it
+read (`unit_read` in the output). Rendering is UTC+8 computed arithmetically rather than
+from the machine's timezone, because a silent hour of skew and a stalled chain look
+identical at night. `0` is not treated as an instant: "never delivered" is stored as 0, and
+it is 1970 only if you insist.
+
+`test_t095b77_notify_doctor.py` asserts all of it against fabricated fixtures, including
+that the state directory is byte-identical before and after a run and that the output
+contains no identifier.
+

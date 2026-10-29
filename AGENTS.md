@@ -83,6 +83,16 @@ This repository is a **snapshot of source, tests and docs**. It must never conta
 Before any push:
 
 ```powershell
+python -B tools/release_gate.py --clean-clone
+```
+
+That runs the checks below in order and prints one verdict. It also runs in CI on every
+push (`.github/workflows/gate.yml`), so nobody has to remember the sequence.
+`docs/PUBLISHING.md` explains the output and why prose was not enough.
+
+The individual checks, for when the tool itself is what is broken:
+
+```powershell
 # 1. the suites must be green in a clean clone, not just in your working tree
 python -B -m unittest discover -s . -p 'test_*.py'
 $env:PYTHON = (Get-Command python).Source
@@ -90,15 +100,15 @@ Get-ChildItem -Filter 'test_*.mjs' | ForEach-Object { node $_.FullName }
 
 # 2. nothing sensitive, nothing untracked by intent
 git status --short
-git grep --cached -nIE 'Administrator|[A-Z]:\\Users|gh[pousr]_[A-Za-z0-9]{20,}|BEGIN [A-Z ]*PRIVATE KEY' -- `
-  '*.py' '*.mjs' '*.js' '*.json' '*.html' '*.cs' '*.ps1'
+python -B tools/hygiene_scan.py --all       # --self-test proves the rules still fire
+python -B tools/hygiene_scan.py --all --json
 
 # 3. every extension id that appears must be synthetic
 git grep --cached -nIoE 'chrome-extension://[a-p]{32}' -- '*.py' '*.mjs' '*.js' '*.json' '*.html' '*.cs' '*.ps1'
 ```
 
-Command 2 must print nothing. Command 3 must print **only** ids you can justify as
-synthetic — and "synthetic" means self-evidently so: a single repeated letter, or a
+Check 2 must report `0 unexplained, 0 stale`. Check 3 must print **only** ids you can
+justify as synthetic — and "synthetic" means self-evidently so: a single repeated letter, or a
 sequence. A real unpacked id looks random precisely because it is a hash of the load path,
 so anything random-looking is a leak.
 
