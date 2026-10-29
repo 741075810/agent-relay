@@ -163,14 +163,17 @@ def known_event_ids(doc):
                for ident in values})
 
 
-def _verify_written(state_dir, wanted_ids, what):
-    """Did the ids we just wrote survive on disk?
+def _verify_written(state_dir, wanted_ids, what, strict_ids=None):
+    """Did the ids we just wrote survive on disk -- and did we clobber anyone?
 
     `_Lock` breaks its own lock after `timeout_s` so a dead host cannot wedge delivery.
     That trade is right, but it means a *live* holder can be evicted and its save can land
-    on top of someone else's -- so a caller could be told "added" about an event that is
-    not there. Reading back is cheap and turns a silent loss into a retry, and a retry that
-    still fails into a named error. Never into a confident wrong answer.
+    on top of someone else's. Checking only our own ids is not enough: the write that
+    overwrites a peer keeps ours and loses theirs, which is exactly the direction nobody
+    notices. So the events that were already there are checked too.
+
+    Reading back is cheap and turns a silent loss into a retry, and a retry that still
+    fails into a named error. Never into a confident wrong answer.
     """
     document = load_queue(state_dir)
     present = set()
@@ -183,6 +186,12 @@ def _verify_written(state_dir, wanted_ids, what):
                         'the queue did not keep %s %s after writing it; another writer '
                         'evicted the lock and overwrote the file'
                         % (what, ', '.join(missing[:3])))
+    clobbered = [ident for ident in (strict_ids or []) if ident not in present]
+    if clobbered:
+        raise HostError(P.E_INTERNAL,
+                        'writing %s dropped %d event(s) that were already queued (%s): '
+                        'another writer evicted the lock'
+                        % (what, len(clobbered), ', '.join(sorted(clobbered)[:3])))
 
 
 def append_events(state_dir, events):
@@ -190,6 +199,9 @@ def append_events(state_dir, events):
     for attempt in (1, 2):
         with _Lock(state_dir):
             doc = load_queue(state_dir)
+            before_ids = [event.get('eventId') for event in doc['events']
+                          if isinstance(event, dict)
+                          and isinstance(event.get('eventId'), str)]
             known = known_event_ids(doc)
             added = 0
             added_ids = []
@@ -211,7 +223,11 @@ def append_events(state_dir, events):
         if not added:
             return added
         try:
-            _verify_written(state_dir, added_ids, 'event(s)')
+            # The first attempt also proves it did not drop a peer. On the retry the peer's
+            # events are already merged in by the reload, so only our own ids are demanded
+            # -- a pruned peer must not turn into a permanent refusal.
+            _verify_written(state_dir, added_ids, 'event(s)',
+                            strict_ids=before_ids if attempt == 1 else None)
             return added
         except HostError:
             if attempt == 2:
