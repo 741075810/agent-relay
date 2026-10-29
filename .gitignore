@@ -1,0 +1,57 @@
+# Build artefacts, local configuration and runtime state. None of these belong in a
+# repository: they are either machine-specific, regenerable, or contain what this
+# machine actually did.
+
+# --- the launcher binary: built from launcher/HostLauncher.cs ---
+host_launcher.exe
+*.exe
+*.dll
+
+# --- the manifest: machine-specific absolute path plus one extension id ---
+# host_manifest.example.json is the template and IS tracked.
+host_manifest.json
+
+# --- runtime state: run ids, consent decisions, arm snapshots, queues ---
+state/
+*.runs.json
+terminal-source.json
+terminal-arm.json
+queue.json
+*journal*.json
+
+# --- release snapshots are verification artefacts, regenerated per release ---
+release/
+*.SHA256SUMS
+
+# --- local DSH session logs, if anyone points a test at a repo-local copy ---
+sessions/
+*.jsonl
+*.jsonl.zstd
+
+# --- python ---
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# --- node ---
+node_modules/
+npm-debug.log*
+package-lock.json
+
+# --- editors and OS noise ---
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# --- local scratch: probes, diagnostics and backups kept while working ---
+inbox_*
+*.bak
+*.pre-t*
+*.log
+tmp/
+temp/

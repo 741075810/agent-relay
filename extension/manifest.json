@@ -1,0 +1,42 @@
+{
+  "manifest_version": 3,
+  "name": "DSH Notify Bridge (prototype)",
+  "version": "0.1.1",
+  "description": "Receives DSH task-completion notices from a local native host into a background ChatGPT tab. Prototype: simulated data and read-only detection only; it never types or submits.",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "nativeMessaging",
+    "alarms",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["lib/send_adapter.js", "lib/send_gate.js"],
+      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"]
+    }
+  ],
+  "action": {
+    "default_title": "DSH Notify Bridge",
+    "default_popup": "popup.html"
+  }
+}

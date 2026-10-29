@@ -1,0 +1,13 @@
+# Normalise line endings in the repository, not on checkout. Without this, every file
+# shows as modified on a machine whose core.autocrlf differs, which buries the real
+# diff -- and a test suite that must be runnable from a clean clone should not depend
+# on the cloner's git configuration.
+* text=auto eol=lf
+
+# Windows-only build script; keep it LF too, PowerShell accepts both.
+*.ps1 text eol=lf
+
+# Binaries (none are tracked today; this states the intent rather than the fact).
+*.exe binary
+*.dll binary
+*.png  binary

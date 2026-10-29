@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>DSH Notify Bridge (prototype)</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      /* Section accents. The dark overrides below keep the same red hue but
+         lift it enough to stay legible on a dark surface -- a literal dark red
+         on dark would be unreadable, which is the usual way these panels break. */
+      --mod-bg: #fdf2f2;
+      --mod-line: #b91c1c;
+      --mod-title: #8f1414;
+      --mod-no-bg: #b91c1c;
+      --mod-no-fg: #ffffff;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --mod-bg: #2a1516;
+        --mod-line: #ef5350;
+        --mod-title: #ff9d9d;
+        --mod-no-bg: #ef5350;
+        --mod-no-fg: #26090a;
+      }
+    }
+    body { font: 13px/1.5 system-ui, sans-serif; margin: 0; width: 22rem; }
+    header { padding: .6rem .8rem; border-bottom: 1px solid #8884; }
+    h1 { font-size: 13px; margin: 0; font-weight: 600; }
+    .tag { font-size: 11px; padding: 0 .3rem; border-radius: 3px;
+           background: #b7791f; color: #fff; }
+    section { padding: .5rem .8rem; border-bottom: 1px solid #8884; }
+    /* Numbered modules: soft tint, red accent rail on the left. */
+    section.module {
+      margin: .45rem .5rem;
+      padding: .5rem .6rem;
+      background: var(--mod-bg);
+      border-left: 3px solid var(--mod-line);
+      border-bottom: 1px solid #8883;
+      border-radius: 0 4px 4px 0;
+    }
+    .mod-title {
+      display: flex;
+      align-items: baseline;
+      flex-wrap: wrap;
+      gap: .35rem;
+      margin: 0 0 .25rem;
+      font-size: 13px;
+      font-weight: 700;
+      line-height: 1.35;
+      color: var(--mod-title);
+    }
+    .mod-no {
+      flex: none;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: .02em;
+      padding: 0 .3rem;
+      border-radius: 3px;
+      background: var(--mod-no-bg);
+      color: var(--mod-no-fg);
+    }
+    h3.mod-title { font-size: 12px; }
+    /* Top jump bar: wraps inside the 22rem popup width, no layout side effects. */
+    nav.anchors {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .3rem;
+      padding: .45rem .5rem;
+      border-bottom: 1px solid #8884;
+    }
+    nav.anchors a {
+      font-size: 11px;
+      font-weight: 600;
+      line-height: 1.6;
+      padding: 0 .45rem;
+      border: 1px solid var(--mod-line);
+      border-radius: 999px;
+      color: var(--mod-title);
+      text-decoration: none;
+      white-space: nowrap;
+    }
+    nav.anchors a:hover, nav.anchors a:focus-visible {
+      background: var(--mod-bg);
+      text-decoration: underline;
+    }
+    button { font: inherit; padding: .25rem .5rem; margin: 0 .25rem .25rem 0; }
+    pre { margin: .3rem 0 0; white-space: pre-wrap; word-break: break-all;
+          font-size: 11px; max-height: 9rem; overflow: auto; }
+    .ok { color: #2f855a; } .bad { color: #c53030; }
+    @media (prefers-color-scheme: dark) {
+      .ok { color: #68d391; } .bad { color: #fc8181; }
+    }
+    ul { margin: .3rem 0 0; padding-left: 1.1rem; }
+    li { margin: 0 0 .2rem; }
+    .mod-note { color: #888; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>DSH Notify Bridge <span class="tag">prototype</span></h1>
+  </header>
+
+  <!-- Fragment links only: no script, no state, nothing that could fire a
+       message. They exist so a long popup can be navigated without scrolling. -->
+  <nav class="anchors" aria-label="模块跳转">
+    <a href="#sec-t053">T053 目标对话</a>
+    <a href="#sec-t054">T054 dry-run</a>
+    <a href="#sec-t055">T055 手动审阅</a>
+    <a href="#sec-t065">T065 链路自检</a>
+    <a href="#sec-t058">T058/T059 自动通知</a>
+  </nav>
+
+  <section class="module" id="sec-channel">
+    <h2 class="mod-title">通道与队列状态</h2>
+    <div><strong>通道</strong> <span id="host">未连接</span></div>
+    <div><strong>能力</strong> <span id="caps">—</span></div>
+    <div><strong>队列</strong> <span id="queue">—</span></div>
+    <div><strong>最近轮询</strong> <span id="lastPoll">—</span></div>
+    <div><strong>最近错误</strong> <span id="lastError">—</span></div>
+  </section>
+
+  <section>
+    <button id="hello">查询主机</button>
+    <button id="status">查询队列</button>
+    <button id="poll">立即轮询</button>
+    <button id="simulate">注入 1 条模拟</button>
+  </section>
+
+  <section class="module" id="sec-received">
+    <h2 class="mod-title">已接收通知</h2>
+    <div class="mod-note">仅展示，不发送。</div>
+    <ul id="received"><li class="ok">尚无</li></ul>
+  </section>
+
+  <section class="module" id="sec-t053">
+    <h2 class="mod-title"><span class="mod-no">T053</span>ChatGPT 目标对话（只读绑定）</h2>
+    <div class="mod-note">绑定仅记录人工选择的页面，不验证账号；不读正文、不发送、不自动切换目标。</div>
+    <pre id="bindingState">读取绑定状态中…</pre>
+    <button id="bindingScan">扫描并预检所有窗口</button>
+    <div id="bindingCandidates"></div>
+    <div id="bindingConfirmation" hidden>
+      <div>人工确认短语（包括精确 tab/window/URL/conversation）：</div>
+      <pre id="bindingConfirmationPhrase"></pre>
+      <input id="bindingConfirmationInput" type="text" autocomplete="off" spellcheck="false">
+      <button id="bindingConfirm">确认绑定此页面</button>
+      <button id="bindingCancel">取消</button>
+    </div>
+    <button id="bindingHealth">只检查已绑定目标</button>
+    <button id="bindingClear">解除绑定</button>
+    <pre id="bindingHealthResult">—</pre>
+    <pre id="t053BuildStamp">—</pre>
+  </section>
+
+  <section class="module" id="sec-t054">
+    <h2 class="mod-title"><span class="mod-no">T054</span>绑定目标 + 通知提案 dry-run</h2>
+    <div class="mod-note">仅做离线只读判定：不发送、不写页面、不读正文、不触碰队列。
+      判定"允许人工审阅"也不代表获得发送资格。</div>
+    <label>模拟终态事件：
+      <select id="dryRunStatus">
+        <option value="completed">completed</option>
+        <option value="failed">failed</option>
+        <option value="cancelled">cancelled</option>
+      </select>
+    </label>
+    <div>
+      <input id="dryRunRunId" type="text" size="38" autocomplete="off"
+             spellcheck="false" placeholder="runId UUID">
+      <button id="dryRunGenerate">生成模拟 runId</button>
+    </div>
+    <button id="dryRunEvaluate">只读 dry-run 判定</button>
+    <pre id="dryRunResult">—</pre>
+    <div id="dryRunHistoryInfo">—</div>
+  </section>
+
+  <section class="module" id="sec-tabs">
+    <h2 class="mod-title">当前窗口 ChatGPT 标签页（只读）</h2>
+    <div class="mod-note">预检只检查 URL、页面状态和输入框存在性；不识别账号、不读正文、不发送。</div>
+    <pre id="tabs">—</pre>
+    <button id="scan">扫描标签页</button>
+    <button id="readonlyProbe">手动只读预检</button>
+  </section>
+
+  <section class="module" id="sec-t055">
+    <h2 class="mod-title"><span class="mod-no">T055</span>已接收记录 · 手动只读审阅</h2>
+    <div class="mod-note">仅读取本地展示记录，不轮询、不 ACK、不发送。当前来源均未验证，可信真实提案一律阻止。
+      与 T054 本地模拟事件分开；不展示正文，不推断 cancelled/aborted。</div>
+    <button id="receivedReviewList">读取已有记录</button>
+    <select id="receivedReviewChoice" aria-label="选择一条已有通知" disabled>
+      <option value="">请先读取，再人工选择</option>
+    </select>
+    <pre id="receivedReviewMetadata">尚未选择；createdAt 是源创建/启动时间，不是结束时间。</pre>
+    <button id="receivedReviewEvaluate" disabled>只读评估所选记录</button>
+    <pre id="receivedReviewResult">尚未评估；来源缺失时 fail-closed。</pre>
+  </section>
+
+  <section class="module" id="sec-t065">
+    <h2 class="mod-title"><span class="mod-no">T065</span>自动回传链路自检（只读）</h2>
+    <div class="mod-note">只读取本机状态与 Host 应答，用于回答"链路走到哪一步"。
+      不轮询、不 ACK、不产生候选、不写页面、不激活标签、不发消息。
+      下面四层是分开的：<strong>Host 在线</strong>、<strong>终态源就绪</strong>、
+      <strong>授权开着</strong>，都不等于<strong>真的发送成功</strong>。</div>
+    <button id="chainSelfCheck">运行链路自检</button>
+    <pre id="chainVerdict">尚未运行。</pre>
+    <pre id="chainDetail">—</pre>
+  </section>
+
+  <section class="module" id="sec-t058">
+    <h2 class="mod-title"><span class="mod-no">T058/T059</span>自动通知 · 一次授权</h2>
+    <div class="mod-note">先在 T053 完成绑定，再在这里授权一次。授权只改变“是否需要逐条输入 SEND”，
+      不影响只读通知；只读记录永远不会变成可发送候选。授权有期限和条数上限，
+      任何一次结果不确定都会立刻自动停用。</div>
+    <pre id="notifyAuthState">尚未读取</pre>
+    <div id="notifyAuthPhrase">—</div>
+    <label class="mod-note" for="notifyAuthMode">投递模式：</label>
+    <select id="notifyAuthMode">
+      <option value="foreground" selected>前台 — 仅当该标签可见且在前台（默认，和以前一样）</option>
+      <option value="background">后台 — 你切到别的标签/程序后仍然投递（需要另一句短语）</option>
+    </select>
+    <div class="mod-note">后台模式不会切换窗口、不会激活标签、不会新开对话；只往已绑定的那个标签写一条固定短语。
+      标签被 Chrome 冻结/丢弃、浏览器已关闭、页面拒绝程序化提交时，它只记原因并等待，不会假装成功。
+      想让它自动触发，**还需要下一节的 T059 终态触发也打开**——两个开关互不代替。</div>
+    <input id="notifyAuthConfirmation" type="text" autocomplete="off"
+           placeholder="先读取状态，再照抄上面的短语" />
+    <button id="notifyAuthRefresh">刷新自动发送状态</button>
+    <button id="notifyAuthArm" disabled>一次授权并启用</button>
+    <button id="notifyAuthDisarm" disabled>立即停用</button>
+    <pre id="notifyAuthResult">尚未操作</pre>
+    <hr />
+    <h3 class="mod-title"><span class="mod-no">T059</span>任务终态触发（默认关闭，独立开关）</h3>
+    <div class="mod-note">只接受终态完成事件，固定短语加任务 ID，不带正文。内置最小间隔与每小时上限；
+      同一任务不会重复发送。触发只排队候选，不跳过任何页面检查。</div>
+    <pre id="terminalTriggerState">尚未读取</pre>
+    <div id="terminalTriggerPhrase">—</div>
+    <input id="terminalTriggerConfirmation" type="text" autocomplete="off"
+           placeholder="先读取状态，再照抄上面的短语" />
+    <button id="terminalTriggerArm" disabled>启用终态触发</button>
+    <button id="terminalTriggerDisarm" disabled>停用终态触发</button>
+    <pre id="terminalTriggerResult">尚未操作</pre>
+    <hr />
+    <h3 class="mod-title"><span class="mod-no">T067</span>直发任务：逐条选择通知</h3>
+    <div class="mod-note">经 Bridge 发起的任务（ChatGPT 让你做的）默认每条终态都通知；
+      <strong>在 DSH Desktop 里自己开的任务默认不通知</strong>，要在这里逐条点“通知”才算数。
+      同一任务只会通知一次，A/B 两条路共用同一份去重记录。点“通知”不会立刻发送：
+      只是让它在下一轮检查时通过准入，原有的间隔、每小时上限、页面检查和授权仍然全部生效。</div>
+    <pre id="directOptInState">尚未读取</pre>
+    <select id="directOptInChoice" aria-label="选择一条直发任务" disabled>
+      <option value="">请先刷新，再人工选择</option>
+    </select>
+    <button id="directOptInRefresh">刷新直发任务列表</button>
+    <button id="directOptInArm" disabled>通知所选这一条</button>
+    <pre id="directOptInResult">尚未操作</pre>
+    <hr />
+    <h3 class="mod-title"><span class="mod-no">T068</span>正在运行的任务：结束前就能决定</h3>
+    <div class="mod-note">上面那一栏只有任务<em>结束以后</em>才列得出来，长任务就来不及了。
+      这一栏列出 DSH 自己记录为<strong>正在运行</strong>、且不是经 Bridge 派发的任务。
+      在这里点“结束后通知”，任务还在跑的时候就已经记下选择；它结束时才会尝试发送，
+      30 分钟、几小时的长任务都不会掉。撤销同样随时可以。
+      仍然默认不通知；点选不会立刻发送，间隔、每小时上限、页面检查和授权照旧生效。</div>
+    <pre id="runningState">尚未读取</pre>
+    <select id="runningChoice" aria-label="选择一个正在运行的任务" disabled>
+      <option value="">请先刷新，再人工选择</option>
+    </select>
+    <button id="runningRefresh">刷新正在运行的任务</button>
+    <button id="runningArm" disabled>结束后通知这一条</button>
+    <button id="runningRevoke" disabled>撤销这一条的选择</button>
+    <pre id="runningResult">尚未操作</pre>
+  </section>
+
+  <script src="popup.js"></script>
+</body>
+</html>

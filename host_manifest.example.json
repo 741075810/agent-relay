@@ -1,0 +1,9 @@
+{
+  "name": "com.dsh.notify",
+  "description": "T044 prototype: DSH task-completion notices for the DSH Notify Bridge extension.",
+  "path": "PLACEHOLDER_ABSOLUTE_PATH_TO\\host_launcher.exe",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://EXTENSION_ID_HERE/"
+  ]
+}
