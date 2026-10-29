@@ -206,12 +206,7 @@ def load_arm(state_dir):
 
 
 def save_arm(state_dir, doc):
-    path = _arm_path(state_dir)
-    tmp = path + '.tmp'
-    os.makedirs(state_dir, exist_ok=True)
-    with open(tmp, 'w', encoding='utf-8') as handle:
-        json.dump(doc, handle, ensure_ascii=False, sort_keys=True)
-    os.replace(tmp, path)
+    _atomic_write(_arm_path(state_dir), doc)
 
 
 def arm_snapshot(state_dir, root=None, epoch=None):
@@ -295,13 +290,40 @@ def load_state(state_dir):
     return doc
 
 
+def _atomic_write(path, doc):
+    """Write a JSON document so a crash can only leave the old one or the new one.
+
+    Three properties, each of which was missing from the two callers below:
+
+      * the temporary carries the writer's pid, so two host processes cannot interleave
+        their bytes into one file and publish the mixture. `host.save_queue` already did
+        this; these two shared a fixed `.tmp`;
+      * the bytes are flushed and fsynced before the rename, because the rename is atomic
+        but the *contents* are not: publishing a file the kernel has not written out can
+        leave a short document that reads as damaged state;
+      * the temporary is removed if the write fails, so a full disk does not leave debris
+        behind on every retry.
+    """
+    tmp = '%s.tmp-%d' % (path, os.getpid())
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    try:
+        with open(tmp, 'w', encoding='utf-8') as handle:
+            json.dump(doc, handle, ensure_ascii=False, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def save_state(state_dir, doc):
-    path = _state_path(state_dir)
-    tmp = path + '.tmp'
-    os.makedirs(state_dir, exist_ok=True)
-    with open(tmp, 'w', encoding='utf-8') as handle:
-        json.dump(doc, handle, ensure_ascii=False, sort_keys=True)
-    os.replace(tmp, path)
+    _atomic_write(_state_path(state_dir), doc)
 
 
 def _bounded_newest_first(ids_with_time):
@@ -749,7 +771,20 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
         # Test-only stand-in for the bridge's own table; see `classify_fixture`.
         origin = run_origin.classify_fixture(
             origin_fixture, [run['requestID'] for run in runs])
-    state = load_state(state_dir)
+    try:
+        state = load_state(state_dir)
+    except SourceError as exc:
+        # A damaged sampler state is not "nothing new", and it is not repairable here.
+        # The file is where `pendingIds` lives, so synthesising a fresh one would absorb
+        # whatever completion was waiting in it -- the loss would be silent, and the
+        # report would call the silence correct. Refusing is the only honest answer:
+        # nothing is written, the damaged file survives for the operator to inspect, and
+        # the caller is told which way this failed. Letting the exception escape instead
+        # left Chrome with no answer at all, and every later poll repeated it.
+        return {'ok': False, 'code': 'state_unreadable', 'error': str(exc),
+                'candidates': [], 'requiresAck': False, 'confirmed': False,
+                'deliverable': False, 'provenance': 'unverified',
+                'baselineEstablished': False, 'redelivered': 0}
     # T067R: what the Bridge says each run actually did. Read once per sample and
     # used to overrule the ledger's own status, which reports the desktop event
     # stream rather than the task (see `resolve_status`).
