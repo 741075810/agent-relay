@@ -254,8 +254,8 @@ class DeliveryClaimTest(Scene):
         doctor = load_doctor()
         report = doctor.diagnose(self.state, now_ms=BASE_MS + 60000)
         stats = doctor.stats_only(report)
-        self.assertEqual(stats['delivery'], 'evidenced',
-                         'a bare poll should be reported as the host handover it is')
+        self.assertEqual(stats['delivery'], 'consumer_polled',
+                         'a bare poll is a handover, not evidence a page showed it')
         self.assertIn('extension_store_not_read', stats.get('limitations', []),
                       'the report must say the only witness to a page write was not read')
 

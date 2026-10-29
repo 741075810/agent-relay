@@ -113,16 +113,42 @@ def _any_timestamp(value):
     return isinstance(value, str) and parse_iso(value) is not None
 
 
-def delivery_evidence(event):
-    """Did a *timestamp* record the handover? This is the only thing that counts.
+RECEIPT_KEYS = ('pageReceipt', 'receipt', 'shownAt', 'visibleAt', 'pageShownAt')
 
-    The host writing `deliveredAt` is the host describing what it did. A consumer's
-    receipt is a second party confirming it. Either has a time attached, and a time is
-    the part that can be checked against the clock and against the other artifacts.
+
+def host_handoff(event):
+    """A stamp the **host** writes when it hands an event to a consumer.
+
+    `host.py` sets `deliveredAt` and `consumerDeliveredAt[consumer]` on every poll. That
+    is a fact about the transport -- the event left the queue -- and nothing at all about
+    whether a page ever showed it. Until T084 this counted as evidence of delivery.
     """
-    if _any_timestamp(event.get('deliveredAt')):
+    consumer = event.get('consumerDeliveredAt')
+    if isinstance(consumer, dict):
+        # The host writes `consumerDeliveredAt[consumer] = <number>` per poll, so this is
+        # its own stamp -- whatever keys happen to be in it.
+        if consumer and _any_timestamp(consumer):
+            return True
+    elif _any_timestamp(consumer):
         return True
-    return _any_timestamp(event.get('consumerDeliveredAt'))
+    return _any_timestamp(event.get('deliveredAt'))
+
+
+def visibility_evidence(event):
+    """A receipt the host could **not** have written: the consumer reported a page write.
+
+    The host writes bare numbers into `deliveredAt`, and writes
+    `consumerDeliveredAt[consumer] = <number>` on every poll -- keyed by consumer name, so
+    a single-value dictionary is indistinguishable from that stamp. Nothing in the queue
+    file therefore separates "handed over" from "the consumer reported seeing it", which
+    means no shape of `consumerDeliveredAt` can evidence visibility at all. Only an
+    explicit receipt key, which the host never writes, is stronger than a hand-over -- and
+    even that is a claim about the composer, not proof a person saw it.
+    """
+    for key in RECEIPT_KEYS:
+        if _any_timestamp(event.get(key)):
+            return True
+    return False
 
 
 def delivery_claimed(event):
@@ -245,7 +271,8 @@ def diagnose(state, now_ms=None, stale_ms=DEFAULT_STALE_MINUTES * 60 * 1000):
     events = (queue or {}).get('events') if isinstance((queue or {}).get('events'),
                                                       list) else []
     joined = set()
-    deliverable = suppressed = undelivered = evidenced = claimed = 0
+    deliverable = suppressed = undelivered = 0
+    handed_over = acknowledged = user_visible = claimed = 0
     fresh_created = None
     for event in events:
         if not isinstance(event, dict):
@@ -258,8 +285,10 @@ def diagnose(state, now_ms=None, stale_ms=DEFAULT_STALE_MINUTES * 60 * 1000):
             fresh_created = created_ms
         if event.get('deliverable'):
             deliverable += 1
-            if delivery_evidence(event):
-                evidenced += 1
+            if visibility_evidence(event):
+                user_visible += 1
+            elif host_handoff(event):
+                handed_over += 1
             elif delivery_claimed(event):
                 claimed += 1
             else:
@@ -267,9 +296,20 @@ def diagnose(state, now_ms=None, stale_ms=DEFAULT_STALE_MINUTES * 60 * 1000):
         else:
             suppressed += 1
     consumer_acks = (queue or {}).get('consumer_acks')
+    acked_ids = set((queue or {}).get('acked') or [])
+    if isinstance(consumer_acks, dict):
+        for values in consumer_acks.values():
+            if isinstance(values, list):
+                acked_ids |= set(values)
+    acknowledged = len(acked_ids)
     report['stages']['queue'] = {
         'events': len(events), 'deliverable': deliverable, 'suppressed': suppressed,
-        'undelivered': undelivered, 'evidenced': evidenced, 'claimed_only': claimed,
+        'undelivered': undelivered,
+        # `evidenced` is kept as the old name for the same count so a script that already
+        # reads it is not silently given a different number; the layered name is beside it.
+        'evidenced': user_visible, 'user_visible': user_visible,
+        'handed_over': handed_over, 'acknowledged': acknowledged,
+        'claimed_only': claimed,
         'next_seq': (queue or {}).get('next_seq'),
         'consumers': sorted((queue or {}).get('consumers') or {}),
         'newest_created_at': beijing(fresh_created)}
@@ -325,19 +365,31 @@ def diagnose(state, now_ms=None, stale_ms=DEFAULT_STALE_MINUTES * 60 * 1000):
 
     blockers = [f for f in report['findings'] if f['severity'] == 'blocker']
     unknowns = [f for f in report['findings'] if f['severity'] == 'unknown']
-    # `delivered` is claimed only on evidence. An unevidenced claim is graded `unknown`
-    # above and never promoted to delivery here.
-    report['delivery'] = ('evidenced' if evidenced else
+    # The layered contract. Each name is a different fact, and only the last one describes
+    # a page write at all -- and even that one is *unverified*, because confirming it needs
+    # the extension's journal, which this tool does not read.
+    report['evidence'] = ('user_visible_unverified' if user_visible else
+                          'consumer_acknowledged' if acknowledged else
+                          'consumer_polled' if handed_over else
+                          'host_appended' if deliverable else 'none')
+    report['delivery'] = ('user_visible_unverified' if user_visible else
+                          'consumer_polled' if handed_over else
                           'claimed_only' if claimed else
                           'none' if deliverable else 'nothing_deliverable')
-    if evidenced:
-        report['primary'] = 'delivered'
+    if user_visible:
+        # Never `delivered`: the only witness that a person saw the notice is the
+        # extension's own store, and `limitations` says it was not read.
+        report['primary'] = 'user_visible_unverified'
     elif blockers:
         report['primary'] = blockers[0]['code']
     elif unknowns:
         report['primary'] = unknowns[0]['code']
     elif report['findings']:
         report['primary'] = 'expected_silence'
+    elif handed_over:
+        # The chain got as far as a hand-over and stopped. That is the honest headline when
+        # nothing else fired: not a fault, and not a delivery either.
+        report['primary'] = 'consumer_polled'
     else:
         report['primary'] = 'no_reason_found'
     report['chain_intact'] = not blockers
@@ -373,6 +425,8 @@ def stats_only(report):
     return {
         'primary': report['primary'],
         'delivery': report.get('delivery'),
+        'evidence': report.get('evidence'),
+        'user_visible': (report['stages'].get('queue') or {}).get('user_visible'),
         'chain_intact': report.get('chain_intact'),
         'grades': counts,
         'codes': [finding['code'] for finding in report['findings']],

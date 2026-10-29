@@ -233,7 +233,13 @@ class ReasonTest(DoctorTestCase):
                             events=[event(ident(1), deliverable=True, delivered=True,
                                           consumer_taken=True)])
         report = self.run_tool()
-        self.assertEqual(report['primary'], 'delivered')
+        # T085: `consumer_taken` is the host's own poll stamp, so the furthest this report
+        # may go is "handed over". Claiming `delivered` from it described a hand-over as a
+        # sighting, and the same report admits it never read the extension's store.
+        self.assertEqual(report['primary'], 'consumer_polled')
+        self.assertEqual(report['delivery'], 'consumer_polled')
+        self.assertEqual(report['evidence'], 'consumer_polled')
+        self.assertNotEqual(report['primary'], 'delivered')
         self.assertTrue(report['chain_intact'])
 
     def test_a_stale_arm_over_pending_turns_is_a_fault(self):
@@ -301,27 +307,44 @@ class DeliveryEvidenceTest(DoctorTestCase):
     that makes a broken chain look healthy.
     """
 
-    def test_a_consumer_receipt_with_a_time_is_evidence(self):
+    def test_a_consumer_stamp_with_a_time_is_a_handover_not_a_delivery(self):
+        """T085 correction: the host writes `consumerDeliveredAt[consumer] = <number>` on
+        every poll, so a time in it records the hand-over. It cannot be read as a notice
+        having arrived, and it is not called `evidenced` any more."""
         entry = event(ident(1))
         entry['consumerDeliveredAt'] = {'at': NOW_SECONDS - 300}
         self.write_defaults(origin_ids=[ident(1)], armed=[ident(1)], events=[entry])
         report = self.run_tool()
-        self.assertEqual(report['delivery'], 'evidenced')
-        self.assertEqual(report['primary'], 'delivered')
+        self.assertEqual(report['delivery'], 'consumer_polled')
+        self.assertEqual(report['evidence'], 'consumer_polled')
+        self.assertNotEqual(report['primary'], 'delivered')
 
-    def test_a_short_key_receipt_carrying_one_time_is_evidence(self):
-        """`{'c': <epoch seconds>}` is a shape a real consumer writes. One number with no
-        label is still a number, and a receipt has no other reason to hold one."""
+    def test_a_short_key_stamp_is_the_same_handover(self):
+        """`{'c': <epoch seconds>}` is exactly the shape the host writes for a consumer
+        named `c`. It stays a hand-over."""
         entry = event(ident(1))
         entry['consumerDeliveredAt'] = {'c': NOW_SECONDS - 300}
         self.write_defaults(origin_ids=[ident(1)], armed=[ident(1)], events=[entry])
-        self.assertEqual(self.run_tool()['delivery'], 'evidenced')
+        self.assertEqual(self.run_tool()['delivery'], 'consumer_polled')
 
-    def test_an_iso_receipt_is_evidence(self):
+    def test_an_iso_stamp_is_the_same_handover(self):
         entry = event(ident(1))
         entry['consumerDeliveredAt'] = {'deliveredAt': '2027-01-15T07:25:00Z'}
         self.write_defaults(origin_ids=[ident(1)], armed=[ident(1)], events=[entry])
-        self.assertEqual(self.run_tool()['delivery'], 'evidenced')
+        self.assertEqual(self.run_tool()['delivery'], 'consumer_polled')
+
+    def test_an_explicit_page_receipt_is_visibility_and_still_unverified(self):
+        """The only thing stronger than a hand-over: a key the host never writes. It is
+        still not a confirmation -- the extension's store is what would prove a page
+        write, and this tool does not read it."""
+        entry = event(ident(1))
+        entry['consumerDeliveredAt'] = {'at': NOW_SECONDS - 300}
+        entry['pageReceipt'] = {'shownAt': NOW_SECONDS - 290}
+        self.write_defaults(origin_ids=[ident(1)], armed=[ident(1)], events=[entry])
+        report = self.run_tool()
+        self.assertEqual(report['delivery'], 'user_visible_unverified')
+        self.assertEqual(report['evidence'], 'user_visible_unverified')
+        self.assertNotEqual(report['primary'], 'delivered')
 
     def test_a_receipt_stub_with_no_time_is_unknown_not_delivered(self):
         entry = event(ident(1))
