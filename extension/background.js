@@ -818,7 +818,30 @@ async function refreshTerminalCandidates() {
       .preArmCandidateKeys) ? triggerStored.terminalTrigger.preArmCandidateKeys : []);
   const isProtected = (item) => Boolean(item) && preArmKeys.has(
     terminalTrigger.key(item.runId, item.status));
-  const workCount = existing.filter((item) => !isProtected(item)).length;
+  // T073: capacity reserves space for candidates that can still become a notice.
+  //
+  // `preArmKeys` alone is not that test. It is a snapshot taken when the trigger was
+  // armed, and it goes stale: on a live install it held 49 keys, not one of which
+  // matched any of the 50 stored candidates, so every entry counted as work, `room`
+  // was permanently 0, and a finished task could not be *queued* at all -- let alone
+  // delivered. A notice the operator had explicitly asked for died at intake, before
+  // the tick ever saw it.
+  //
+  // A channel-B candidate nobody has opted into cannot produce a notice on its own; it
+  // is display history the operator may still choose from. Reserving capacity for those
+  // is what let a backlog of them become permanent. Channel A needs no consent, and
+  // either consent -- recorded while the task was running, or clicked on the entry
+  // afterwards -- makes the entry real work.
+  const optInState = (await readOptIns()).state;
+  const reservesCapacity = (item) => {
+    if (!item) return false;
+    if (isProtected(item)) return false;      // pre-arm history: shown, never sent
+    if (item.origin === terminalTrigger.ORIGIN_BRIDGE) return true;
+    if (Number.isFinite(item.directArmedAt)) return true;
+    if (Number.isFinite(item.runningArmedAt)) return true;
+    return terminalTrigger.optInFor(optInState, item) !== null;
+  };
+  const workCount = existing.filter(reservesCapacity).length;
   const room = Math.max(0, MAX_CANDIDATES_STORED - workCount);
   // T069: an entry we already hold is not skipped outright any more -- its host-owned
   // provenance is refreshed if the host re-offers the same run. Normally an entry is
@@ -899,7 +922,11 @@ async function refreshTerminalCandidates() {
     let excess = merged.length - MAX_CANDIDATES_STORED;
     const kept = [];
     for (const item of merged) {          // oldest first
-      if (excess > 0 && isProtected(item)) { excess -= 1; continue; }
+      // T073: protected history first, then anything else that cannot become a
+      // notice. `isProtected` alone could not free a slot that an un-consented
+      // channel-B entry was holding, so the display backlog could grow to the bound
+      // and stay there for good.
+      if (excess > 0 && !reservesCapacity(item)) { excess -= 1; continue; }
       kept.push(item);
     }
     merged = kept;
@@ -1503,7 +1530,21 @@ async function runTerminalTrigger(options = {}) {
 
   // The limit applies to work this tick may actually do. Counting skipped history
   // against it would let a handful of stale entries starve every new completion.
-  for (const candidate of fresh.slice(0, limit)) {
+  //
+  // T073: and so does counting *refusals*. `limit` used to slice `fresh` before any
+  // decision was taken, so the three oldest entries were inspected and then discarded
+  // whether or not they could ever be admitted. A channel-B candidate nobody has opted
+  // into is refused with `direct_not_opted_in`, which by design neither journals it nor
+  // drains it -- so it stayed at the front and was re-refused on every tick for ever,
+  // and everything behind it was never looked at. A live install at 50 such entries
+  // silently stopped delivering while the popup said the opt-in had been recorded.
+  //
+  // Inspection is pure and cheap; the bound is there to cap page writes, so the budget
+  // is spent on candidates that get past `admit`, and a refusal costs nothing. The loop
+  // still terminates on the candidate list, and every refusal is still reported.
+  let budget = Math.max(0, limit);
+  for (const candidate of fresh) {
+    if (budget <= 0) break;
     if (state.enabled !== true) {
       results.push({ candidate, code: 'trigger_disabled' });
       break;
@@ -1523,6 +1564,11 @@ async function runTerminalTrigger(options = {}) {
       }
       continue;
     }
+    // Past `admit`: this one is going to touch the page, so it is what the bound is
+    // for. Spending the budget here is what keeps a burst of completions from turning
+    // into a burst of writes while still letting a consented candidate through a
+    // backlog it cannot be blamed for.
+    budget -= 1;
     const marked = terminalTrigger.markAttempt(state, candidate, nowFn());
     state = marked.state;
     await chrome.storage.local.set({ terminalTrigger: state });

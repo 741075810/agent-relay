@@ -90,3 +90,35 @@ is "too late", which is what they get.
 * a message without a real user gesture;
 * an entry written to storage by hand — `armedAt` is the proof, and a hand-written value
   can only ever claim a time, not establish one.
+
+## A refusal may not starve a consent
+
+`direct_not_opted_in` is a correct answer, but it is not an *event*: it writes no journal
+entry and removes nothing from the candidate list. That is deliberate — journaling it
+would mark a channel-B task as handled for good, so a click on it later could never
+produce a notice.
+
+The consequence is that a refused candidate stays queued and will be examined again on
+the next tick. The per-tick budget therefore has to bound **work**, not **inspection**:
+`runTerminalTrigger` spends it only once `admit()` has returned true, i.e. when a notice
+is actually going to be written.
+
+Spending it on inspection instead is what T073 fixed. With the budget applied to the
+first N entries of the list, the N oldest channel-B completions — none of them opted
+into — were refused on every tick for ever, so nothing behind them was ever looked at.
+A live install reached 50 such entries, and a task the operator had explicitly opted into
+while it was running finished and was never delivered. The popup had confirmed the click;
+the chain had gone quiet; no error was recorded anywhere, because a refusal is not an
+error.
+
+The same rule governs capacity. `MAX_CANDIDATES_STORED` reserves room for entries that
+can still become a notice — channel A, or channel B with either consent — and treats the
+rest as display history that gives up its slot first. A backlog of un-consented
+candidates must never be able to make `room` zero, or a fresh completion cannot even be
+queued, and the tick never sees it.
+
+Two invariants follow, and `test_t073_candidate_starvation.mjs` asserts both:
+
+* a consented candidate is reached however many un-consented ones precede it, at any
+  budget of one or more;
+* a tick writes at most `limit` notices, and a second tick does not repeat one.
