@@ -88,6 +88,13 @@ export function createTargetBindingController(api, options = {}) {
   const epochs = new Map();
   let writeTail = Promise.resolve();
   const probeOptions = { now, timeoutMs: options.timeoutMs };
+  // T095B76: health checks may repair a lost content script; candidate binds may not.
+  // The difference is consent. `health` re-measures a tab the operator already
+  // confirmed, so re-establishing the observer that measures it changes nothing about
+  // what is authorised. `bind` is looking at a tab nobody has confirmed yet, and
+  // injecting anything there would be doing work on an unapproved target.
+  const probeHealth = typeof options.probeHealth === 'function'
+    ? options.probeHealth : probeSpecificTab;
 
   async function read() {
     if (!api.session || typeof api.session.get !== 'function' ||
@@ -380,7 +387,7 @@ export function createTargetBindingController(api, options = {}) {
     const epoch = epochs.get(binding.tabId) || 0;
     let snapshot;
     try {
-      snapshot = await probeSpecificTab(api, binding, probeOptions);
+      snapshot = await probeHealth(api, binding, probeOptions);
     } catch (_err) {
       snapshot = { status: 'probe_unavailable' };
     }

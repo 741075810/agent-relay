@@ -49,9 +49,22 @@ const CONTENT_SOURCE = readFileSync(new URL('./extension/content.js', import.met
 
 // ------------------------------------------------------- one page load
 // Evaluating content.js a second time is exactly what a reload does: a new
-// document, a new script instance, a new `DOCUMENT_INSTANCE_ID`, and a listener
-// that only knows about its own document.
+// document, a new script instance, and a listener that only knows about its own
+// document.
+//
+// T095B76 changed where the identity comes from: it used to be `crypto.randomUUID()`
+// per evaluation, so every instance differed and the rig did not have to model a
+// document at all. It is now derived from `performance.timeOrigin`, which is a
+// property of the *document* -- that is what lets a re-injected script in an
+// un-navigated document report the same id and keep the binding alive. So the rig
+// has to say which document each instance is in, exactly as a browser would. Two
+// pages that shared a time origin would be one document by definition.
+let documentSeq = 0;
 function loadContentScript(page) {
+  if (!Number.isFinite(page.timeOrigin)) {
+    documentSeq += 1;
+    page.timeOrigin = 1.6e12 + documentSeq;
+  }
   const listeners = [];
   const chrome = {
     runtime: {
@@ -65,10 +78,13 @@ function loadContentScript(page) {
   };
   const doc = page.doc;
   doc.addEventListener = () => {};
+  // `performance` is passed in rather than inherited from Node's global, because it
+  // is the document's clock and the whole point is that two documents disagree.
+  const performanceForPage = { timeOrigin: page.timeOrigin };
   // eslint-disable-next-line no-new-func
   const run = new Function('chrome', 'document', 'location', 'URL', 'crypto', 'Date',
-    CONTENT_SOURCE);
-  run(chrome, doc, doc.location, URL, crypto, Date);
+    'performance', CONTENT_SOURCE);
+  run(chrome, doc, doc.location, URL, crypto, Date, performanceForPage);
 
   function send(msg) {
     return new Promise((resolve, reject) => {

@@ -21,7 +21,66 @@ const COMPOSER_SELECTORS = [
 ];
 
 const OWN_MESSAGE_SELECTOR = '[data-message-author-role="user"]';
-const DOCUMENT_INSTANCE_ID = crypto.randomUUID();
+
+// T095B76: the document id has to survive a *re-injection into the same document*.
+//
+// It used to be `crypto.randomUUID()` per evaluation, which made it an id for this
+// script instance rather than for the document. That was invisible while a content
+// script only ever ran once per document. It stopped being invisible when the
+// extension started reconnecting content scripts after a reload (T095B76): the
+// re-injected script announced a brand new id, the binding it was meant to satisfy
+// said `document_instance_changed`, and the operator was asked to bind again -- the
+// exact step the reconnect existed to avoid.
+//
+// `performance.timeOrigin` is fixed when the document is created, so it is the
+// document's own identity rather than any script's. Two evaluations in the same
+// document reproduce it exactly; a reload or a navigation starts a new document and
+// therefore a new value. T052's rule is untouched: a same-URL reload still changes
+// the id, because the reload creates a new document.
+//
+// Read from the isolated world, where the page's own JavaScript cannot reach or
+// rewind it, and mixed with a fixed tag so the value stays opaque rather than
+// publishing the document's creation time wherever an id is displayed.
+function stableDocumentId() {
+  let origin;
+  try {
+    origin = typeof performance !== 'undefined' &&
+      Number.isFinite(performance.timeOrigin) ? performance.timeOrigin : null;
+  } catch (_err) {
+    origin = null;
+  }
+  if (origin === null) {
+    // No time origin to key on: fall back to a per-instance id, which means a
+    // reconnect cannot prove sameness and the binding will ask for a re-bind.
+    // Degrading to today's behaviour is the safe direction; inventing a stable
+    // value from the clock or the URL would be a guess dressed as proof.
+    return crypto.randomUUID();
+  }
+  // Microseconds keep two documents that start in the same millisecond apart.
+  const seed = 'dsh-doc-v1\u0000' + String(Math.round(origin * 1000));
+  let a = 0x811c9dc5;
+  let b = 0x01000193;
+  for (let i = 0; i < seed.length; i += 1) {
+    const code = seed.charCodeAt(i);
+    a ^= code;
+    a = Math.imul(a, 0x01000193) >>> 0;
+    b = (b + code) >>> 0;
+    b = Math.imul(b ^ (b >>> 13), 0x85ebca6b) >>> 0;
+  }
+  const hex = (n) => n.toString(16).padStart(8, '0');
+  const left = hex(a) + hex(b);
+  let c = 0xc2b2ae35;
+  let d = 0x27d4eb2f;
+  for (let i = seed.length - 1; i >= 0; i -= 1) {
+    const code = seed.charCodeAt(i);
+    c ^= code;
+    c = Math.imul(c, 0x85ebca6b) >>> 0;
+    d = (d + Math.imul(code, 0x9e3779b1)) >>> 0;
+  }
+  return 'doc-' + left + hex(c) + hex(d);
+}
+
+const DOCUMENT_INSTANCE_ID = stableDocumentId();
 
 // Kept byte-identical in spirit to the README claim it supports: nothing here
 // reads message text. `count` is a number; no innerText is ever returned.
@@ -140,6 +199,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       } });
       return true;
     }
+    // T095B76: one writer per document, even if this file somehow runs twice in the
+    // same isolated world. Before T095B76 that could not happen -- a content script
+    // ran once per document and that was the end of it. Reconnecting a lost script
+    // introduces a second evaluation, so the guarantee has to be stated rather than
+    // assumed: the latch is set synchronously, before the first await, so a second
+    // listener cannot slip past it. Two writers here would mean two notices in the
+    // same conversation, which is precisely the damage the rest of this file spends
+    // its time preventing.
+    if (globalThis.__dshWriteInFlight === true) {
+      sendResponse({ ok: true, result: {
+        status: 'refused', reason: 'concurrent_write_in_flight',
+        composerTouched: false, composerWritten: false, clickPerformed: false,
+        evidence: { precheckOnly: true, documentInstanceId: DOCUMENT_INSTANCE_ID },
+      } });
+      return true;
+    }
+    globalThis.__dshWriteInFlight = true;
     (async () => {
       try {
         const adapter = await import(chrome.runtime.getURL('lib/send_adapter.js'));
@@ -164,6 +240,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // all of them mean "do not send". The caller records it as unconfirmed.
         sendResponse({ ok: false,
           error: String(err && err.message ? err.message : err) });
+      } finally {
+        // Released on every path, including a refusal thrown from inside the
+        // adapter, so one failed attempt cannot wedge the document for good.
+        globalThis.__dshWriteInFlight = false;
       }
     })();
     return true;

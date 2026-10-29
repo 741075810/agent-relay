@@ -27,6 +27,12 @@ import { createBoundDryRunController } from './lib/bound_dry_run_controller.js';
 import { createReceivedReview, handleReceivedReviewMessage } from './lib/received_review.js';
 import { createAutoSendController } from './lib/autosend_controller.js';
 import { createChromeAutoSend } from './lib/autosend_chrome_wiring.js';
+// T095B76: a reload destroys the content script in every open tab and clears the
+// session-scoped binding. The first is repaired by re-injecting the read-only
+// observer, the second by mirroring the binding into `local`. Neither widens what a
+// notice may do: every send still re-probes the tab and re-checks the document.
+import { createResilientProbe, ensureContentScript } from './lib/content_reconnect.js';
+import { createMirroredSession, BINDING_RESTORED_AT_KEY } from './lib/binding_mirror.js';
 // The limits themselves (defaults and hard bounds), so the popup reports the
 // numbers the code actually enforces. Missing this import was a live defect: the
 // constants were referenced but unbound, so every `t058-state` threw
@@ -38,9 +44,50 @@ import { summariseChain, describeStage, hostLayer, authorizationLayer,
 import { describeChainEvidence, describeEvidenceLine } from './lib/chain_evidence.js';
 import { classifySendReason } from './lib/send_adapter.js';
 
+// T095B76: the two reload-recovery seams, declared before anything that uses them.
+//
+// `bindingSession` is `chrome.storage.session` with a mirror in `local`, so a reload
+// no longer erases the operator's confirmed target while leaving the grant that
+// points at it.
+const bindingSession = createMirroredSession(
+  { session: chrome.storage.session, local: chrome.storage.local },
+  { onRestore: (event) => {
+    // Recorded because a restored binding is a *claim* about to be re-verified, and
+    // the next person reading storage should be able to tell that apart from a
+    // binding that was confirmed in this browser session.
+    note({ kind: 'binding-restored', revision: event.revision,
+      hasBinding: event.hasBinding, invalidatedReason: event.invalidatedReason })
+      .catch(() => {});
+  } },
+);
+
+// `resilientProbe` re-injects the read-only observer when a tab provably has no
+// receiving end, then measures once more. Only the observer: `write` still goes
+// through the content script, so this adds a way to look at the bound tab again and
+// not a new way to type into it.
+const resilientProbe = createResilientProbe({
+  probeSpecificTab,
+  reconnect: (api, target) => ensureContentScript(api, target, { file: 'content.js' }),
+  onEvent: (event) => {
+    const attempt = event.attempt || {};
+    note({ kind: attempt.ok ? 'content-reconnected' : 'content-reconnect-failed',
+      tabId: event.tabId === undefined ? null : event.tabId,
+      cause: event.cause || null, code: attempt.code || null,
+      error: attempt.error || null }).catch(() => {});
+  },
+});
+
 const targetBinding = createTargetBindingController({
   tabs: chrome.tabs,
-  session: chrome.storage.session,
+  // T095B76: the same `storage.session`-shaped area, backed by a mirror in `local`.
+  // The controller is unchanged and still believes the binding is session-scoped; it
+  // simply no longer disappears when a reload clears the session area.
+  session: bindingSession,
+  // Needed by the health-path reconnect: re-injecting the observer is a `scripting`
+  // call, and the controller hands this same object to the probe it was given.
+  scripting: chrome.scripting,
+  // Health may put a lost content script back; a candidate bind may not.
+  probeHealth: resilientProbe,
 });
 
 // T054: read-only decision only. It has no send path and never reads the queue.
@@ -90,7 +137,11 @@ chrome.tabs.onAttached.addListener((tabId) => {
 // the adapter -- module missing, CSP, page changed -- the reply is an error and
 // the controller settles the notice as ambiguous, which disarms everything.
 const chromeAutoSend = createChromeAutoSend(chrome, {
-  probeSpecificTab,
+  // T095B76: the send path gets the same reconnect-aware probe, because the tab that
+  // lost its script is exactly the tab a notice is about to be written into. The
+  // write itself is untouched: it is still a `tabs.sendMessage` to the content script,
+  // which re-checks the document id before typing.
+  probeSpecificTab: resilientProbe,
   getBindingState: () => targetBinding.getState(),
 });
 const autoSend = chromeAutoSend.controller;

@@ -456,10 +456,25 @@ const reports = [report()];
   check(!background.includes('send_gate') && !content.includes('send_gate') &&
         !popup.includes('send_gate'),
         'mock send gate is not wired into existing extension scripts');
+  // T095B76 widened this list by exactly one entry, `scripting`, so a content script
+  // destroyed by an extension reload can be put back into the tab the operator already
+  // bound. The boundary is restated rather than removed: nothing broader than
+  // `scripting` may be added, and the injection itself is confined to one module.
   check(manifest.permissions.slice().sort().join(',') ===
-        ['alarms', 'nativeMessaging', 'storage', 'tabs'].sort().join(',') &&
-        !manifest.permissions.includes('scripting'),
-        'manifest permissions remain unchanged and exclude scripting');
+        ['alarms', 'nativeMessaging', 'storage', 'tabs', 'scripting'].sort().join(','),
+        'manifest permissions are exactly the five the code uses ('
+        + manifest.permissions.slice().sort().join(',') + ')');
+  check(!manifest.permissions.includes('webNavigation') &&
+        !manifest.permissions.includes('debugger') &&
+        !manifest.permissions.includes('<all_urls>'),
+        'and still exclude webNavigation, debugger and <all_urls>');
+  const reconnectSource = readFileSync(
+    new URL('./extension/lib/content_reconnect.js', import.meta.url), 'utf8');
+  check(reconnectSource.includes('scripting.executeScript') &&
+        !background.includes('executeScript') &&
+        !content.includes('executeScript') &&
+        !popup.includes('executeScript'),
+        'injection lives in one module; the scripts themselves never inject');
   const contentCode = content.replace(/\/\*[\s\S]*?\*\//g, '')
     .replace(/\/\/.*$/gm, '');
   check(!contentCode.includes('.click(') &&

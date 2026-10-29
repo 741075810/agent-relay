@@ -748,11 +748,16 @@ await controllerTest();
         'T053 background never activates, navigates or injects');
   check(!popup.includes('window.prompt'),
         'popup binding confirmation uses its own input, not prompts');
-  check(manifest.permissions.length === 4 &&
+  // T095B76: `scripting` was added, and only that. The two invariants that survive are
+  // the ones that matter: nothing here navigates a tab, and nothing in the background
+  // calls executeScript directly -- the single injection site is content_reconnect.js.
+  check(manifest.permissions.length === 5 &&
         manifest.permissions.includes('storage') &&
-        !manifest.permissions.includes('scripting') &&
-        !manifest.permissions.includes('webNavigation'),
-        'T053 adds no permission: storage.session rides the existing storage right');
+        manifest.permissions.includes('scripting') &&
+        !manifest.permissions.includes('webNavigation') &&
+        !manifest.permissions.includes('debugger'),
+        'T053 keeps storage.session; T095B76 adds only scripting ('
+        + manifest.permissions.slice().sort().join(',') + ')');
   const sendGate = readFileSync(new URL('./extension/lib/send_gate.js',
     import.meta.url), 'utf8');
   check(!controller.includes('send_gate') && !policy.includes('send_gate'),

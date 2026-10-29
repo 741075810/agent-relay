@@ -170,3 +170,65 @@ Failing is allowed; failing silently is not. If the alarm cannot be restored —
 `alarms` permission, a storage read that throws — the install hook still completes, the
 queue poller is still scheduled, and a `terminal-alarm-restore-failed` note is recorded,
 so the next person reading storage sees the fact that went missing here.
+
+## Reconnecting is not re-authorising
+
+The same reload that clears the alarm table also clears `chrome.storage.session`, and
+that is where T053 keeps the operator's confirmed target. It also orphans every content
+script already injected into an open page: the page keeps running, the tab keeps its id,
+and nothing puts a script back, because declarative content scripts are injected at
+document idle and a document that never navigates never reaches document idle again.
+
+So a reload used to cost two things, and only one of them was obvious:
+
+* the binding was gone, so the standing T058/T059 grant had nothing to point at and every
+  tick refused `target_not_bound`;
+* the probe had no receiver, so there was nothing to measure even if the binding had
+  survived.
+
+Refreshing the page fixes the second and *worsens* the first: a refresh is a new document,
+a new document is a different target, and the binding is correctly invalidated. That is
+why the refresh never helped — it moved the work from "reload the page" to "bind again",
+turn after turn.
+
+The fix is two narrow repairs, and the phrase "narrow" is doing real work in both:
+
+* the binding is mirrored into `chrome.storage.local` and rehydrated into the session copy
+  on read. **A restore is a claim, not a proof.** Every send already re-probes the tab and
+  compares tab, window, url, conversation and document instance before typing; restoring
+  the record cannot get past that check, it only saves the operator from retyping
+  something the probe can still prove. An invalidated binding comes back invalidated,
+  because the mirror carries `invalidatedReason`; a mirror that fails its shape check is
+  ignored rather than repaired; and a mirror is only ever written from a value the
+  controller itself just wrote, so the two copies cannot disagree about what was
+  confirmed.
+* a lost content script is re-injected with `chrome.scripting.executeScript`, which is why
+  the manifest now requests `scripting` — the one permission T044, T053 and T051 all
+  asserted the extension did not need. It is used under conditions that make it an
+  observation repair rather than a new capability: the target is the single tab the
+  operator already bound, its URL must still equal the bound URL character for
+  character, it runs `files: ['content.js']` and never a `func` or a string of code, it
+  never touches the main world, and it fires only after a probe has *definitively*
+  reported no receiver. A timeout is not that proof — a slow reply may mean a live
+  script, and injecting then would run the file twice in one document.
+
+That last hazard is why `content.js` now latches its write path. Two listeners would mean
+two notices in one conversation, so the latch is taken synchronously before the first
+`await` and released in a `finally`; the second caller is refused with
+`concurrent_write_in_flight` instead of racing. One document gets one writer.
+
+And the document id had to stop being an id for a *script* and become an id for a
+*document*, or the whole reconnect would be pointless: a re-injected script that
+announced a fresh random id would satisfy every gate except the one that matters, and the
+operator would be asked to bind again — the exact step the reconnect exists to avoid. It
+is now derived from `performance.timeOrigin`, which is fixed when the document is created
+and unreadable from the page's own world. Two evaluations in one document reproduce it
+exactly. A reload, a navigation or a refresh creates a new document and therefore a new
+value, so **T052's rule is untouched**: a stale document is still refused with
+`document_instance_changed`. Reconnecting to the document that was confirmed is not the
+same act as adopting a new one, and only the first is done silently.
+
+`test_t095b76_reload_binding.mjs` asserts all of it, and `mutate_t095b76.py` proves the
+assertions are load-bearing by reverting each half of the fix in turn and requiring the
+suite to go red — seven mutations, seven red runs. A test that passes with and without the
+fix is a comment.

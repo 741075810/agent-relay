@@ -710,10 +710,15 @@ class ExtensionSourceTests(unittest.TestCase):
     def test_the_manifest_is_mv3_and_requests_only_what_is_used(self):
         doc = json.loads(self.read('manifest.json'))
         self.assertEqual(doc['manifest_version'], 3)
+        # T095B76 added `scripting`, and nothing else, so a content script destroyed
+        # by an extension reload can be re-injected into the tab the operator already
+        # bound. The old assertion forbade it outright; the new one pins the boundary
+        # that replaced it -- scripting yes, anything wider no.
         self.assertEqual(sorted(doc['permissions']),
-                         ['alarms', 'nativeMessaging', 'storage', 'tabs'])
-        self.assertNotIn('scripting', doc['permissions'],
-                         'scripting would allow injecting code; not needed')
+                         ['alarms', 'nativeMessaging', 'scripting', 'storage', 'tabs'])
+        for wider in ('webNavigation', 'debugger', '<all_urls>'):
+            self.assertNotIn(wider, doc['permissions'],
+                             '%s is broader than the reconnect needs' % wider)
 
     def test_the_content_script_cannot_write_into_the_page(self):
         """The read-only promise, checked against code rather than prose."""
@@ -764,11 +769,28 @@ class ExtensionSourceTests(unittest.TestCase):
 
     def test_the_background_never_calls_a_page_write_api(self):
         source = self.strip_comments(self.read('background.js'))
-        for token in ('chrome.scripting', 'executeScript', 'tabs.update',
+        for token in ('executeScript', 'insertCSS', 'tabs.update',
                       'tabs.reload', 'tabs.create', 'window.open',
                       'chrome.windows.update'):
             self.assertNotIn(token, source,
                              'background.js uses %r' % token)
+        # T095B76: the background now hands `chrome.scripting` to the reconnect module
+        # -- it never calls it. One mention, as a property passed in, is the whole
+        # allowance; a second one would mean a call site grew here.
+        self.assertEqual(source.count('chrome.scripting'), 1,
+                         'background.js may only pass chrome.scripting along, once '
+                         '(%d mentions)' % source.count('chrome.scripting'))
+        self.assertIn('scripting: chrome.scripting', source)
+        # And the one injection site can only re-run a file that ships with the
+        # extension. `func:` would let it run arbitrary code, and `world: 'MAIN'`
+        # would put it where the page's own JavaScript can reach it.
+        reconnect = self.strip_comments(
+            self.read(os.path.join('lib', 'content_reconnect.js')))
+        self.assertIn("files: [options.file || 'content.js']", reconnect)
+        for token in ('func:', 'args:', "'MAIN'", '"MAIN"', 'world'):
+            self.assertNotIn(token, reconnect,
+                             'content_reconnect.js uses %r' % token)
+        self.assertNotIn('insertCSS', reconnect)
 
     def test_manual_probe_is_read_only_and_not_automatic(self):
         source = self.strip_comments(self.read('background.js'))
@@ -825,7 +847,11 @@ class ExtensionSourceTests(unittest.TestCase):
         self.assertNotIn('send_gate', controller)
         self.assertNotIn('window.prompt', popup)
         self.assertEqual(sorted(manifest['permissions']),
-                         ['alarms', 'nativeMessaging', 'storage', 'tabs'])
+                         ['alarms', 'nativeMessaging', 'scripting', 'storage', 'tabs'])
+        # T095B76: `executeScript` is allowed in one module and nowhere else, and
+        # navigation stays forbidden everywhere.
+        self.assertIn('scripting.executeScript',
+                      self.read(os.path.join('lib', 'content_reconnect.js')))
         for token in ('chrome.tabs.update', 'executeScript',
                       'webNavigation', 'send_gate'):
             self.assertNotIn(token, background)
@@ -866,7 +892,7 @@ class ExtensionSourceTests(unittest.TestCase):
         self.assertIn('wouldSend: false', policy)
         self.assertIn('deliveryReceipt: \'unsupported\'', policy)
         self.assertEqual(sorted(manifest['permissions']),
-                         ['alarms', 'nativeMessaging', 'storage', 'tabs'])
+                         ['alarms', 'nativeMessaging', 'scripting', 'storage', 'tabs'])
         self.assertNotIn('id="send', popup_html.lower())
         self.assertIn('dryRunEvaluate', popup_html)
         self.assertIn('t054-dry-run', popup)
