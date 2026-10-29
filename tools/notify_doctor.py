@@ -139,6 +139,9 @@ def diagnose(state, now_ms=None, stale_ms=DEFAULT_STALE_MINUTES * 60 * 1000):
             note(code, '%s.json' % name)
     if all(code for code in (origin_code, source_code, arm_code, queue_code)):
         report['primary'] = 'nothing_readable'
+        # Say which way it failed. Unreadable is not the same fact as "nothing to send",
+        # and an answer of None here reads as a bug in the tool rather than a finding.
+        report['chain_intact'] = False
         return report
 
     origin_ids = id_set(origin, 'ids')

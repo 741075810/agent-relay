@@ -281,6 +281,8 @@ class DegradedTest(DoctorTestCase):
         report = self.run_tool()
         self.assertEqual(report['primary'], 'nothing_readable')
         self.assertEqual(len(self.codes(report, 'blocker')), 4)
+        # Not None: unreadable is a failure, and a failure has to name itself as one.
+        self.assertIs(report['chain_intact'], False)
 
     def test_the_invisible_stage_is_declared(self):
         self.write_defaults(origin_ids=[ident(1)])
