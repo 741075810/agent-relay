@@ -120,7 +120,10 @@ class StaleLockTest(QueueScene):
         self.assertEqual(added, 1)
         self.assertLess(elapsed, 12.0,
                         'a stale lock held delivery for %.1fs' % elapsed)
-        self.assertFalse(os.path.exists(lock), 'the broken lock was left behind')
+        # Since T088 the file is never deleted -- deleting the inode would release a lock
+        # another writer holds. The guarantee is "it does not exclude anyone", not "it is
+        # gone", and the append above is what proves that.
+        self.assertTrue(os.path.exists(lock))
 
     def test_delivery_resumes_after_the_stale_lock_is_cleared(self):
         host.append_events(self.state, [event('e1')])

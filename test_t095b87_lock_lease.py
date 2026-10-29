@@ -27,14 +27,11 @@ from test_t095b86_queue_concurrency import QueueScene, event
 
 
 class LiveHolderTest(QueueScene):
-    @unittest.expectedFailure
     def test_a_live_slow_writer_is_waited_for_not_evicted(self):
-        """KNOWN GAP, not fixed yet. `_Lock` breaks *any* lock after five seconds, so a
-        writer that is alive and working inside the critical section is evicted and its
-        publish lands over its peer's. The fix is a lease with an owner and a liveness
-        check (`os.kill(pid, 0)` / `OpenProcess`), waiting while the owner lives and
-        recycling only when it does not. Written as a failing test so the gap is visible
-        in CI rather than remembered."""
+        """The lock's job is mutual exclusion. Five seconds of thinking is not death.
+
+        This was an `expectedFailure` until the lock moved to `flock`/`msvcrt.locking`: the
+        old create-based file was broken by anyone whose patience ran out."""
         real_replace = host.os.replace
         reached = threading.Event()
         release = threading.Event()
@@ -58,15 +55,19 @@ class LiveHolderTest(QueueScene):
                 target=lambda: box.update(fast=host.append_events(
                     self.state, [event('fast')])))
             intruder.start()
-            # Longer than `_Lock`'s five second patience: the old code breaks the lock here.
+            # Longer than `_Lock`'s five second patience: the old code broke the lock here
+            # and let the second writer in on top of a live one.
             time.sleep(5.5)
-            during = {e['eventId'] for e in self.queue_document()['events']}
+            try:                                   # the first write may not have landed yet
+                during = {e['eventId'] for e in self.queue_document()['events']}
+            except FileNotFoundError:
+                during = set()
             self.assertNotIn('fast', during,
                              'a second writer entered while the first was alive and inside '
                              'the critical section')
             release.set()
-            holder.join(40)
-            intruder.join(40)
+            holder.join(60)
+            intruder.join(60)
         finally:
             host.os.replace = real_replace
             release.set()
@@ -86,7 +87,10 @@ class LiveHolderTest(QueueScene):
         self.assertEqual(added, 1)
         self.assertLess(time.time() - started, 12.0,
                         'a dead holder held delivery for too long')
-        self.assertFalse(host.os.path.exists(lock))
+        # The file stays behind now: it is never deleted, because deleting the inode would
+        # drop a lock somebody else may hold. What matters is that it no longer excludes
+        # anyone, which the append above already proved.
+        self.assertTrue(host.os.path.exists(lock))
 
 
 class GenerationWindowTest(QueueScene):

@@ -456,9 +456,12 @@ class QueueTests(TempState):
 
     def test_the_lock_is_released_after_a_write(self):
         H.append_events(self.state, H.simulated_events(1))
-        self.assertFalse(os.path.exists(
-            os.path.join(self.state, H.LOCK_FILE)),
-            'the lock file was left behind, which would block the next run')
+        # Since T088 the lock is an OS-level lock on a file that is never deleted: removing
+        # the inode would release a lock somebody else is holding. The property that matters
+        # is that it no longer excludes anyone, so a second write must go straight through
+        # instead of waiting out a timeout.
+        H.append_events(self.state, H.simulated_events(1))
+        self.assertIn('events', H.load_queue(self.state))
 
 
 # -- request handling --------------------------------------------------

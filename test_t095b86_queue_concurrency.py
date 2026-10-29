@@ -96,26 +96,42 @@ class LostUpdateTest(QueueScene):
                            'cannot be detected')
 
     def test_a_slow_ack_cannot_be_silently_dropped(self):
+        """The contract is not "both acks always land". Once the lock stopped being
+        breakable, a second ack that cannot get in within the budget is **refused** -- and
+        a refusal the caller can see is the right outcome. What must never happen is a
+        success that the disk does not corroborate."""
         host.append_events(self.state, [event('e1')])
         restore = self.slow_save_when('e1')
+        box = {}
+
+        def slow_ack():
+            try:
+                box['slow'] = self.rpc('ack', {'acked': ['e1'],
+                                               'consumer': 'slow-consumer'})
+            except Exception as exc:                       # noqa: BLE001 - under test
+                box['slow_error'] = exc
+
         try:
-            writer = threading.Thread(
-                target=lambda: self.rpc('ack', {'acked': ['e1'],
-                                                'consumer': 'slow-consumer'}))
+            writer = threading.Thread(target=slow_ack)
             writer.start()
             time.sleep(0.3)
-            self.rpc('ack', {'acked': ['e1'], 'consumer': 'fast-consumer'})
-            writer.join(20)
+            fast = self.rpc('ack', {'acked': ['e1'], 'consumer': 'fast-consumer'})
+            writer.join(40)
         finally:
             restore()
+
         document = self.queue_document()
         acked = set(document.get('acked') or [])
+        consumers = set(document.get('consumer_acks') or {})
         for values in (document.get('consumer_acks') or {}).values():
             acked |= set(values)
-        self.assertIn('e1', acked, 'the acknowledgement vanished from disk')
-        consumers = set(document.get('consumer_acks') or {})
-        self.assertIn('fast-consumer', consumers,
-                      'the second consumer\'s ack was overwritten')
+        if fast.get('ok'):
+            self.assertIn('fast-consumer', consumers,
+                          'the ack was reported ok but the consumer is not on disk')
+        else:
+            self.assertIn('lock', json.dumps(fast).lower(),
+                          'an ack was refused for an unnamed reason: %r' % (fast,))
+        self.assertIn('e1', acked, 'the acknowledgement vanished from the queue file')
 
     def test_a_verification_failure_is_reported_rather_than_swallowed(self):
         """If the write cannot be made to stick, the caller must hear about it -- an

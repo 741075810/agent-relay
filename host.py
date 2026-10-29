@@ -125,11 +125,26 @@ def save_queue(state_dir, doc, expect=None):
 
 
 class _Lock(object):
-    """Exclusive create-based lock, held only for one read-modify-write.
+    """Exclusive access to the queue, enforced by the operating system.
 
-    Same shape as the notifier's engine lock, and for the same reason: two
-    Chrome profiles can load the same extension against one host, and two
-    interleaved `ack` calls would lose an event id from the acked set.
+    T087 proved the previous version lost data: it broke **any** lock after five seconds
+    without asking whether the holder still existed, so a writer that was alive and working
+    inside the critical section could be evicted and its publish would land over its peer's.
+    No file content can fix that -- a pid is reused, an mtime is not a heartbeat, and "is
+    this process alive" cannot be answered for another user's process.
+
+    So the lock file's content is not evidence of anything. The exclusion is `flock` on
+    POSIX and `msvcrt.locking` on Windows, held for the critical section only:
+
+      * the operating system releases it when the process dies, so a killed host is never a
+        permanent wedge and no timeout-based eviction is needed at all;
+      * a live holder cannot be evicted, whatever it is doing or however long it takes;
+      * PID reuse is irrelevant, because no pid is consulted;
+      * the file is never deleted, so an old holder's release cannot remove a lock someone
+        else now holds -- on POSIX that would mean deleting the inode under them.
+
+    Waiting is bounded. When the budget runs out this raises instead of breaking in: a
+    refusal the caller can see beats a lost write it cannot.
     """
 
     def __init__(self, state_dir, timeout_s=5.0):
@@ -137,33 +152,55 @@ class _Lock(object):
         self.timeout_s = timeout_s
         self.handle = None
 
+    def _take(self, fd):
+        if os.name == 'nt':
+            import msvcrt
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b'\0')          # locking a byte needs a byte to lock
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _give_back(self, fd):
+        try:
+            if os.name == 'nt':
+                import msvcrt
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass                             # closing the descriptor releases it anyway
+
     def __enter__(self):
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        end = time.time() + self.timeout_s
+        directory = os.path.dirname(self.path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        deadline = time.time() + self.timeout_s
         while True:
+            fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
             try:
-                self.handle = os.open(self.path,
-                                      os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                self._take(fd)
+                self.handle = fd
                 return self
-            except FileExistsError:
-                if time.time() > end:
-                    # A stale lock from a killed host must not wedge delivery
-                    # forever, so it is broken rather than waited on.
-                    try:
-                        os.unlink(self.path)
-                    except OSError:
-                        pass
-                    end = time.time() + self.timeout_s
-                time.sleep(0.02)
+            except OSError:
+                os.close(fd)
+                if time.time() > deadline:
+                    raise HostError(
+                        P.E_INTERNAL,
+                        'the queue lock stayed held for %.1fs; refusing rather than '
+                        'breaking a lock that a running host may still hold'
+                        % self.timeout_s)
+                time.sleep(0.01)
 
     def __exit__(self, *_exc):
         if self.handle is not None:
+            self._give_back(self.handle)
             os.close(self.handle)
             self.handle = None
-            try:
-                os.unlink(self.path)
-            except OSError:
-                pass
         return False
 
 
