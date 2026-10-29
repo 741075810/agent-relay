@@ -106,6 +106,7 @@ jobs:
           python -B -W ignore::ResourceWarning tools/ci_unittest.py
           test_publish_hygiene
           test_t095b77_notify_doctor
+          test_t095b80_fault_recovery
           test_release_gate
           test_release_gate_timeout
 

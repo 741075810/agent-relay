@@ -536,7 +536,21 @@ def candidates_from(runs, state, arm_ids=None, origin=None, facts=None,
     that completed in the last month.
     """
     terminal = []
-    for run in runs:
+    # One run, one entry. A ledger can hold the same `requestID` twice: a resume that
+    # appended instead of replacing, a retry, a writer that never truncated. Two entries
+    # here become two candidates for one finished task, and therefore two notices -- the
+    # exact failure this feature exists to prevent. The greatest `createdAt` wins, because
+    # a re-write is the source's latest word about that run; a copy appearing later in the
+    # file only wins when the timestamps tie. Found by T095B80's duplicate-record fault;
+    # every earlier wire suite used distinct runs and never saw it.
+    _chosen = {}
+    for _run in runs:
+        _run_id = _run.get('requestID')
+        _kept = _chosen.get(_run_id)
+        if _kept is None or (int(_run.get('createdAt') or 0)
+                             >= int(_kept.get('createdAt') or 0)):
+            _chosen[_run_id] = _run
+    for run in _chosen.values():
         # T067R: the announced status is resolved from both accounts, not taken from
         # the ledger alone. A `failed` task that the ledger calls `cancelled` would
         # otherwise be reported to the operator as something they cancelled.
@@ -565,6 +579,16 @@ def candidates_from(runs, state, arm_ids=None, origin=None, facts=None,
     ledger_index = _ledger_turn_index(runs)
     for item in native_candidates(native, ledger_index):
         terminal.append(item)
+    # The ledger's own account of a run outranks channel B's for the same run id, and a
+    # run can only appear once. Ledger entries were appended first, so this keeps them.
+    _seen_runs = set()
+    _unique = []
+    for item in terminal:
+        if item['runId'] in _seen_runs:
+            continue
+        _seen_runs.add(item['runId'])
+        _unique.append(item)
+    terminal = _unique
     terminal.sort(key=lambda item: item['startedAt'])
 
     baseline, dropped = _bounded_newest_first(
