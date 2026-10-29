@@ -89,12 +89,22 @@ def save_queue(state_dir, doc):
     os.makedirs(state_dir, exist_ok=True)
     path = os.path.join(state_dir, QUEUE_FILE)
     tmp = '%s.tmp-%d' % (path, os.getpid())
-    with open(tmp, 'w', encoding='utf-8') as handle:
-        json.dump(doc, handle, ensure_ascii=False, indent=1, sort_keys=True)
-        handle.write('\n')
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp, path)
+    try:
+        with open(tmp, 'w', encoding='utf-8') as handle:
+            json.dump(doc, handle, ensure_ascii=False, indent=1, sort_keys=True)
+            handle.write('\n')
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        # A failed save must not leave debris: a full disk would then fill the state
+        # directory a little more on every retry, and the next reader has to walk past
+        # files that are not part of anything.
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 class _Lock(object):
