@@ -47,10 +47,35 @@ TAP_FAIL = re.compile(r'^[\u2139#]\s*fail (\d+)', re.MULTILINE)
 # unittest says `Ran 1 test` in the singular and `Ran 2 tests` in the plural. Requiring
 # the plural made any repository with exactly one test read as "printed no test count".
 PY_RAN = re.compile(r'^Ran (\d+) tests?\b', re.MULTILINE)
-PY_SKIPS = re.compile(r'^(?:OK|FAILED) \(skipped=(\d+)\)', re.MULTILINE)
-# unittest prints a bare `OK` when nothing was skipped. Requiring the parenthesised form
-# made a suite with zero skips read as "neither passed nor skipped cleanly".
+# unittest ends with `OK`, `OK (skipped=3)`, `FAILED (failures=1)` or
+# `FAILED (failures=1, errors=2, skipped=43)` -- the parts vary in order and number.
+PY_SUMMARY = re.compile(r'^(?:OK|FAILED) \(([^)]*)\)', re.MULTILINE)
+PY_SKIPPED = re.compile(r'skipped=(\d+)')
 PY_OK = re.compile(r'^OK\b', re.MULTILINE)
+
+# `native_turns.py` reports `zstandard_missing` and reads zero turns without this, so it
+# is a production dependency that was never declared. Its absence is invisible on the
+# machine it was written on and fatal everywhere else: the host silently finds nothing to
+# notify about. Thirty-odd tests skip without it, which made a green run greener than its
+# coverage.
+REQUIRED_PYTHON = [('zstandard', 'the host cannot read session.v4.jsonl.zstd without it')]
+NODE_ZSTD_FLOOR = (22, 15)
+
+
+def python_skips(text):
+    """Skips counted by unittest, or None when the run printed no summary line at all.
+
+    A bare `OK` means zero skips, and that is a different fact from no summary at all
+    (`NO TESTS RAN` has none). Collapsing them made a clean single-test suite read as
+    "neither passed nor skipped".
+    """
+    summary = PY_SUMMARY.search(text)
+    if summary:
+        counted = PY_SKIPPED.search(summary.group(1))
+        return int(counted.group(1)) if counted else 0
+    if PY_OK.search(text):
+        return 0
+    return None
 
 
 def parse_summary(text):
@@ -113,17 +138,51 @@ def python_suite(root):
                     '-m', 'unittest', 'discover', '-s', '.', '-p', 'test_*.py', '-v'],
                    root)
     ran = PY_RAN.search(outcome['output'])
-    skips = PY_SKIPS.search(outcome['output'])
+    skips = python_skips(outcome['output'])
     outcome['tests'] = int(ran.group(1)) if ran else 0
-    outcome['skips'] = int(skips.group(1)) if skips else 0
+    outcome['skips'] = skips or 0
     if outcome['ok'] and ran is None:
         outcome['ok'] = False
         outcome['problem'] = 'the suite printed no test count'
-    elif outcome['ok'] and skips is None and not PY_OK.search(outcome['output']):
+    elif outcome['ok'] and skips is None:
         outcome['ok'] = False
         outcome['problem'] = ('the suite neither passed nor skipped cleanly; the last '
                               'lines were: ' + outcome['output'].strip().splitlines()[-1])
     return outcome
+
+
+def dependencies(root):
+    """The optional-looking packages that are not optional.
+
+    Checked separately from the suites because their absence does not fail those suites
+    -- it makes them skip, and a skip count is exactly the number that hides a gap.
+    """
+    problems = []
+    versions = {}
+    for module, why in REQUIRED_PYTHON:
+        probe = run([sys.executable, '-B', '-c',
+                     'import %s as m; print(getattr(m, "__version__", "present"))'
+                     % module], root)
+        if probe['returncode'] != 0:
+            problems.append('%s is missing: %s (pip install -r requirements.txt)'
+                            % (module, why))
+        else:
+            versions[module] = probe['output'].strip()
+    probe = run(['node', '-e',
+                 'const z=require("node:zlib");'
+                 'if(typeof z.zstdCompressSync!=="function")'
+                 '{console.error("no zstdCompressSync");process.exit(3)}'
+                 'process.stdout.write(process.versions.node)'], root)
+    if probe['returncode'] != 0:
+        problems.append('node %d.%d or newer is required for zlib.zstdCompressSync; '
+                        'the session-log fixtures cannot be built without it'
+                        % NODE_ZSTD_FLOOR)
+    else:
+        versions['node'] = probe['output'].strip()
+    return {'name': 'dependencies', 'ok': not problems, 'problems': problems,
+            'versions': versions,
+            'output': '\n'.join(problems) if problems else
+                      ', '.join('%s %s' % (k, v) for k, v in sorted(versions.items()))}
 
 
 def js_suites(root):
@@ -207,7 +266,8 @@ def worktree_state(root):
 
 
 def gate(root, clean_clone=False):
-    parts = [worktree_state(root), hygiene(root), python_suite(root), js_suites(root)]
+    parts = [worktree_state(root), dependencies(root), hygiene(root),
+             python_suite(root), js_suites(root)]
     result = {
         'root': root,
         'ok': all(part['ok'] for part in parts),
@@ -270,6 +330,9 @@ def summarise(result):
                         'passed' if part['steps'][0]['ok'] else 'FAILED'))
         elif part['name'] == 'python suite':
             extra = '%d tests, %d skips' % (part['tests'], part['skips'])
+        elif part['name'] == 'dependencies':
+            extra = ('ok' if part['ok']
+                     else '; '.join(part.get('problems') or ['missing']))
         else:
             extra = '%d suites, %d assertions' % (part['count'], part['assertions'])
             if part['failed']:
@@ -348,6 +411,8 @@ def headline(part):
         detail = part.get('detail') or {}
         return '%s: %s unexplained, %s stale' % (name, detail.get('unexplained'),
                                                  detail.get('stale'))
+    if name == 'dependencies':
+        return name + ': ' + ', '.join(part.get('problems') or ['ok'])
     return name
 
 

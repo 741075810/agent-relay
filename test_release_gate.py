@@ -244,10 +244,21 @@ class ReportingTest(unittest.TestCase):
         self.assertTrue(lines[0].startswith('AssertionError'), lines)
 
     def test_a_passing_suite_with_no_skips_is_not_a_failure(self):
-        """unittest prints a bare `OK` when nothing was skipped, and the first version
-        of the gate read the missing `(skipped=0)` as "neither passed nor skipped"."""
-        self.assertTrue(self.gate.PY_OK.search('Ran 3 tests\n\nOK\n'))
-        self.assertIsNone(self.gate.PY_SKIPS.search('Ran 3 tests\n\nOK\n'))
+        """unittest prints a bare `OK` when nothing was skipped. Requiring the
+        parenthesised `(skipped=0)` made every clean single-test suite read as
+        "neither passed nor skipped", and `NO TESTS RAN` -- which prints no summary at
+        all -- has to stay distinguishable from it."""
+        self.assertEqual(self.gate.python_skips('Ran 3 tests\n\nOK\n'), 0)
+        self.assertEqual(self.gate.python_skips('Ran 3 tests\n\nOK (skipped=2)\n'), 2)
+        self.assertIsNone(self.gate.python_skips('\nNO TESTS RAN\n'))
+
+    def test_skips_are_counted_even_when_the_run_failed(self):
+        """`FAILED (failures=1, errors=2, skipped=43)` is how unittest reports a broken
+        run that also skipped. Reading only `(skipped=N)` as the whole parenthesis made
+        the gate print "0 skips" for a run that skipped forty-three."""
+        text = 'Ran 300 tests\n\nFAILED (failures=1, errors=2, skipped=43)\n'
+        self.assertEqual(self.gate.python_skips(text), 43)
+        self.assertEqual(self.gate.python_skips('Ran 3 tests\n\nFAILED (failures=1)\n'), 0)
 
     def test_skip_reasons_are_summarised(self):
         part = {'output': "test_a ... skipped 'no launcher'\n"

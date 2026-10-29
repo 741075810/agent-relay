@@ -1,0 +1,13 @@
+# Runtime dependencies of the native messaging host.
+#
+# One entry, and it is not optional. `native_turns.py` reads the session log
+# `session.v4.jsonl.zstd`, and without this module it reports `zstandard_missing` and
+# returns zero turns -- the notify chain then has nothing to offer and the popup says
+# there is nothing running, which looks exactly like a machine where no task ever ended.
+#
+# It was never declared, and the omission was invisible because the machine this was
+# written on already had it installed. GitHub Actions did not, and thirty-odd tests
+# skipped there instead of failing: a green run that proved less than it claimed.
+#
+# Install:  python -m pip install -r requirements.txt
+zstandard>=0.21

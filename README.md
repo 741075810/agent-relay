@@ -66,16 +66,32 @@ docs/                                                                 design not
 ## Running the tests
 
 ```powershell
-# Python: 211 tests. Needs python 3.9+; `zstandard` is used when present.
+# 1. the one runtime dependency, which is not optional
+python -m pip install -r requirements.txt
+
+# 2. Python: 278 tests.
 python -B -W ignore::ResourceWarning -m unittest discover -s . -p 'test_*.py'
 
-# JS: 44 suites on Node 20+ (node:test). No dependencies to install.
+# 3. JS: 46 suites / 2426 assertions on Node 22.15+ (see below). No packages to install.
 $env:PYTHON = (Get-Command python).Source    # the e2e suites spawn the real host
 Get-ChildItem -Filter 'test_*.mjs' | ForEach-Object { node $_.FullName }
+
+# 4. or all of it, with the publish checks, as one verdict
+python -B tools/release_gate.py
 ```
 
-Expected on a fresh clone: **Python `OK (skipped=11)`** and **JS 44/44**. The skips are
-`host_launcher.exe` and `host_manifest.json`, which are local build/config artefacts —
+`zstandard` is **required, not optional**. The session log is `session.v4.jsonl.zstd`;
+without the module `native_turns` reports `zstandard_missing` and reads zero turns, so
+the notify chain has nothing to offer and the popup says nothing is running — which looks
+identical to a machine where no task ever ended. It was undeclared for a long time and
+the omission was invisible on the machine it was written on.
+
+Node **22.15+** is required for `zlib.zstdCompressSync`, which the suites use to build
+those compressed fixtures. On Node 20 they either skip or fail, depending on how each one
+asked; `tools/release_gate.py` checks both dependencies before it runs anything.
+
+Expected on a fresh clone: **Python `OK (skipped=11)`** and **JS 0 failures**. The skips
+are `host_launcher.exe` and `host_manifest.json`, which are local build/config artefacts —
 see below. With both present the Python run is `OK` with no skips.
 
 ## Building the launcher and registering the host

@@ -26,6 +26,13 @@ jobs:
         with:
           python-version: '3.12'
 
+      # `zstandard` is a runtime dependency of host.py, not a test-only one: without it
+      # `native_turns` reports `zstandard_missing` and reads zero turns, so the notify
+      # chain has nothing to offer. It was undeclared until a runner without it turned
+      # thirty-odd tests into skips and six into errors.
+      - name: install host dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
       - uses: actions/setup-node@v4
         with:
           # 24, not 20. The session-log fixtures are zstd-compressed, and
