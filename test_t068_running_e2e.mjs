@@ -22,7 +22,7 @@ const mod = (rel) => import(new URL(rel, ROOT).href);
 
 const CONV = '3f2a1b4c-5d6e-7f80-9a1b-2c3d4e5f6071';
 const BRIDGE_RUN = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
-const BRIDGE_SESSION = 'session-d93ea870-74fe-432e-9999-aaaaaaaaaaaa';
+const BRIDGE_SESSION = 'session-dddddddd-0000-4000-8000-000000000069';
 const DIRECT_SESSION = 'session-11111111-2222-4333-8444-555555555555';
 const WORKSPACE = '--E-ApkTest--';
 const HOUR = 60 * 60 * 1000;

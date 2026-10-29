@@ -1,0 +1,43 @@
+# The publish gate, on every push.
+#
+# Runs on Windows because that is what this project is: the native messaging host, the
+# launcher and the preflight are Windows-specific, and several suites legitimately skip
+# when a Windows binary is absent. A Linux runner would report a different set of skips
+# and prove something about a platform this code does not run on.
+#
+# The checkout here *is* the clean clone that `--clean-clone` would build locally, so it
+# is not requested twice: what arrives in a runner is exactly what a reader would get.
+name: gate
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  gate:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # One step, because the point of the gate is that nobody assembles the checks by
+      # hand and nobody reads a number out of a log and retypes it.
+      - name: release gate
+        run: python -B tools/release_gate.py
+
+      # Kept as its own step so a hygiene failure is legible even when a suite is also
+      # red. The gate already ran it; repeating the scan costs a second and names the
+      # rule that fired.
+      - name: hygiene, verbose
+        if: always()
+        run: python -B tools/hygiene_scan.py --all

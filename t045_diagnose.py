@@ -8,8 +8,14 @@ starts the launcher suspended inside a kill-on-close Windows Job Object and has 
 single monotonic deadline.
 
 Run:
-    E:\\program\\python312\\python.exe -B t045_diagnose.py
-    E:\\program\\python312\\python.exe -B t045_diagnose.py --origin <32-char-id>
+    python -B t045_diagnose.py
+    python -B t045_diagnose.py --origin <32-char-id>
+
+T095B77: the run lines used to spell out one machine's interpreter path, which
+published that machine's install layout. `python` is what the reader actually types.
+Note also that this script *prints* the extension id derived from the unpacked
+path -- that is the point of it locally, but it means its output is machine
+identifying and must not be pasted into a published report verbatim.
 """
 import argparse
 import hashlib

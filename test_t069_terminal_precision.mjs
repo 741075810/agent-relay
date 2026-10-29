@@ -20,9 +20,15 @@ import assert from 'node:assert/strict';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const HERE = 'E:/ApkTest/.nixiang-analysis/chatgpt_handoff/t044_native';
+// T095B77: this used to be an absolute path into one machine's working copy, which did
+// two kinds of damage. It published the operator's directory layout in a public
+// repository, and it made the suite read the *live* tree instead of the tree under
+// test -- so on any other machine the suite threw ENOENT, and in the working copy it
+// silently verified files that the clone did not contain. Resolving from this file's
+// own URL fixes both: every checkout tests itself.
+const HERE = fileURLToPath(new URL('.', import.meta.url));
 const LIB = join(HERE, 'extension/lib');
 
 // The lib is Chrome-flavoured ESM; node needs `.mjs` copies with the specifiers fixed.

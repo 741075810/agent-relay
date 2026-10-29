@@ -34,8 +34,14 @@ try:
 except Exception:                                                     # pragma: no cover
     zstandard = None
 
-SESSION_DIR = 'session-644cd4ce-7fe7-432e-b48e-33eef537214b'
-BRIDGE_SESSION = 'session-d93ea870-74fe-432e-9999-aaaaaaaaaaaa'
+# T095B77: SESSION_DIR was a real DSH session id copied out of the operator's own
+# machine, and BRIDGE_SESSION kept a real-looking first two groups with a fabricated
+# tail. Both are fixtures -- they name a temporary directory and are compared to
+# themselves -- so they can be synthetic without weakening a single assertion. The
+# published-repository scan now looks for `session-<uuid>` precisely because this gate
+# claimed to protect against identifiers and did not look for the commonest one here.
+SESSION_DIR = 'session-cccccccc-0000-4000-8000-000000000068'
+BRIDGE_SESSION = 'session-dddddddd-0000-4000-8000-000000000069'
 DIRECT_SESSION = 'session-11111111-2222-4333-8444-555555555555'
 WORKSPACE = '--E-ApkTest--'
 BASE_MS = 1793260000000

@@ -1,0 +1,35 @@
+# Hygiene allowlist: `rule  path  reason`
+#
+# A reason is mandatory and is checked by test_publish_hygiene.py -- an exception
+# without a reason becomes indistinguishable from an oversight within one release.
+# Entries match by rule and path prefix, so an entry excuses every finding of that rule
+# in that file. That is coarse on purpose (excerpts are masked and would be fragile to
+# match on), and it is why the scan prints every excused line on every run: the point of
+# the allowlist is to keep the judgement visible, not to make the output quiet.
+#
+# Nothing here may be added to silence a finding without knowing what the value is.
+
+# --- known debt 1: the launcher's compiled-in default interpreter path -------------
+# HostLauncher.cs bakes one machine's Python path in as the default, and
+# build_launcher.ps1 passes it at build time. Replacing it means rebuilding
+# host_launcher.exe, whose hash the preflight pins, and restarting the running host --
+# both out of scope for a change that must not require the operator to do anything.
+# Tracked in docs/PUBLISHING.md as daytime work. Low identifying value (an install
+# path, no account name), but it is still one machine's layout and should go.
+windows-path  launcher/HostLauncher.cs  compiled-in default interpreter path; needs a launcher rebuild + preflight hash update (daytime)
+windows-path  launcher/build_launcher.ps1  build-time interpreter and csc paths; same rebuild dependency (daytime)
+
+# --- a docstring that explains escaping, using the placeholder, not a real account --
+windows-user-path  run_origin.py  literal placeholder C:\\Users\\... in a docstring about quoting; no account name present
+windows-path       run_origin.py  same placeholder, matched by the narrower path rule as well
+
+# --- fictional fixture paths -------------------------------------------------------
+# `secret-project` is not a directory anyone has. Two suites share the spelling.
+windows-path  test_t059_terminal_source.py  fictional fixture path (secret-project)
+windows-path  test_t059_terminal_wire.py  fictional fixture path (secret-project)
+
+# --- fabricated fixtures -----------------------------------------------------------
+# Judged fabricated because the same value appears in more than one suite as a shared
+# constant, which is not how a value copied out of a run behaves.
+conversation-id  test_t066_baseline_state.mjs  fabricated constant, same value as CONV in test_t068_running_e2e.mjs
+conversation-id  test_t095b75_reload_alarm.mjs  fabricated 'c0ffee00' joke constant used as a run/conversation fixture
