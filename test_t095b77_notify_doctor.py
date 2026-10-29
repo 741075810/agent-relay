@@ -291,5 +291,133 @@ class DegradedTest(DoctorTestCase):
         self.assertIn('bridge_ledger_not_read', report['limitations'])
 
 
+class DeliveryEvidenceTest(DoctorTestCase):
+    """A delivery is claimed only on a timestamp, never on the fact that someone wrote
+    the word.
+
+    The first version counted any non-empty `consumerDeliveredAt` as taken, so a receipt
+    stub with no time read as proof that a notice had arrived. That is the failure mode
+    worth a whole class of tests: it invents evidence, and it does it in the direction
+    that makes a broken chain look healthy.
+    """
+
+    def test_a_consumer_receipt_with_a_time_is_evidence(self):
+        entry = event(ident(1))
+        entry['consumerDeliveredAt'] = {'at': NOW_SECONDS - 300}
+        self.write_defaults(origin_ids=[ident(1)], armed=[ident(1)], events=[entry])
+        report = self.run_tool()
+        self.assertEqual(report['delivery'], 'evidenced')
+        self.assertEqual(report['primary'], 'delivered')
+
+    def test_a_short_key_receipt_carrying_one_time_is_evidence(self):
+        """`{'c': <epoch seconds>}` is a shape a real consumer writes. One number with no
+        label is still a number, and a receipt has no other reason to hold one."""
+        entry = event(ident(1))
+        entry['consumerDeliveredAt'] = {'c': NOW_SECONDS - 300}
+        self.write_defaults(origin_ids=[ident(1)], armed=[ident(1)], events=[entry])
+        self.assertEqual(self.run_tool()['delivery'], 'evidenced')
+
+    def test_an_iso_receipt_is_evidence(self):
+        entry = event(ident(1))
+        entry['consumerDeliveredAt'] = {'deliveredAt': '2027-01-15T07:25:00Z'}
+        self.write_defaults(origin_ids=[ident(1)], armed=[ident(1)], events=[entry])
+        self.assertEqual(self.run_tool()['delivery'], 'evidenced')
+
+    def test_a_receipt_stub_with_no_time_is_unknown_not_delivered(self):
+        entry = event(ident(1))
+        entry['deliveredAt'] = 0
+        entry['consumerDeliveredAt'] = {'c': True}
+        self.write_defaults(origin_ids=[ident(1)], armed=[ident(1)], events=[entry])
+        report = self.run_tool()
+        self.assertEqual(report['delivery'], 'claimed_only')
+        self.assertEqual(report['primary'], 'delivery_claimed_without_timestamp')
+        self.assertIn('delivery_claimed_without_timestamp', self.codes(report, 'unknown'))
+        # Unknown is not a break: the chain may be fine, this tool just cannot say.
+        self.assertIs(report['chain_intact'], True)
+        self.assertNotIn(report['primary'], ('delivered',))
+
+    def test_a_status_word_alone_is_not_evidence(self):
+        entry = event(ident(1))
+        entry['deliveredAt'] = 0
+        entry['consumerDeliveredAt'] = {}
+        entry['status'] = 'delivered'
+        entry['deliveries'] = 2
+        self.write_defaults(origin_ids=[ident(1)], armed=[ident(1)], events=[entry])
+        report = self.run_tool()
+        self.assertEqual(report['delivery'], 'claimed_only')
+        self.assertNotEqual(report['primary'], 'delivered')
+
+    def test_an_event_with_nothing_said_is_undelivered(self):
+        entry = event(ident(1))
+        entry['deliveredAt'] = 0
+        entry['consumerDeliveredAt'] = {}
+        entry['status'] = 'queued'
+        entry['deliveries'] = 0
+        self.write_defaults(origin_ids=[ident(1)], armed=[ident(1)], events=[entry])
+        report = self.run_tool()
+        self.assertEqual(report['delivery'], 'none')
+        self.assertIn('waiting_for_consumer', self.codes(report, 'blocker'))
+
+    def test_a_real_failure_outranks_an_unknown(self):
+        """`primary` names one thing. A definite break must not be pushed out by a
+        maybe, or the report reads as uncertainty when it is actually a fault."""
+        entry = event(ident(2))
+        entry['deliveredAt'] = 0
+        entry['consumerDeliveredAt'] = {'c': True}
+        self.write_defaults(origin_ids=[ident(1), ident(2)],
+                            pending=[ident(2), ident(3)], armed=[ident(2), ident(3)],
+                            events=[entry])
+        report = self.run_tool()
+        self.assertEqual(report['primary'], 'armed_but_not_enqueued')
+        self.assertIs(report['chain_intact'], False)
+
+
+class StatsOutputTest(DoctorTestCase):
+    """The structured form has to be safe to paste somewhere else.
+
+    `--json` is the full report: it carries the state directory and consumer names,
+    because it is meant for the machine that produced it. `--json-stats` is the same
+    reasoning with the identifying parts removed, so it can leave the machine.
+    """
+
+    def test_the_stats_form_carries_no_identifier(self):
+        entry = event(ident(1))
+        entry['consumerDeliveredAt'] = {'at': NOW_SECONDS - 300}
+        self.write_defaults(origin_ids=[ident(1)], armed=[ident(1)], events=[entry])
+        report = self.run_tool()
+        text = json.dumps(self.tool.stats_only(report), ensure_ascii=False)
+        self.assertNotIn(ident(1), text)
+        self.assertNotIn('dsh-ext-fixture', text)
+        self.assertNotIn(self.root, text)
+        self.assertNotIn(os.path.dirname(self.root), text)
+        self.assertIsNone(UUID_SHAPE.search(text))
+        self.assertIsNone(HASH_SHAPE.search(text))
+
+    def test_the_stats_form_still_names_the_rules(self):
+        self.write_defaults(origin_ids=[ident(1)], pending=[ident(2)],
+                            armed=[ident(3)])
+        stats = self.tool.stats_only(self.run_tool())
+        self.assertIn('pending_not_armed', stats['codes'])
+        self.assertEqual(stats['grades']['expected'], 1)
+        self.assertEqual(stats['grades']['blocker'], 0)
+        self.assertIn('primary', stats)
+        self.assertIn('delivery', stats)
+
+    def test_consumer_names_become_a_count(self):
+        self.write_defaults(origin_ids=[ident(1)])
+        stats = self.tool.stats_only(self.run_tool())
+        self.assertEqual(stats['stages']['queue']['consumers'], 1)
+
+    def test_the_cli_offers_the_safe_form(self):
+        self.write_defaults(origin_ids=[ident(1)])
+        done = subprocess.run([sys.executable, '-B', TOOL, '--state', self.root,
+                               '--json-stats'], stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT)
+        self.assertEqual(done.returncode, 0, done.stdout)
+        document = json.loads(done.stdout.decode('utf-8'))
+        self.assertIn('grades', document)
+        self.assertNotIn(self.root, done.stdout.decode('utf-8'))
+
+
 if __name__ == '__main__':
     unittest.main()

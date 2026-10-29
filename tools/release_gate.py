@@ -106,23 +106,72 @@ def child_env():
     return env
 
 
-def run(command, cwd, timeout=1800):
+# A hung suite must produce a verdict, not a stack trace. `subprocess.run(timeout=...)`
+# kills the child it started -- but the e2e suites start their own host process, and that
+# grandchild survives the kill and holds the pipe open. Killed by group, not by pid.
+STEP_TIMEOUT = 1800
+
+
+def kill_tree(proc):
+    """Kill a child and everything it started."""
+    if os.name == 'nt':
+        subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)],
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=60)
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), 9)
+        except OSError:
+            proc.kill()
+
+
+def run(command, cwd, timeout=None):
+    """Run one step, and never let it run forever.
+
+    On timeout the result says so and carries whatever output arrived first, so the gate
+    can name the step that hung. The first version let `TimeoutExpired` escape, which
+    killed the whole gate with a traceback: the run that is supposed to explain a failure
+    became an unexplained failure of its own.
+    """
+    limit = STEP_TIMEOUT if timeout is None else timeout
     started = time.time()
-    done = subprocess.run(command, cwd=cwd, stdin=subprocess.DEVNULL,
-                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                          env=child_env(), timeout=timeout)
+    options = {}
+    if os.name == 'nt':
+        options['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        options['start_new_session'] = True
+    proc = subprocess.Popen(command, cwd=cwd, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            env=child_env(), **options)
+    timed_out = False
+    try:
+        out = proc.communicate(timeout=limit)[0]
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        kill_tree(proc)
+        try:
+            out = proc.communicate(timeout=60)[0]
+        except subprocess.TimeoutExpired:
+            out = b''
     return {
         'command': ' '.join(command),
-        'returncode': done.returncode,
-        'output': done.stdout.decode('utf-8', 'replace'),
+        'returncode': None if timed_out else proc.returncode,
+        'output': (out or b'').decode('utf-8', 'replace'),
         'seconds': round(time.time() - started, 1),
+        'timeout': timed_out,
+        'timeout_seconds': limit,
     }
 
 
-def step(name, command, cwd, timeout=1800):
+def step(name, command, cwd, timeout=None):
     outcome = run(command, cwd, timeout)
     outcome['name'] = name
-    outcome['ok'] = outcome['returncode'] == 0
+    if outcome['timeout']:
+        outcome['ok'] = False
+        outcome['problem'] = ('<no verdict> timed out after %ss and was killed with its '
+                              'children' % outcome['timeout_seconds'])
+    else:
+        outcome['ok'] = outcome['returncode'] == 0
     return outcome
 
 
@@ -227,7 +276,8 @@ def js_suites(root):
         suites.append(outcome)
     return {'name': 'js suites', 'suites': suites,
             'count': len(names) - len(helpers), 'helpers': helpers,
-            'failed': failed, 'assertions': assertions, 'ok': not failed}
+            'failed': failed, 'assertions': assertions, 'ok': not failed,
+            'timed_out': [entry['name'] for entry in suites if entry.get('timeout')]}
 
 
 def hygiene(root):
@@ -337,6 +387,8 @@ def summarise(result):
             extra = '%d suites, %d assertions' % (part['count'], part['assertions'])
             if part['failed']:
                 extra += '; failing: ' + ', '.join(part['failed'])
+            if part.get('timed_out'):
+                extra += '; timed out: ' + ', '.join(part['timed_out'])
         print('%-8s %-14s %s' % (mark, part['name'], extra))
         if not part['ok']:
             for line in detail_lines(part):
@@ -501,6 +553,7 @@ def github_report(result):
 
 
 def main(argv=None):
+    global STEP_TIMEOUT
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', default=HERE)
     parser.add_argument('--clean-clone', action='store_true',
@@ -513,8 +566,16 @@ def main(argv=None):
     parser.add_argument('--skip-worktree', action='store_true',
                         help='run the checks but do not require a clean worktree; use '
                              'before committing, not before pushing')
+    parser.add_argument('--step-timeout', type=int, default=None,
+                        help='seconds any single step may run before it is killed with '
+                             'its children and reported as a failure (default %d). CI '
+                             'sets this to the job budget so a hung suite is named '
+                             'rather than timing the job out with no verdict.'
+                             % STEP_TIMEOUT)
     args = parser.parse_args(argv)
 
+    if args.step_timeout:
+        STEP_TIMEOUT = args.step_timeout
     root = os.path.abspath(args.root)
     result = gate(root, clean_clone=args.clean_clone)
     if args.skip_worktree:

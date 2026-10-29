@@ -1,12 +1,20 @@
 # The publish gate, on every push.
 #
-# Runs on Windows because that is what this project is: the native messaging host, the
-# launcher and the preflight are Windows-specific, and several suites legitimately skip
-# when a Windows binary is absent. A Linux runner would report a different set of skips
-# and prove something about a platform this code does not run on.
+# The main job runs on Windows because that is what this project is: the native messaging
+# host, the launcher and the preflight are Windows-specific, and several suites
+# legitimately skip when a Windows binary is absent.
 #
-# The checkout here *is* the clean clone that `--clean-clone` would build locally, so it
-# is not requested twice: what arrives in a runner is exactly what a reader would get.
+# The second job runs the *tooling* suites on Linux. Those tools -- the hygiene scanner,
+# the notify doctor, the release gate itself -- are ordinary Python and Node, they run on
+# both platforms, and they were only ever exercised on one. Path separators, line endings
+# and the encoding of `git ls-files` output are exactly the kind of thing that works on
+# the machine it was written on; a second platform is the cheapest way to find out.
+#
+# Actions are pinned by commit SHA rather than by tag. A tag can be moved; a commit cannot.
+# Each pin carries its version in a comment, and the SHA was read from the tag through the
+# GitHub API on 2026-10-30 -- a tag that is force-moved later no longer changes what runs
+# here, which is the whole point. Bumping one means writing a new SHA and the version it
+# claims to be.
 name: gate
 
 on:
@@ -17,12 +25,13 @@ on:
 
 jobs:
   gate:
+    name: gate (windows)
     runs-on: windows-latest
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: '3.12'
 
@@ -33,7 +42,7 @@ jobs:
       - name: install host dependencies
         run: python -m pip install --disable-pip-version-check -r requirements.txt
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
           # 24, not 20. The session-log fixtures are zstd-compressed, and
           # `zlib.zstdCompressSync` arrived in Node 22.15; on Node 20 the suites either
@@ -49,12 +58,52 @@ jobs:
       # are public. Job logs need `actions: read`; annotations do not, so a red run can
       # be diagnosed without a token. The first six runs of this workflow were red and
       # the only thing readable was "Process completed with exit code 1".
+      #
+      # `--step-timeout 900` bounds any single suite. A hung suite then fails *by name*
+      # in fifteen minutes instead of letting the forty-minute job time out with no
+      # verdict, which is the least useful outcome a gate can produce.
       - name: release gate
-        run: python -B tools/release_gate.py --github
+        run: python -B tools/release_gate.py --github --step-timeout 900
 
       # Kept as its own step so a hygiene failure is legible even when a suite is also
       # red. The gate already ran it; repeating the scan costs a second and names the
       # rule that fired.
+      - name: hygiene, verbose
+        if: always()
+        run: python -B tools/hygiene_scan.py --all
+
+  tools:
+    name: tools (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: '24'
+
+      - name: install host dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      # Only the suites that make no Windows claim. The rest legitimately belong to the
+      # job above; running them here would produce skips that look like coverage.
+      #
+      # `test_release_gate_timeout` hangs a step on purpose and asserts the gate kills it
+      # within a bounded time -- so this job is also the place where "the kill works on a
+      # POSIX process group" gets checked, rather than assumed from the Windows path.
+      - name: tooling suites
+        run: >-
+          python -B -W ignore::ResourceWarning -m unittest -v
+          test_publish_hygiene
+          test_t095b77_notify_doctor
+          test_release_gate
+          test_release_gate_timeout
+
       - name: hygiene, verbose
         if: always()
         run: python -B tools/hygiene_scan.py --all
