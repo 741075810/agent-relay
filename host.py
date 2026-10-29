@@ -602,8 +602,18 @@ def serve(state_dir, manifest_path, stdin, stdout, ledger_root=None,
             return 1
         if doc is None:
             return 0
-        response = handle_request(state_dir, doc, ledger_root, bridge_db,
-                                  bridge_fixture, native_root)
+        try:
+            response = handle_request(state_dir, doc, ledger_root, bridge_db,
+                                      bridge_fixture, native_root)
+        except Exception as exc:                   # noqa: BLE001
+            # A write that fails -- a full disk, a killed process, a permission that
+            # changed under us -- must not take the request with it. Raising here left the
+            # caller with no answer at all, and because the next request reads the same
+            # full disk, it failed the same way: the popup saw a dead pipe instead of
+            # "the state file could not be written". Named, and fail-closed.
+            ident = doc.get('id') if isinstance(doc, dict) else None
+            response = P.error_response(ident, P.E_INTERNAL,
+                                        '%s: %s' % (type(exc).__name__, exc))
         try:
             stdout.write(P.encode(response))
             stdout.flush()
