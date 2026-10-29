@@ -254,8 +254,7 @@ def summarise(result):
                 extra += '; failing: ' + ', '.join(part['failed'])
         print('%-8s %-14s %s' % (mark, part['name'], extra))
         if not part['ok']:
-            tail = part.get('output', '').strip().splitlines()[-6:]
-            for line in tail:
+            for line in detail_lines(part):
                 print('         ' + line)
     if result['clean_clone']:
         clone = result['clean_clone']
@@ -268,12 +267,100 @@ def summarise(result):
     return 0 if result['ok'] else 1
 
 
+# The lines that say why, out of a suite's whole output. A bare tail is not enough: a
+# node:test suite prints its failing assertion above its summary, so the tail shows
+# "fail 1" and nothing about what failed.
+HIGH_LINE = re.compile(
+    r'(^FAIL:|^ERROR:|^FAILED \(|AssertionError|^not ok |^# Subtest|^  FAIL |'
+    r'ModuleNotFoundError|ImportError|^Error:|^error:|unexplained|ENOENT|EACCES|'
+    r'EPERM|^Could not|^cannot |exit code)')
+LOW_LINE = re.compile(r'(Traceback|^\s+File "|^\s+\w+Error|\^)')
+
+# Annotations are part of the public check-run record, so a machine path must not ride
+# out on one. The negative test that proved this module works printed the operator's
+# own temp directory into an annotation.
+ABSOLUTE_PATH = re.compile(r'[A-Za-z]:[\\/][^\s"\')]*')
+USER_SEGMENT = re.compile(r'(Users[\\/]+)[^\\/\s"\')]+')
+
+
+def scrub(text):
+    return USER_SEGMENT.sub(r'\1<user>', ABSOLUTE_PATH.sub('<path>', text))
+
+
+def detail_lines(part, limit=8):
+    """The few lines of a part's output that explain the failure, most telling first."""
+    if part.get('problem'):
+        return [scrub(str(part['problem']))][:limit]
+    text = part.get('output') or ''
+    high, low = [], []
+    for line in text.splitlines():
+        stripped = line.rstrip()
+        if not stripped:
+            continue
+        if HIGH_LINE.search(stripped):
+            high.append(scrub(stripped[:300]))
+        elif LOW_LINE.search(stripped):
+            low.append(scrub(stripped[:300]))
+    picked = (high + low)[:limit]
+    if picked:
+        return picked
+    return [scrub(line) for line in text.strip().splitlines()[-limit:]]
+
+
+def github_escape(text):
+    return (text.replace('%', '%25').replace('\r', '%0D')
+            .replace('\n', '%0A').replace(':', '%3A').replace(',', '%2C'))
+
+
+def github_report(result):
+    """Emit `::error::` / `::notice::` workflow commands.
+
+    The reason is not only in the log: job logs need `actions: read`, so an operator (or
+    an agent) without that scope can see *that* CI is red and not *why*. Annotations are
+    part of the public check-run record, so a failure that explains itself here can be
+    read with an unauthenticated API call. That is how the first red run was diagnosed.
+    """
+    emitted = 0
+    for part in result['parts']:
+        if part['ok']:
+            continue
+        for line in detail_lines(part):
+            if emitted >= 8:
+                break
+            print('::error title=gate %s::%s'
+                  % (github_escape(part['name']), github_escape(line)))
+            emitted += 1
+    clone = result.get('clean_clone')
+    if clone and not clone['ok']:
+        for problem in (clone.get('problems') or [])[:3]:
+            print('::error title=gate clean-clone::%s' % github_escape(problem))
+            emitted += 1
+    if result['ok']:
+        parts = {part['name']: part for part in result['parts']}
+        py = parts.get('python suite', {})
+        js = parts.get('js suites', {})
+        hy = parts.get('hygiene', {}).get('detail', {})
+        print('::notice title=gate::passed: python %s tests, js %s suites/%s '
+              'assertions, hygiene %s unexplained/%s excused/%s stale'
+              % (py.get('tests'), js.get('count'), js.get('assertions'),
+                 hy.get('unexplained'), hy.get('excused'), hy.get('stale')))
+    else:
+        failing = [part['name'] for part in result['parts'] if not part['ok']]
+        print('::error title=gate verdict::DO NOT PUSH -- failing: %s'
+              % github_escape(', '.join(failing) or 'clean clone'))
+    return 0 if result['ok'] else 1
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', default=HERE)
     parser.add_argument('--clean-clone', action='store_true',
                         help='also clone HEAD and run both suites there')
     parser.add_argument('--json', action='store_true')
+    parser.add_argument('--github', action='store_true',
+                        help='emit ::error::/::notice:: workflow commands so the reason '
+                             'survives in the check-run annotations, which unlike job '
+                             'logs need no token to read')
     parser.add_argument('--skip-worktree', action='store_true',
                         help='run the checks but do not require a clean worktree; use '
                              'before committing, not before pushing')
@@ -296,7 +383,10 @@ def main(argv=None):
                               if k in p}} for p in result['parts']]}
         print(json.dumps(slim, indent=2))
         return 0 if result['ok'] else 1
-    return summarise(result)
+    code = summarise(result)
+    if args.github:
+        github_report(result)
+    return code
 
 
 if __name__ == '__main__':

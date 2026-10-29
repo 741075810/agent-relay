@@ -32,8 +32,13 @@ jobs:
 
       # One step, because the point of the gate is that nobody assembles the checks by
       # hand and nobody reads a number out of a log and retypes it.
+      #
+      # `--github` makes the failure explain itself in the check-run annotations, which
+      # are public. Job logs need `actions: read`; annotations do not, so a red run can
+      # be diagnosed without a token. The first six runs of this workflow were red and
+      # the only thing readable was "Process completed with exit code 1".
       - name: release gate
-        run: python -B tools/release_gate.py
+        run: python -B tools/release_gate.py --github
 
       # Kept as its own step so a hygiene failure is legible even when a suite is also
       # red. The gate already ran it; repeating the scan costs a second and names the
