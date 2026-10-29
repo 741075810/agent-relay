@@ -137,6 +137,8 @@ document.getElementById('scan').addEventListener('click', async () => {
 const bindingMessageTypes = new Set([
   't053-binding-state', 't053-binding-scan', 't053-binding-confirm',
   't053-binding-health', 't053-binding-clear',
+  // T095B76: re-inject the read-only observer into one named tab.
+  't053-binding-reconnect',
 ]);
 
 function bindingAsk(message) {
@@ -208,6 +210,49 @@ function renderScanDiagnostics(container, reply, now) {
       rejected.map((item) => describeRejection(item, now)).join('\n\n');
   }
   container.appendChild(block);
+  // T095B76: the one rejection an operator can fix from here. A reload in
+  // chrome://extensions orphans the content script in an already-open page, and the
+  // tab then reports `content_unavailable` -- which is not a target the binding may
+  // accept, so without this the tab is unbindable until the page is refreshed. The
+  // button is per tab, names the tab it will touch, and does nothing else.
+  const orphaned = rejected.filter((item) => item && item.status === 'content_unavailable' &&
+    Number.isSafeInteger(item.tabId));
+  if (!orphaned.length) return;
+  const hint = document.createElement('p');
+  hint.className = 'mod-note';
+  hint.textContent = '以下标签的内容脚本在扩展重载后已断开。重连只把只读探针放回去，' +
+    '不改绑定、不发通知；重连成功后重新扫描即可绑定，不需要刷新页面。';
+  container.appendChild(hint);
+  for (const item of orphaned) {
+    const row = document.createElement('div');
+    const label = document.createElement('pre');
+    label.textContent = 'tabId=' + item.tabId + '\n' + (item.url || 'URL 不可用');
+    const button = document.createElement('button');
+    button.textContent = '重连此标签页的内容脚本';
+    button.addEventListener('click', async () => {
+      button.disabled = true;
+      button.textContent = '正在重连…';
+      const reply = await bindingAsk({ type: 't053-binding-reconnect',
+        tabId: item.tabId });
+      const attempt = reply && reply.ok ? reply.result : null;
+      if (!attempt || attempt.ok !== true) {
+        button.disabled = false;
+        button.textContent = '重连失败，重试';
+        const why = document.createElement('pre');
+        why.textContent = '重连未成功: ' +
+          ((attempt && attempt.code) || (reply && reply.error) || 'unknown') +
+          (attempt && attempt.error ? '\n' + attempt.error : '');
+        row.appendChild(why);
+        return;
+      }
+      button.textContent = '已重连，重新扫描…';
+      // Re-scan so the newly readable tab appears as a confirmable candidate. The
+      // binding still needs the typed phrase; this only re-measures.
+      document.getElementById('bindingScan').click();
+    });
+    row.append(label, button);
+    container.appendChild(row);
+  }
 }
 
 function showCandidateButtons(candidates, currentBinding, diagnostics) {
@@ -245,6 +290,15 @@ function showCandidateButtons(candidates, currentBinding, diagnostics) {
     });
     row.append(description, button);
     els.bindingCandidates.appendChild(row);
+  }
+  // Orphaned tabs get their reconnect control even when some other tab is bindable,
+  // otherwise a second ChatGPT tab that lost its script would be invisible here for
+  // exactly as long as it was inconvenient.
+  const orphans = (diagnostics && Array.isArray(diagnostics.rejected)
+    ? diagnostics.rejected : []).filter((item) => item &&
+    item.status === 'content_unavailable');
+  if (orphans.length) {
+    renderScanDiagnostics(els.bindingCandidates, diagnostics, Date.now());
   }
 }
 

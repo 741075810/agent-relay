@@ -33,6 +33,7 @@ export const RECONNECT_CODES = {
   urlChanged: 'reconnect_url_changed',
   notConversation: 'reconnect_not_a_conversation',
   tabGone: 'reconnect_tab_gone',
+  badTab: 'reconnect_bad_tab_id',
   refused: 'reconnect_refused',
 };
 
@@ -92,6 +93,36 @@ export async function ensureContentScript(api, target, options = {}) {
       error: String(err && err.message ? err.message : err),
     });
   }
+}
+
+/**
+ * Reconnect one tab named by the operator, before anything is bound to it.
+ *
+ * The automatic path above can only repair a tab that is *already* bound, which leaves
+ * a hole on the first reload after an upgrade: the mirror is empty, so there is no
+ * binding to restore, so nothing automatic ever runs -- and `scan` reports every
+ * ChatGPT tab `content_unavailable`, which means no candidate can be confirmed at all
+ * and the only way forward is refreshing the page. That is the step this exists to
+ * remove.
+ *
+ * It is not consent. It re-injects the read-only observer into one tab, and the tab is
+ * named by the operator's own click in the popup; binding that tab still requires the
+ * typed confirmation phrase afterwards. Nothing here can write to a page.
+ */
+export async function reconnectTabById(api, tabId, options = {}) {
+  if (!Number.isSafeInteger(tabId)) return code(RECONNECT_CODES.badTab);
+  if (!api || !api.tabs || typeof api.tabs.get !== 'function') {
+    return code(RECONNECT_CODES.unsupported);
+  }
+  const tab = await api.tabs.get(tabId).catch(() => null);
+  if (!tab) return code(RECONNECT_CODES.tabGone);
+  const parsed = parseConversationUrl(tab.url);
+  if (!parsed.ok) return code(RECONNECT_CODES.notConversation);
+  // The URL is read here and re-checked inside `ensureContentScript` against the same
+  // read, so the injection can only happen while the tab is showing that exact
+  // conversation -- a navigation between the two reads is caught rather than ignored.
+  return ensureContentScript(api,
+    { tabId, url: tab.url, conversationId: parsed.conversationId }, options);
 }
 
 /**

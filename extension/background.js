@@ -31,7 +31,8 @@ import { createChromeAutoSend } from './lib/autosend_chrome_wiring.js';
 // session-scoped binding. The first is repaired by re-injecting the read-only
 // observer, the second by mirroring the binding into `local`. Neither widens what a
 // notice may do: every send still re-probes the tab and re-checks the document.
-import { createResilientProbe, ensureContentScript } from './lib/content_reconnect.js';
+import { createResilientProbe, ensureContentScript, reconnectTabById }
+  from './lib/content_reconnect.js';
 import { createMirroredSession, BINDING_RESTORED_AT_KEY } from './lib/binding_mirror.js';
 // The limits themselves (defaults and hard bounds), so the popup reports the
 // numbers the code actually enforces. Missing this import was a live defect: the
@@ -467,6 +468,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: true, result: await targetBinding.health() });
         } else if (msg.type === 't053-binding-clear') {
           sendResponse({ ok: true, result: await targetBinding.clear(msg.confirmation) });
+        } else if (msg.type === 't053-binding-reconnect') {
+          // T095B76: the operator names one tab, in their own popup, to have its
+          // observer put back. Without this the first reload after an upgrade is a
+          // dead end -- no mirror yet, so nothing automatic runs, and every scanned
+          // tab reports `content_unavailable`, which cannot be confirmed. The old
+          // escape was refreshing the page.
+          const attempt = await reconnectTabById(chrome, msg.tabId);
+          await note({ kind: attempt.ok ? 'content-reconnected-by-operator'
+            : 'content-reconnect-by-operator-failed',
+          tabId: Number.isSafeInteger(msg.tabId) ? msg.tabId : null,
+          code: attempt.code || null }).catch(() => {});
+          sendResponse({ ok: true, result: attempt });
         } else {
           sendResponse({ ok: false, error: 'unknown_t053_binding_request' });
         }

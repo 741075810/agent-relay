@@ -522,10 +522,62 @@ section('T095B76/10  a second listener in the same document cannot write');
 }
 
 // =====================================================================
-// 11. The reload still restores the terminal timer, and the binding state
+// 11. The first reload after an upgrade is not a dead end
+// =====================================================================
+section('T095B76/11  a tab can be reconnected by name, before anything is bound');
+{
+  scripts.clear();
+  const browser = fakeBrowser([
+    { id: 7, windowId: 3, url: URL_OK, documentInstanceId: 'doc-7aaaaaaaaaaaaaaaaaaa' },
+    { id: 11, windowId: 3, url: 'https://chatgpt.com/', documentInstanceId: 'doc-dddddddddddddddddddd' },
+    { id: 12, windowId: 3, url: 'https://example.test/c/' + CONV,
+      documentInstanceId: 'doc-eeeeeeeeeeeeeeeeeeee' },
+  ]);
+  const named = await CR.reconnectTabById(browser.api, 7);
+  check(named.ok === true && named.code === CR.RECONNECT_CODES.injected,
+    'the tab the operator named is reconnected (' + named.code + ')');
+  check(browser.log.injected.length === 1 &&
+    browser.log.injected[0].target.tabId === 7,
+    'and only that tab was touched');
+  const notConv = await CR.reconnectTabById(browser.api, 11);
+  check(notConv.ok === false && notConv.code === CR.RECONNECT_CODES.notConversation,
+    'a tab that is not a conversation is refused (' + notConv.code + ')');
+  const wrongHost = await CR.reconnectTabById(browser.api, 12);
+  check(wrongHost.ok === false,
+    'and so is a path that looks like a conversation on another host ('
+    + wrongHost.code + ')');
+  const badId = await CR.reconnectTabById(browser.api, 'seven');
+  check(badId.ok === false && badId.code === CR.RECONNECT_CODES.badTab,
+    'a non-integer tab id never reaches tabs.get (' + badId.code + ')');
+  const missing = await CR.reconnectTabById(browser.api, 999);
+  check(missing.ok === false && missing.code === CR.RECONNECT_CODES.tabGone,
+    'a tab that is not there is refused (' + missing.code + ')');
+  check(browser.log.injected.length === 1,
+    'and none of the refusals injected anything');
+
+  const bg = read('extension/background.js');
+  check(/msg\.type === 't053-binding-reconnect'/.test(bg),
+    'the popup can ask for it');
+  check(/const attempt = await reconnectTabById\(chrome, msg\.tabId\)/.test(bg),
+    'and the background passes the named tab straight through');
+  const popup = read('extension/popup.js');
+  check(/'t053-binding-reconnect'/.test(popup),
+    'the popup is allowed to send it');
+  check(/item\.status === 'content_unavailable'/.test(popup),
+    'and only offers it for a tab whose observer is actually gone');
+  // The button must not become a second way to bind: it re-injects, then re-scans,
+  // and the binding still needs the typed phrase.
+  check(!/t053-binding-confirm/.test(popup.slice(
+    popup.indexOf("item.status === 'content_unavailable'"),
+    popup.indexOf("item.status === 'content_unavailable'") + 2200)),
+    'the reconnect control never confirms a binding itself');
+}
+
+// =====================================================================
+// 12. The reload still restores the terminal timer, and the binding state
 //     the grant points at is the one that was confirmed
 // =====================================================================
-section('T095B76/11  reload: timer restored, revision and grant untouched');
+section('T095B76/12  reload: timer restored, revision and grant untouched');
 {
   const background = read('extension/background.js');
   check(background.includes('await restoreTerminalAlarm();'),
