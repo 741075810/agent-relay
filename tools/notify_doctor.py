@@ -301,7 +301,15 @@ def diagnose(state, now_ms=None, stale_ms=DEFAULT_STALE_MINUTES * 60 * 1000):
         for values in consumer_acks.values():
             if isinstance(values, list):
                 acked_ids |= set(values)
-    acknowledged = len(acked_ids)
+    # Only acknowledgements of events still in the queue describe *this* state. The acked
+    # set is history -- an event leaves the queue when it is consumed -- so counting it
+    # whole made a quiet chain report `consumer_acknowledged` beside
+    # `delivery: nothing_deliverable`, which reads as two answers to one question.
+    current_ids = set()
+    for event in events:
+        if isinstance(event, dict) and isinstance(event.get('eventId'), str):
+            current_ids.add(event['eventId'])
+    acknowledged = len(acked_ids & current_ids)
     report['stages']['queue'] = {
         'events': len(events), 'deliverable': deliverable, 'suppressed': suppressed,
         'undelivered': undelivered,
