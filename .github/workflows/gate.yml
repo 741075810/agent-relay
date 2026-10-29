@@ -109,6 +109,9 @@ jobs:
           test_t095b80_fault_recovery
           test_t095b81_crash_consistency
           test_t095b82_queue_consistency
+          test_t095b84_ack_durability
+          test_t095b85_evidence_layers
+          test_t095b86_queue_concurrency
           test_release_gate
           test_release_gate_timeout
 

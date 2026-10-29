@@ -163,27 +163,60 @@ def known_event_ids(doc):
                for ident in values})
 
 
+def _verify_written(state_dir, wanted_ids, what):
+    """Did the ids we just wrote survive on disk?
+
+    `_Lock` breaks its own lock after `timeout_s` so a dead host cannot wedge delivery.
+    That trade is right, but it means a *live* holder can be evicted and its save can land
+    on top of someone else's -- so a caller could be told "added" about an event that is
+    not there. Reading back is cheap and turns a silent loss into a retry, and a retry that
+    still fails into a named error. Never into a confident wrong answer.
+    """
+    document = load_queue(state_dir)
+    present = set()
+    for event in document.get('events') or []:
+        if isinstance(event, dict) and isinstance(event.get('eventId'), str):
+            present.add(event['eventId'])
+    missing = [ident for ident in wanted_ids if ident not in present]
+    if missing:
+        raise HostError(P.E_INTERNAL,
+                        'the queue did not keep %s %s after writing it; another writer '
+                        'evicted the lock and overwrote the file'
+                        % (what, ', '.join(missing[:3])))
+
+
 def append_events(state_dir, events):
     """Add events, skipping any `eventId` already present. Returns added count."""
-    with _Lock(state_dir):
-        doc = load_queue(state_dir)
-        known = known_event_ids(doc)
-        added = 0
-        for event in events:
-            if event['eventId'] in known:
-                continue
-            row = dict(event)
-            row['seq'] = doc['next_seq']
-            doc['next_seq'] += 1
-            row['enqueuedAt'] = int(time.time())
-            row['deliveredAt'] = None
-            row['deliveries'] = 0
-            doc['events'].append(row)
-            known.add(event['eventId'])
-            added += 1
-        if added:
-            save_queue(state_dir, doc)
-        return added
+    for attempt in (1, 2):
+        with _Lock(state_dir):
+            doc = load_queue(state_dir)
+            known = known_event_ids(doc)
+            added = 0
+            added_ids = []
+            for event in events:
+                if event['eventId'] in known:
+                    continue
+                row = dict(event)
+                row['seq'] = doc['next_seq']
+                doc['next_seq'] += 1
+                row['enqueuedAt'] = int(time.time())
+                row['deliveredAt'] = None
+                row['deliveries'] = 0
+                doc['events'].append(row)
+                known.add(event['eventId'])
+                added_ids.append(event['eventId'])
+                added += 1
+            if added:
+                save_queue(state_dir, doc)
+        if not added:
+            return added
+        try:
+            _verify_written(state_dir, added_ids, 'event(s)')
+            return added
+        except HostError:
+            if attempt == 2:
+                raise
+    return 0
 
 
 def _valid_consumer_id(value):
