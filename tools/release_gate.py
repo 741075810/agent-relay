@@ -418,8 +418,16 @@ LOW_LINE = re.compile(r'(Traceback|^\s+File "|^\s+\w+Error|\^)')
 # Annotations are part of the public check-run record, so a machine path must not ride
 # out on one. The negative test that proved this module works printed the operator's
 # own temp directory into an annotation.
-ABSOLUTE_PATH = re.compile(r'[A-Za-z]:[\\/][^\s"\')]*')
+# A drive letter must not be the last letter of a word: without the lookbehind, `https://`
+# matches as drive `s`, and every URL in an annotation becomes `http<path>`. That went
+# unnoticed until a test asserted the scheme survives.
+ABSOLUTE_PATH = re.compile(r'(?<![\w])[A-Za-z]:[\\/][^\s"\')]*')
 USER_SEGMENT = re.compile(r'(Users[\\/]+)[^\\/\s"\')]+')
+# POSIX paths too. This repository is Windows-first, so the scrubber only knew drive
+# letters -- and the first run of the Linux CI job published a runner's temporary
+# directory inside a check-run annotation, which is public. Two segments minimum, and not
+# after a `:` or another `/`, so a URL keeps its scheme.
+POSIX_PATH = re.compile(r'(?<![\w:/])/(?:[\w.@+\-]+/)+[\w.@+\-]*')
 # `-v` puts the reason inside the skip line: `test_x (...) ... skipped 'why'`.
 SKIP_REASON = re.compile(r"skipped '([^']+)'")
 
@@ -437,7 +445,14 @@ def skip_summary(part, keep=3):
 
 
 def scrub(text):
-    return USER_SEGMENT.sub(r'\1<user>', ABSOLUTE_PATH.sub('<path>', text))
+    """Remove machine-specific paths from anything headed for a public annotation.
+
+    Drive-letter paths first (that rule also swallows the account segment inside one),
+    then an account segment on its own for a path that appears without a drive letter,
+    then POSIX paths.
+    """
+    text = USER_SEGMENT.sub(r'\1<user>', ABSOLUTE_PATH.sub('<path>', text))
+    return POSIX_PATH.sub('<path>', text)
 
 
 def text_of(part):

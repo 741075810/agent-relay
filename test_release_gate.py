@@ -206,6 +206,28 @@ class ReportingTest(unittest.TestCase):
         self.assertEqual(self.gate.github_escape('a:b,c%d\ne'),
                          'a%3Ab%2Cc%25d%0Ae')
 
+    def test_a_posix_path_is_scrubbed_too(self):
+        """Found by the Linux CI job, on its first run: the scrubber only knew drive
+        letters, so a runner's `/tmp/gate-hang-xxxx` reached a public annotation."""
+        for text in ('AssertionError: /tmp/gate-hang-kkc6kzxv unexpectedly found',
+                     'File "/home/runner/work/agent-relay/agent-relay/x.py", line 3',
+                     'at /usr/local/lib/python3.12/unittest/case.py'):
+            scrubbed = self.gate.scrub(text)
+            self.assertIn('<path>', scrubbed, text)
+            for leaked in ('/tmp/gate-hang', 'runner', '/usr/local'):
+                self.assertNotIn(leaked, scrubbed, '%s survived in %r' % (leaked, scrubbed))
+
+    def test_a_url_keeps_its_scheme(self):
+        """Over-scrubbing a URL would make a real message unreadable, and a double slash
+        after a colon is not a filesystem path."""
+        text = 'see https://github.com/actions/runner-images/issues/14748 for detail'
+        self.assertIn('https://github.com/actions/runner-images/issues/14748',
+                      self.gate.scrub(text))
+
+    def test_a_relative_path_is_left_alone(self):
+        text = '  LEAK  session-id  tools/example.py:12'
+        self.assertIn('tools/example.py:12', self.gate.scrub(text))
+
     def test_a_path_is_scrubbed_out_of_an_annotation(self):
         two = chr(92)
         text = 'File "' + 'C:' + two + 'Users' + two + 'someone' + two + 'work.py"'
