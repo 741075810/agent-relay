@@ -659,10 +659,24 @@ function formatTrigger(state, preArm, extras) {
       Math.round(state.minIntervalMs / 1000) + ' 秒最小间隔使任一 60 分钟内的'
       + '实际上限约为 ' + pacingCap(state) + ' 条');
   }
+  // T095B75: the scheduled period is an *observation*, not a restatement of the
+  // configured interval. When the alarm table is empty but the trigger is enabled --
+  // which is what a reload used to leave behind -- saying "每 0.5 分钟检查一次" was a
+  // false statement about a timer that did not exist. Name the two states apart.
   const alarm = extras && extras.alarm;
+  const alarmError = extras && extras.alarmError;
+  const alarmExpected = extras && extras.alarmExpected;
   if (state.enabled && typeof alarm === 'number') {
     lines.push('调度周期：每 ' + alarm + ' 分钟检查一次' +
       '（Chrome 只保证不早于该周期，实际可能延后）');
+  } else if (state.enabled && alarmError) {
+    lines.push('定时器状态：无法读取（' + alarmError + '）'
+      + '——不能据此判断是否会检查');
+  } else if (state.enabled) {
+    lines.push('定时器状态：未调度（已授权，但 Chrome 里没有这个定时器）'
+      + (typeof alarmExpected === 'number'
+        ? '；理论周期每 ' + alarmExpected + ' 分钟' : '')
+      + '——重启浏览器或重新授权后恢复');
   }
   // T076: a pre-write refusal (blurred tab, a draft in the composer) is a wait,
   // not a failure. Saying so keeps it distinct from the "last error" line, which
@@ -1008,7 +1022,9 @@ async function refreshAutoSend() {  const stateReply = await ask({ type: 't058-s
     : '读取失败：' + (stateReply.error || '未知'), stateReply.ok ? 'ok' : 'bad');
   setText(asEls.triggerState,
     triggerReply.ok ? formatTrigger(triggerReply.result, triggerReply.preArm,
-      { alarm: triggerReply.alarm, defaults: triggerReply.defaults })
+      { alarm: triggerReply.alarm, alarmError: triggerReply.alarmError,
+        alarmExpected: triggerReply.alarmExpected,
+        defaults: triggerReply.defaults })
       : '读取失败：' + (triggerReply.error || '未知'),
     triggerReply.ok ? 'ok' : 'bad');
   renderDirectOptIn(directReply);

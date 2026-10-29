@@ -122,3 +122,51 @@ Two invariants follow, and `test_t073_candidate_starvation.mjs` asserts both:
 * a consented candidate is reached however many un-consented ones precede it, at any
   budget of one or more;
 * a tick writes at most `limit` notices, and a second tick does not repeat one.
+
+## A stored authorization is not a running timer
+
+Consent lives in `chrome.storage.local` and survives everything. The alarm that consumes
+it lives in Chrome's alarm table and survives nothing — not a browser restart, and, as it
+turned out, not an extension reload either.
+
+The two lifecycle hooks are not interchangeable. `onStartup` fires when the *browser*
+starts. `onInstalled` fires on install, on update, and on the reload button in
+`chrome://extensions`. Reloading an unpacked extension — the normal way to pick up a code
+change — fires only the second one. For a while only `onStartup` restored the terminal
+alarm, so a reload left the trigger with `enabled: true` in storage and no alarm to wake
+it: it never ticked, never sent, and recorded no error, because nothing had run to fail.
+
+What made it expensive to find is that every surface kept reporting health. `lastError`
+was null. `terminalChainStatus` was `ok: true` — correctly, since it describes the last
+tick, which had succeeded. The popup printed `调度周期：每 0.5 分钟检查一次`, which was not
+an observation at all but `terminalAlarmPeriod(state)`, arithmetic on the configured
+interval. The extension looked armed and scheduled while doing nothing whatsoever.
+
+Both hooks now call `restoreTerminalAlarm()`, and `t059-trigger-state` reports the alarm
+Chrome actually holds (`alarm`) separately from the period the trigger would use
+(`alarmExpected`). Three states are now distinguishable, and the popup names them apart:
+
+| `alarm` | `alarmExpected` | meaning |
+|---|---|---|
+| a number | a number | armed and scheduled at that period |
+| `null` | a number | armed but **not** scheduled — the dormant state |
+| `null` | `null` | not armed, so there is no period to expect |
+
+The restore itself has to stay narrow, and `test_t095b75_reload_alarm.mjs` asserts each
+half of that:
+
+* it creates or clears exactly one alarm and writes nothing else — the trigger record,
+  the candidates, the consent store, the T058/T059 grant and the T053 binding all come
+  out byte-identical;
+* a trigger with `enabled: false` is **never** re-enabled. Restoring a timer is not
+  re-authorising anything;
+* a second, third or fourth wake-up does not re-create an alarm that already matches.
+  Re-creating resets the timer, and a timer reset more often than its own period never
+  fires — the same starvation as T073, reached from the other end;
+* it never connects to the native host and never messages a tab. Scheduling is a local
+  operation, and a restore that needs the host would fail exactly when the host is down.
+
+Failing is allowed; failing silently is not. If the alarm cannot be restored — no
+`alarms` permission, a storage read that throws — the install hook still completes, the
+queue poller is still scheduled, and a `terminal-alarm-restore-failed` note is recorded,
+so the next person reading storage sees the fact that went missing here.

@@ -203,6 +203,20 @@ chrome.runtime.onInstalled.addListener(async () => {
   if (!alarm) {
     chrome.alarms.create(POLL_ALARM, { periodInMinutes: POLL_PERIOD_MINUTES });
   }
+  // T095B75: a reload clears the alarm table and fires *only* this hook -- `onStartup`
+  // is reserved for a real browser start and does not run when a person presses reload
+  // on chrome://extensions. The terminal trigger therefore came back from a reload with
+  // `enabled: true` in storage and no alarm to wake it: it never ticked, sent nothing and
+  // recorded no error, while the popup went on reporting the period it *would* have used.
+  // Diagnosing that cost a whole investigation, from file mtimes, twice.
+  //
+  // The restore is deliberately narrow. `syncTerminalAlarm` reads the stored trigger and
+  // creates or clears one alarm; it never enables a disabled trigger, never re-arms,
+  // never writes consent, candidates or the journal, and never sends. Awaiting it here
+  // is what makes the alarm exist before this handler returns -- the fire-and-forget
+  // form cannot promise that, and a worker suspended mid-flight would leave the table
+  // empty while reporting success.
+  await restoreTerminalAlarm();
   const { retryAt } = await chrome.storage.local.get({ retryAt: null });
   if (Number.isFinite(retryAt) && retryAt > Date.now()) {
     chrome.alarms.create(RETRY_ALARM, { when: retryAt });
@@ -214,7 +228,7 @@ chrome.runtime.onStartup.addListener(() => {
   chrome.alarms.create(POLL_ALARM, { periodInMinutes: POLL_PERIOD_MINUTES });
   // The alarm table does not survive a restart but the stored authorization
   // does; without this the trigger would look armed and never tick.
-  syncTerminalAlarm().catch(() => {});
+  restoreTerminalAlarm().catch(() => {});
   chrome.storage.local.get({ retryAt: null }).then(({ retryAt }) => {
     if (Number.isFinite(retryAt) && retryAt > Date.now()) {
       chrome.alarms.create(RETRY_ALARM, { when: retryAt });
@@ -346,6 +360,29 @@ async function syncTerminalAlarm() {
       ? existing.periodInMinutes : null };
 }
 
+// T095B75: the lifecycle-safe wrapper both wake-up hooks use.
+//
+// `syncTerminalAlarm` can throw for reasons that have nothing to do with the trigger --
+// a missing `alarms` permission, an API surface that changed, a storage read that
+// failed. In `onInstalled` that would reject the whole install hook and take the queue
+// poller's alarm down with it, so the failure is caught, recorded and returned instead.
+//
+// It records rather than swallows because "the trigger is armed but could not be
+// scheduled" is exactly the fact that went missing the first time: everything else kept
+// reporting health while nothing ticked. A note is the cheapest honest answer, and it
+// costs nothing on the success path.
+async function restoreTerminalAlarm() {
+  try {
+    return await syncTerminalAlarm();
+  } catch (err) {
+    const detail = String(err && err.message ? err.message : err);
+    try {
+      await note({ kind: 'terminal-alarm-restore-failed', detail });
+    } catch (_ignored) { /* storage gone: nothing left to record it in */ }
+    return { armed: false, error: detail };
+  }
+}
+
 // Messages from the popup and the content script. Every handler is read-only
 // except `simulate`, which only asks the host to enqueue synthetic events.
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -473,10 +510,33 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             ? reconciled.state.preArmCandidateKeys : []);
           const preArm = candidates.filter((item) => preArmKeys.has(
             terminalTrigger.key(item.runId, item.status))).length;
+          // T095B75: report the alarm Chrome actually holds, separately from the period
+          // the trigger would like. Conflating the two is what let "armed and ticking"
+          // and "armed and asleep" render as the same sentence in the popup, so a
+          // dormant trigger looked healthy for as long as nobody read a file mtime.
+          //
+          // `alarm` is the observation; `alarmExpected` is the intent. The popup now
+          // says which one it has, and the answer "armed but not scheduled" is a state
+          // it can name rather than a difference it cannot see.
+          let alarm = null;
+          let alarmError = null;
+          try {
+            const found = await chrome.alarms.get(TERMINAL_ALARM);
+            alarm = found && Number.isFinite(found.periodInMinutes)
+              ? found.periodInMinutes : null;
+          } catch (err) {
+            // An unreadable alarm table is not the same fact as an empty one, and the
+            // popup must not silently render it as "missing".
+            alarm = null;
+            alarmError = String(err && err.message ? err.message : err);
+          }
           sendResponse({ ok: true, result: reconciled.state,
             candidates: candidates.length, preArm,
             defaults: t059Defaults(),
-            alarm: terminalAlarmPeriod(reconciled.state) });
+            alarm,
+            alarmError,
+            alarmExpected: reconciled.state.enabled === true
+              ? terminalAlarmPeriod(reconciled.state) : null });
         } else if (msg.type === 't059-trigger-arm') {
           const binding = await chromeAutoSend.readBinding();
           const stored = await chrome.storage.local.get({ terminalTrigger: null });
