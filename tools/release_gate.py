@@ -44,8 +44,13 @@ COUNT_LINE = re.compile(r'(\d+) passed, (\d+) failed')
 SENTENCE_RESULT = re.compile(r'^RESULT: ', re.MULTILINE)
 TAP_PASS = re.compile(r'^[\u2139#]\s*pass (\d+)', re.MULTILINE)
 TAP_FAIL = re.compile(r'^[\u2139#]\s*fail (\d+)', re.MULTILINE)
-PY_RAN = re.compile(r'^Ran (\d+) tests', re.MULTILINE)
+# unittest says `Ran 1 test` in the singular and `Ran 2 tests` in the plural. Requiring
+# the plural made any repository with exactly one test read as "printed no test count".
+PY_RAN = re.compile(r'^Ran (\d+) tests?\b', re.MULTILINE)
 PY_SKIPS = re.compile(r'^(?:OK|FAILED) \(skipped=(\d+)\)', re.MULTILINE)
+# unittest prints a bare `OK` when nothing was skipped. Requiring the parenthesised form
+# made a suite with zero skips read as "neither passed nor skipped cleanly".
+PY_OK = re.compile(r'^OK\b', re.MULTILINE)
 
 
 def parse_summary(text):
@@ -97,15 +102,24 @@ def step(name, command, cwd, timeout=1800):
 
 
 def python_suite(root):
+    """Run the suite verbosely so a skip carries its reason.
+
+    Without `-v` the output says `skipped=43` and nothing about why, and a skip count is
+    exactly the number that hides a real gap: a runner that skips thirty tests it would
+    pass on a developer machine is greener than its coverage.
+    """
     outcome = step('python suite',
                    [sys.executable, '-B', '-W', 'ignore::ResourceWarning',
-                    '-m', 'unittest', 'discover', '-s', '.', '-p', 'test_*.py'],
+                    '-m', 'unittest', 'discover', '-s', '.', '-p', 'test_*.py', '-v'],
                    root)
     ran = PY_RAN.search(outcome['output'])
     skips = PY_SKIPS.search(outcome['output'])
     outcome['tests'] = int(ran.group(1)) if ran else 0
     outcome['skips'] = int(skips.group(1)) if skips else 0
-    if outcome['ok'] and skips is None:
+    if outcome['ok'] and ran is None:
+        outcome['ok'] = False
+        outcome['problem'] = 'the suite printed no test count'
+    elif outcome['ok'] and skips is None and not PY_OK.search(outcome['output']):
         outcome['ok'] = False
         outcome['problem'] = ('the suite neither passed nor skipped cleanly; the last '
                               'lines were: ' + outcome['output'].strip().splitlines()[-1])
@@ -173,15 +187,23 @@ def hygiene(root):
 
 def worktree_state(root):
     """Nothing uncommitted may be pushed by accident, and nothing ignored may be
-    published. Both are one command and both have bitten before."""
+    published. Both are one command and both have bitten before.
+
+    `ok` requires a *clean* tree. The first version set `ok` from the exit code of
+    `git status` alone and recorded cleanliness in a separate `clean` flag that the
+    verdict never read, so the check that exists to stop an accidental push of
+    uncommitted work reported PASS on a dirty tree -- for the whole first release.
+    `test_release_gate.py` found it.
+    """
     dirty = run(['git', 'status', '--porcelain'], root)
-    outcome = {
+    listed = dirty['output'].strip() if dirty['returncode'] == 0 else ''
+    return {
         'name': 'worktree',
-        'ok': dirty['returncode'] == 0,
-        'output': dirty['output'].strip(),
+        'git_ok': dirty['returncode'] == 0,
+        'output': listed,
+        'clean': dirty['returncode'] == 0 and listed == '',
+        'ok': dirty['returncode'] == 0 and listed == '',
     }
-    outcome['clean'] = outcome['ok'] and outcome['output'] == ''
-    return outcome
 
 
 def gate(root, clean_clone=False):
@@ -273,7 +295,9 @@ def summarise(result):
 HIGH_LINE = re.compile(
     r'(^FAIL:|^ERROR:|^FAILED \(|AssertionError|^not ok |^# Subtest|^  FAIL |'
     r'ModuleNotFoundError|ImportError|^Error:|^error:|unexplained|ENOENT|EACCES|'
-    r'EPERM|^Could not|^cannot |exit code)')
+    r'EPERM|^Could not|^cannot |exit code|'
+    # The hygiene scanner's own rows: the rule name that fired is here and nowhere else.
+    r'^\s*(LEAK|REVIEW|STALE|excused)\s)')
 LOW_LINE = re.compile(r'(Traceback|^\s+File "|^\s+\w+Error|\^)')
 
 # Annotations are part of the public check-run record, so a machine path must not ride
@@ -281,17 +305,57 @@ LOW_LINE = re.compile(r'(Traceback|^\s+File "|^\s+\w+Error|\^)')
 # own temp directory into an annotation.
 ABSOLUTE_PATH = re.compile(r'[A-Za-z]:[\\/][^\s"\')]*')
 USER_SEGMENT = re.compile(r'(Users[\\/]+)[^\\/\s"\')]+')
+# `-v` puts the reason inside the skip line: `test_x (...) ... skipped 'why'`.
+SKIP_REASON = re.compile(r"skipped '([^']+)'")
+
+
+def skip_summary(part, keep=3):
+    """Why tests were skipped, most frequent first, or None."""
+    counts = {}
+    for match in SKIP_REASON.finditer(part.get('output') or ''):
+        reason = match.group(1)
+        counts[reason] = counts.get(reason, 0) + 1
+    if not counts:
+        return None
+    top = sorted(counts.items(), key=lambda item: -item[1])[:keep]
+    return '; '.join('%dx %s' % (count, scrub(reason)[:100]) for reason, count in top)
 
 
 def scrub(text):
     return USER_SEGMENT.sub(r'\1<user>', ABSOLUTE_PATH.sub('<path>', text))
 
 
+def text_of(part):
+    """The output that explains a part.
+
+    `hygiene` is itself two steps, and its scan output -- the one that names the rule that
+    fired -- lives under `detail`, not `output`. Reading only `output` made the hygiene
+    annotation say the word "hygiene" and nothing else.
+    """
+    if part.get('output'):
+        return part['output']
+    return (part.get('detail') or {}).get('output') or ''
+
+
+def headline(part):
+    """One line that identifies what failed, before any detail floods the budget."""
+    name = part['name']
+    if name == 'js suites' and part.get('failed'):
+        return name + ': ' + ', '.join(part['failed'])
+    if name == 'python suite':
+        return name + ': %d tests, %d skips' % (part.get('tests'), part.get('skips'))
+    if name == 'hygiene':
+        detail = part.get('detail') or {}
+        return '%s: %s unexplained, %s stale' % (name, detail.get('unexplained'),
+                                                 detail.get('stale'))
+    return name
+
+
 def detail_lines(part, limit=8):
     """The few lines of a part's output that explain the failure, most telling first."""
     if part.get('problem'):
         return [scrub(str(part['problem']))][:limit]
-    text = part.get('output') or ''
+    text = text_of(part)
     high, low = [], []
     for line in text.splitlines():
         stripped = line.rstrip()
@@ -324,7 +388,16 @@ def github_report(result):
     for part in result['parts']:
         if part['ok']:
             continue
-        for line in detail_lines(part):
+        # One summary annotation per failing check first, so no check can be crowded out
+        # by another one's detail. The first run of this mode spent all eight of its
+        # annotations on Python tracebacks and never named the failing JS suites.
+        print('::error title=gate %s::%s' % (github_escape(part['name']),
+                                             github_escape(headline(part))))
+        emitted += 1
+    for part in result['parts']:
+        if part['ok']:
+            continue
+        for line in detail_lines(part, limit=max(2, 8 - emitted)):
             if emitted >= 8:
                 break
             print('::error title=gate %s::%s'
@@ -340,14 +413,25 @@ def github_report(result):
         py = parts.get('python suite', {})
         js = parts.get('js suites', {})
         hy = parts.get('hygiene', {}).get('detail', {})
+        skips = skip_summary(py) or 'none'
         print('::notice title=gate::passed: python %s tests, js %s suites/%s '
               'assertions, hygiene %s unexplained/%s excused/%s stale'
               % (py.get('tests'), js.get('count'), js.get('assertions'),
                  hy.get('unexplained'), hy.get('excused'), hy.get('stale')))
+        # Why anything was skipped, on every run. A green run that skipped half the
+        # suite is greener than its coverage and must not read as "all clear".
+        print('::notice title=gate skips::%s skipped (%s)'
+              % (py.get('skips'), github_escape(skips)))
     else:
         failing = [part['name'] for part in result['parts'] if not part['ok']]
         print('::error title=gate verdict::DO NOT PUSH -- failing: %s'
               % github_escape(', '.join(failing) or 'clean clone'))
+        python = [part for part in result['parts'] if part['name'] == 'python suite']
+        if python:
+            skips = skip_summary(python[0])
+            if skips:
+                print('::error title=gate python skips::%s skipped (%s)'
+                      % (python[0].get('skips'), github_escape(skips)))
     return 0 if result['ok'] else 1
 
 

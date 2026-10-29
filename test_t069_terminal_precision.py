@@ -33,14 +33,30 @@ except ImportError:                      # pragma: no cover - environment probe
 
 
 def zstd_bytes(body):
+    """Compress a session-log fixture with whatever this machine has.
+
+    Two paths, because neither dependency is guaranteed: the `zstandard` module is an
+    optional install, and `zlib.zstdCompressSync` arrived in Node 22.15. The first
+    version of this used `check=True` on the Node fallback, so a runner with Node 20
+    reported six *errors* -- tracebacks from `subprocess` -- instead of one honest
+    "this environment cannot build the fixture". CI ran red for six pushes because of it.
+    A missing optional tool is a skip with a reason, never an error.
+    """
     if zstandard is not None:
         return zstandard.ZstdCompressor().compress(body)
     import subprocess
-    return subprocess.run(['node', '-e',
+    done = subprocess.run(['node', '-e',
                            'process.stdout.write(require("node:zlib")'
                            '.zstdCompressSync(require("node:fs")'
                            '.readFileSync(0)))'],
-                          input=body, capture_output=True, check=True).stdout
+                          input=body, capture_output=True)
+    if done.returncode != 0:
+        detail = done.stderr.decode('utf-8', 'replace').strip().splitlines()
+        raise unittest.SkipTest(
+            'no zstd compressor here: the zstandard module is not installed and this '
+            'Node has no zlib.zstdCompressSync (needs 22.15+); %s'
+            % (detail[-1] if detail else 'node exited %d' % done.returncode))
+    return done.stdout
 
 
 def record(kind, seq, time_ms, data):

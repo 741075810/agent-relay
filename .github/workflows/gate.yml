@@ -28,7 +28,12 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          # 24, not 20. The session-log fixtures are zstd-compressed, and
+          # `zlib.zstdCompressSync` arrived in Node 22.15; on Node 20 the suites either
+          # skipped or errored depending on how each one asked. Pinning the runner to the
+          # same major as the machine the suites are developed on means a green run there
+          # means what a green run here means.
+          node-version: '24'
 
       # One step, because the point of the gate is that nobody assembles the checks by
       # hand and nobody reads a number out of a log and retypes it.
