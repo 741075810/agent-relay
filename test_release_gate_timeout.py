@@ -97,45 +97,52 @@ class HungStepTest(Tree):
 
     def test_the_children_of_a_hung_step_are_killed_too(self):
         """The e2e suites start their own host. Killing the node process alone left that
-        host holding the pipe, so the gate waited anyway."""
-        marker = os.path.join(self.root, 'child-was-here')
-        child = (
-            "import time, sys\n"
-            "open(sys.argv[1], 'w').write('up')\n"
-            "time.sleep(600)\n")
-        self.write('child.py', child)
+        host holding the pipe, so the gate waited anyway.
+
+        The child proves it is alive by counting, not by being found in a process
+        listing: `wmic` is gone from current Windows images and `ps` output is a parsing
+        exercise. A counter that stops moving is the fact being asserted -- the child is
+        not doing work any more -- and it reads the same on both platforms.
+        """
+        beat = os.path.join(self.root, 'heartbeat')
+        self.write('child.py',
+                   'import sys, time\n'
+                   'path = sys.argv[1]\n'
+                   'count = 0\n'
+                   'while True:\n'
+                   '    count += 1\n'
+                   '    open(path, "w").write(str(count))\n'
+                   '    time.sleep(0.2)\n')
         self.write('test_spawn_and_hang.py',
                    'import subprocess, sys, time, unittest\n'
                    'class Spawn(unittest.TestCase):\n'
                    '    def test_it(self):\n'
                    '        subprocess.Popen([sys.executable, %r, %r])\n'
                    '        time.sleep(600)\n'
-                   % ('child.py', marker))
+                   % ('child.py', beat))
         self.commit()
         code, out, _ = self.gate('--step-timeout', '6')
         self.assertEqual(code, 1, out)
-        deadline = time.time() + 30
-        while time.time() < deadline and not os.path.exists(marker):
-            time.sleep(0.5)
-        self.assertTrue(os.path.exists(marker), 'the child never started; the case is void')
-        # Give the kill a moment, then assert the grandchild is gone.
-        time.sleep(3)
-        self.assertFalse(live_python_running(child), 'the grandchild survived the timeout')
 
+        def counter():
+            try:
+                with open(beat) as handle:
+                    return int(handle.read().strip() or 0)
+            except (OSError, ValueError):
+                return None
 
-def live_python_running(script_body):
-    """Is a process still running that was started with this script text?"""
-    if os.name == 'nt':
-        listing = subprocess.run(
-            ['wmic', 'process', 'where', "name='python.exe'", 'get',
-             'CommandLine'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
-    else:
-        listing = subprocess.run(['ps', '-eo', 'args'],
-                                 stdout=subprocess.PIPE,
-                                 stderr=subprocess.DEVNULL).stdout
-    text = listing.decode('utf-8', 'replace')
-    needle = script_body.strip().splitlines()[1]
-    return needle in text
+        deadline = time.time() + 20
+        while time.time() < deadline and not counter():
+            time.sleep(0.2)
+        self.assertTrue(counter(), 'the child never started; the case is void')
+        time.sleep(1.0)
+        first = counter()
+        time.sleep(2.0)
+        second = counter()
+        self.assertIsNotNone(second)
+        self.assertEqual(first, second,
+                         'the grandchild was still counting after the gate timed out '
+                         '(%s -> %s): it survived the kill' % (first, second))
 
 
 class ExitCodeLieTest(Tree):

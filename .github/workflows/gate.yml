@@ -96,9 +96,14 @@ jobs:
       # `test_release_gate_timeout` hangs a step on purpose and asserts the gate kills it
       # within a bounded time -- so this job is also the place where "the kill works on a
       # POSIX process group" gets checked, rather than assumed from the Windows path.
+      #
+      # Run through `tools/ci_unittest.py` so a failure lands in the check-run
+      # annotations. Job logs need `actions: read`; annotations do not, and this
+      # repository has already spent six red runs reading nothing but "Process completed
+      # with exit code 1".
       - name: tooling suites
         run: >-
-          python -B -W ignore::ResourceWarning -m unittest -v
+          python -B -W ignore::ResourceWarning tools/ci_unittest.py
           test_publish_hygiene
           test_t095b77_notify_doctor
           test_release_gate
