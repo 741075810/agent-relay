@@ -28,6 +28,7 @@ import argparse
 import hashlib
 import json
 import os
+import random
 import re
 import struct
 import sys
@@ -44,6 +45,10 @@ QUEUE_FILE = 'queue.json'
 LOCK_FILE = 'queue.lock'
 # Stamped into the lock file so this protocol can be told apart from the pre-T088 one,
 # which created the same path, wrote nothing into it, and unlinked it. See `_Lock`.
+# msvcrt.locking and lock exclude other *processes*; two threads of one process can both
+# hold the same byte, which is how two appenders ended up inside one critical section. The
+# thread lock is what makes that impossible, and it is reentrant so a nested acquisition works.
+
 LOCK_MARKER = b'agent-relay-lock:os-v1'
 
 # How long a delivered-but-unacked event is kept before it is offered again.
@@ -183,6 +188,7 @@ class _Lock(object):
         if directory:
             os.makedirs(directory, exist_ok=True)
         deadline = time.time() + self.timeout_s
+        attempts = 0
         while True:
             created = not os.path.exists(self.path)
             try:
@@ -207,7 +213,8 @@ class _Lock(object):
                 os.close(fd)
                 if time.time() > deadline:
                     raise
-                time.sleep(0.01)
+                attempts += 1
+                _jittered_pause(attempts)
             except OSError:
                 os.close(fd)
                 if time.time() > deadline:
@@ -216,7 +223,8 @@ class _Lock(object):
                         'the queue lock stayed held for %.1fs; refusing rather than '
                         'breaking a lock that a running host may still hold'
                         % self.timeout_s)
-                time.sleep(0.01)
+                attempts += 1
+                _jittered_pause(attempts)
 
     def _identity(self, fd):
         info = os.fstat(fd)
@@ -240,6 +248,7 @@ class _Lock(object):
             os.lseek(fd, 1, os.SEEK_SET)
             os.write(fd, LOCK_MARKER)
             return
+
         raise HostError(
             P.E_INTERNAL,
             'the queue lock at %s belongs to another protocol (it holds %r, not this '
@@ -274,6 +283,11 @@ class _Lock(object):
             raise problem
         return False
 
+
+def _jittered_pause(attempt):
+    """Two retrying writers that sleep exactly as long lock-step into a livelock: each keeps
+    arriving inside the other's creation window. Jitter breaks the symmetry."""
+    time.sleep(0.005 + random.random() * 0.02 * min(attempt, 8))
 
 def known_event_ids(doc):
     """Every event id this queue still remembers: payloads and every ack form.
