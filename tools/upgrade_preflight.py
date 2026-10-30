@@ -204,6 +204,28 @@ def _debris_report(state_dir):
     return sorted(name for name in names if name.startswith(prefix))
 
 
+def _path_redirected(path):
+    """Is any component of this path a link, junction or reparse point?
+
+    Comparing the declared path with ealpath looked like the same question and is not:
+    on Windows ealpath also expands 8.3 short names, so an ordinary temp directory under
+    RUNNER~1 came out "redirected" and every verdict was downgraded. Walking the components
+    asks the actual question, and answers it the same way on both platforms.
+    """
+    current = os.path.abspath(path)
+    while True:
+        try:
+            info = os.lstat(current)
+        except OSError:
+            return False
+        if _is_link(info):
+            return True
+        parent = os.path.dirname(current)
+        if parent == current:
+            return False
+        current = parent
+
+
 def _dir_identity(path):
     """Identity of the directory itself, so the two halves of the report cannot come from
     two different installations."""
@@ -224,7 +246,7 @@ def inspect(state_dir, host_stopped=False, accept_realpath=None):
     real = os.path.realpath(state_dir)
     declared = os.path.abspath(state_dir)
     paths = {'declared': declared, 'realpath': real,
-             'through_symlink': os.path.normcase(real) != os.path.normcase(declared)}
+             'through_symlink': _path_redirected(declared)}
     before = _dir_identity(state_dir)
     lock = _lock_report(state_dir)
     queue = _queue_report(state_dir)
