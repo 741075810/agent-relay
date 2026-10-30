@@ -92,12 +92,21 @@ an unknown lock and a damaged queue.
   in user space. That is what the maintenance window is for.
 ## What the lock probe does and does not establish
 
-held_by_a_process: true means a process was **writing at that moment**, and it stops the
-verdict from being safe_to_start even with --host-stopped. alse means nobody was
-writing right then -- the host takes its lock per operation, so an idle host holds nothing and
-alse is *not* evidence that no host is running.
+`held_by_a_process: true` means a process was **holding the lock at that moment**, and it
+stops the verdict from being `safe_to_start` even with `--host-stopped`. `false` means nobody
+was holding it right then — the host takes its lock per operation, so an idle host holds
+nothing, and `false` is *not* evidence that no host is running. `null` means the question
+could not be asked, which is not a yes either.
 
-Proven: a holder **in the same process** is seen (T096), and a killed host's lock is released
-by the operating system (T097, real host subprocess). Unproven: a holder in **another
-process** was not seen in the T097 run, so treat the probe as one more signal, never as the
-evidence that a host is stopped.
+Proven, with a real second process and a ready-file handshake (T098): a holder in another
+process is seen on Windows through its byte-range lock, and the verdict stays manual with and
+without `--host-stopped`. A killed holder releases the lock through the operating system
+(T097, real host subprocess).
+
+Recorded limitation: on POSIX a lock file can be replaced while the holder keeps the *old*
+inode locked, so the probe then describes the new file. Windows refuses the swap because the
+held file is open, which is why the swap case is a Windows assertion and a POSIX note.
+
+How to read it in a maintenance window: the probe is one more signal in the direction of "do
+not start yet". It has never been, and must not become, the evidence that a host is stopped.
+That statement is still yours to make.

@@ -199,25 +199,7 @@ class ForeignHolderTest(unittest.TestCase):
                          % holder.stderr.read(800).decode('utf-8', 'replace'))
         return holder
 
-    @unittest.skip('UNPROVEN: a holder in another process was not seen by the probe in this '
-                   'run -- the same-process case is proven (T096) and the Windows byte-range '
-                   'lock did not answer across the boundary. Recorded rather than asserted, '
-                   'so nothing downstream relies on a guarantee this suite did not establish.')
-    def test_a_lock_held_by_another_process_is_not_overridden_by_an_attestation(self):
-        holder = self.start_holder()
-        try:
-            report = preflight(self.state, stopped=True)
-            self.assertIs(report['lock'].get('held_by_a_process'), True, report['lock'])
-            self.assertNotEqual(report['verdict'], 'safe_to_start',
-                                '--host-stopped overrode a live holder')
-        finally:
-            holder.kill()
-            holder.wait(30)
-        after = preflight(self.state, stopped=True)
-        self.assertIs(after['lock'].get('held_by_a_process'), False, after['lock'])
-        self.assertEqual(after['verdict'], 'safe_to_start', after)
-
-
+    # The cross-process question this case used to skip is answered in\n    # test_t095b98_cross_process_lock.py, with a handshake instead of a sleep.\n\n
 class ProbeMutationTest(unittest.TestCase):
     """Shows the assertions above have teeth: break the probe and they fail."""
 
