@@ -29,6 +29,14 @@ import sys
 
 sys.dont_write_bytecode = True
 
+# Run as `python tools/upgrade_preflight.py`, this file's own directory is what lands on
+# sys.path and `host` lives one level up. Without this the tool only worked when the
+# caller's working directory happened to be the repository root -- which is exactly the
+# situation a preflight launched from a maintenance shell is not.
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
 import host  # noqa: E402  - constants only (no side effects at import)
 
 VERDICT_SAFE = 'safe_to_start'

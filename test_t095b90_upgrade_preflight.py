@@ -19,6 +19,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -150,6 +151,30 @@ class AckIndependenceTest(State, unittest.TestCase):
         report = self.inspect(host_stopped=True)
         self.assertEqual(report['queue']['handed_over'], 1)
         self.assertIn('polled is not the same as seen', ' '.join(report['reasons']))
+
+
+class RunAsProgramTest(State, unittest.TestCase):
+    def test_it_works_from_another_directory(self):
+        """A preflight is run from a maintenance shell, not from the repository root.
+
+        Importing the module in-process hid this: `import host` resolved only because the
+        test runner's working directory was the repository. The tool failed with
+        ModuleNotFoundError when executed the way an operator would run it."""
+        script = TOOL
+        host.append_events(self.state, [event('e1')])
+        result = subprocess.run(
+            [sys.executable, '-B', script, '--state', self.state, '--host-stopped'],
+            cwd=tempfile.gettempdir(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.assertEqual(result.returncode, 0, result.stdout.decode('utf-8', 'replace'))
+        self.assertIn(b'safe_to_start', result.stdout)
+
+    def test_the_json_mode_is_parseable(self):
+        result = subprocess.run(
+            [sys.executable, '-B', TOOL, '--state', self.state, '--json'],
+            cwd=tempfile.gettempdir(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        report = json.loads(result.stdout.decode('utf-8'))
+        self.assertEqual(report['verdict'], 'needs_operator_confirmation')
+        self.assertEqual(result.returncode, 2)
 
 
 class MutationTest(State, unittest.TestCase):
