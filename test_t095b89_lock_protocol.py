@@ -35,8 +35,13 @@ class LegacyProtocolTest(QueueScene):
             host.append_events(self.state, [event('too-early')])
         message = str(caught.exception)
         self.assertIn('lock', message.lower())
-        self.assertGreater(time.time() - started, 1.0,
-                           'the refusal came so fast that nothing was waited for')
+        # T101 inverted this on purpose: an empty lock file used to be ambiguous (it could be
+        # another host mid-creation, so waiting was the cautious thing). With the marker
+        # published atomically, an empty file can only be a pre-T088 remnant, and refusing it
+        # immediately is both correct and safer than waiting a few seconds first.
+        self.assertLess(time.time() - started, 1.0,
+                        'the refusal waited; an empty file is no longer ambiguous')
+        self.assertIn('pre-t088', str(caught.exception).lower())
         self.assertFalse(
             os.path.exists(os.path.join(self.state, host.QUEUE_FILE)),
             'the queue was written while a foreign lock file was in place')

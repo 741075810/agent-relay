@@ -183,10 +183,58 @@ class _Lock(object):
         except OSError:
             pass                             # closing the descriptor releases it anyway
 
+    def _publish(self):
+        """Create the lock file with its content already in it, or leave the path alone.
+
+        `O_CREAT` opens the path before anything can be written, so for a moment the file
+        exists and is empty -- and an empty lock file is exactly what a pre-T088 host leaves
+        behind, so a second writer reads the cradle as a corpse. A hard link publishes content
+        and refuses to overwrite: the target cannot exist without the bytes, and no existing
+        lock is replaced. Where hard links are unavailable the create-then-write path stays,
+        which is a documented window rather than a silent one.
+        """
+        token = os.urandom(8).hex().encode()
+        payload = b'\x00' + LOCK_MARKER + b' ' + token
+        scratch = '%s.tmp-%d-%s' % (self.path, os.getpid(), os.urandom(4).hex())
+        fd = os.open(scratch, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            os.write(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        published = False
+        try:
+            os.link(scratch, self.path)
+            published = True
+        except FileExistsError:
+            published = False
+        except OSError:
+            published = False
+        finally:
+            try:
+                os.unlink(scratch)          # only ever the file this call created
+            except OSError:
+                pass
+        return published
+
     def __enter__(self):
         directory = os.path.dirname(self.path)
         if directory:
             os.makedirs(directory, exist_ok=True)
+        if not os.path.exists(self.path):
+            self._publish()
+        try:
+            if os.path.getsize(self.path) == 0:
+                # An empty lock file is a pre-T088 remnant (this code never publishes one).
+                # Refusing before anything is written keeps the old protocol's file untouched:
+                # writing into it would be a silent, irreversible upgrade.
+                raise HostError(
+                    P.E_INTERNAL,
+                    'the queue lock at %s is empty, which is what a pre-T088 AgentRelay host '
+                    'leaves behind; this host will not write into it or replace it. Stop the '
+                    'old host and remove the file by hand' % self.path)
+        except FileNotFoundError:
+            pass
         deadline = time.time() + self.timeout_s
         attempts = 0
         while True:
