@@ -174,6 +174,7 @@ export class QueueDelivery {
           cursor: committedCursor,
           lastPollAt: this.now(),
           lastError: null,
+          lastErrorCommitted: false,
         });
       } catch (err) {
         await this._scheduleRetry();
@@ -215,7 +216,16 @@ export class QueueDelivery {
         this._lastRetryError = errorText(retryErr);
       }
       try {
-        await this.set({ lastPollAt: this.now(), lastError: message });
+        await this.set({
+          lastPollAt: this.now(),
+          lastError: message,
+          // T095B109: keep the host's structured claim next to its wording. `lastError` alone is
+          // free text, and "written but its durability is unknown" is not the same thing as
+          // "nothing was written" -- anything that reads this later can tell them apart without
+          // matching English. The retry itself stays idempotent: `ack` is a set, so repeating it
+          // reports `newlyAcked: 0` and no event is displayed twice.
+          lastErrorCommitted: Boolean(err && err.committed),
+        });
       } catch (_storageError) {
         // Preserve the original failure; the uncommitted cursor forces a retry.
       }

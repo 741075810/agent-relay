@@ -24,6 +24,12 @@ export class PortError extends Error {
     super(message);
     this.name = 'PortError';
     this.kind = kind;          // 'disconnect' | 'timeout' | 'send' | 'host' | 'connect'
+    // T095B109: the host can refuse a write that it has already published -- the queue file
+    // was replaced but the directory entry was not synced, so the content is on disk and its
+    // survival across a power cut is not. That refusal must not look like "nothing happened":
+    // a caller that cannot tell the two apart resends a notice for a task that already
+    // finished. Older hosts never send the field, so the default is a plain `false`.
+    this.committed = false;
   }
 }
 
@@ -126,9 +132,13 @@ export class NativeClient {
       return;
     }
     const detail = doc.error || {};
-    entry.reject(new PortError(
+    const failure = new PortError(
       (detail.code || 'host_error') + ': ' + (detail.message || 'no detail'),
-      'host'));
+      'host');
+    // Only an explicit `true` counts. A missing field, a string, or an older host means the
+    // write was not published, and guessing the other way would suppress a legitimate retry.
+    failure.committed = detail.committed === true;
+    entry.reject(failure);
   }
 
   /**
