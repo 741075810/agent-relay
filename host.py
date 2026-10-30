@@ -465,7 +465,10 @@ def ack_events(state_dir, event_ids, consumer=None):
                     doc.setdefault('acked_at', {}).setdefault(ident, now_seconds())
             doc['acked'] = sorted(acked)
             _prune_ack_retention(doc, now_seconds())
-            save_queue(state_dir, doc)
+            # State the generation this document was loaded at. Without it a stale `doc` puts
+            # the old file back over a concurrent writer's save, and that writer's event is
+            # gone with both sides reporting success (T100).
+            save_queue(state_dir, doc, expect=doc.get('generation'))
             return len(acked) - before
 
         consumer_acks = doc.setdefault('consumer_acks', {})
@@ -487,7 +490,9 @@ def ack_events(state_dir, event_ids, consumer=None):
                 doc.setdefault('acked_at', {}).setdefault(ident, now_seconds())
         consumer_acks[consumer] = sorted(prior)
         _prune_ack_retention(doc, now_seconds())
-        save_queue(state_dir, doc)
+        # Same reason as the consumer-less branch above: a save that does not say which
+        # generation it read cannot be refused when that reading is out of date.
+        save_queue(state_dir, doc, expect=doc.get('generation'))
         return len(prior) - before
 
 
