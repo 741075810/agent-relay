@@ -686,13 +686,26 @@ def simulated_events(count=1, start_seq=1):
 
 
 # -- request handling --------------------------------------------------
-def handle_request(state_dir, doc, ledger_root=None, bridge_db=None,
-                   bridge_fixture=None, native_root=None):
+def _error_frame(ident, exc):
+    """Refuse, and let the caller see whether the write landed anyway.
+
+    `CommitUncertain` means the queue already holds the new content: reporting it as a plain
+    failure invites a resend of a notice about a task that has already finished. The flag is an
+    extra key inside `error`; the extension reads `code` and `message` and ignores the rest, so
+    an older consumer sees exactly what it saw before.
+    """
+    reply = P.error_response(ident, exc.code, exc.message)
+    if isinstance(exc, CommitUncertain):
+        reply['error']['committed'] = True
+    return reply
+
+
+def handle_request(state_dir, doc, ledger_root=None, bridge_db=None,                   bridge_fixture=None, native_root=None):
     try:
         op, args = P.validate_request(doc)
     except P.ProtocolError as exc:
         ident = doc.get('id') if isinstance(doc, dict) else None
-        return P.error_response(ident, exc.code, exc.message)
+        return _error_frame(ident, exc)
 
     ident = doc['id']
     try:
@@ -811,9 +824,9 @@ def handle_request(state_dir, doc, ledger_root=None, bridge_db=None,
 
         raise HostError(P.E_UNKNOWN_OP, 'unhandled op %r' % op)
     except HostError as exc:
-        return P.error_response(ident, exc.code, exc.message)
+        return _error_frame(ident, exc)
     except P.ProtocolError as exc:
-        return P.error_response(ident, exc.code, exc.message)
+        return _error_frame(ident, exc)
 
 
 # -- origin check ------------------------------------------------------
