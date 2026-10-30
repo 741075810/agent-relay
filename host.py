@@ -235,6 +235,23 @@ class _Lock(object):
                                                  failure.strerror or 'link refused'))
         return published
 
+    @staticmethod
+    def _write_all(fd, data, attempts=8):
+        """Write every byte, or report that the filesystem would not take them.
+
+        `os.write` is allowed to accept less than it was handed. Ignoring the count is how a
+        partial token ends up on disk and how `__exit__` ends up calling that a swap.
+        """
+        written = 0
+        for _ in range(attempts):
+            if written == len(data):
+                return True
+            chunk = os.write(fd, data[written:])
+            if not chunk:
+                return False
+            written += chunk
+        return written == len(data)
+
     def __enter__(self):
         directory = os.path.dirname(self.path)
         if directory:
@@ -276,10 +293,19 @@ class _Lock(object):
                 payload = b'\x00' + LOCK_MARKER + b' ' + self.token
                 if os.fstat(fd).st_size == len(payload):
                     os.lseek(fd, 1 + len(LOCK_MARKER) + 1, os.SEEK_SET)
-                    os.write(fd, self.token)
+                    whole = self._write_all(fd, self.token)
                 else:
                     os.lseek(fd, 0, os.SEEK_SET)
-                    os.write(fd, payload)
+                    whole = self._write_all(fd, payload)
+                if not whole:
+                    # A short write leaves part of this token in a file that still carries the
+                    # marker, and `__exit__` would then accuse somebody of replacing the lock.
+                    # Say what actually happened instead.
+                    raise HostError(
+                        P.E_INTERNAL,
+                        'the lock token could not be written in full to %s (the filesystem '
+                        'took only part of it); refusing rather than holding a lock whose '
+                        'token is not the one this write believes it put there' % self.path)
                 self.handle = fd
                 self.ident = self._identity(fd)
                 return self
