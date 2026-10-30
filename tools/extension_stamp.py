@@ -47,7 +47,11 @@ def tree_digest(root=None):
             if rel.replace('\\', '/') in {item.replace('\\', '/') for item in EXCLUDE}:
                 continue
             with open(full, 'rb') as handle:
-                entries.append((rel.replace('\\', '/'), handle.read()))
+                # Normalise line endings: the digest must describe the source, not the checkout.
+                # A Windows clone with `core.autocrlf` gives every text file CRLF, and a stamp
+                # that changes with the checkout would fail its own gate on a clean clone --
+                # which is exactly where the gate runs.
+                entries.append((rel.replace('\\', '/'), handle.read().replace(b'\r\n', b'\n')))
     digest = hashlib.sha256()
     for rel, data in sorted(entries):
         digest.update(rel.encode('utf-8'))
