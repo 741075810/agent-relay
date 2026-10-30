@@ -19,6 +19,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import * as trigger from './extension/lib/terminal_trigger.js';
+import * as autosend from './extension/lib/autosend.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const EXT = path.join(HERE, 'extension');
@@ -178,4 +179,24 @@ test('T123: the background owns the cap, not the message', () => {
   assert.match(js, /disarmAfterSendOnce/, 'the send path must stop a restricted trigger');
   assert.match(js, /trigger_expired[\s\S]{0,400}syncTerminalAlarm|syncTerminalAlarm[\s\S]{0,400}trigger_expired/,
     'an expired restricted trigger must also clear its alarm');
+});
+test('T123: the popup has no third phrase literal that could drift from the worker', () => {
+  // lib/single_shot_view.js exists so the popup does not carry its own copy of either phrase.
+  // popup.js still needs a fallback for the case where that script failed to load, and a
+  // fallback *is* a third copy: if it drifted, the operator would read one phrase and the
+  // worker would refuse another (`arm_confirmation_mismatch`), with nothing to point at.
+  // So the fallbacks are pinned to the source constants here, in both files that own them.
+  const popup = fs.readFileSync(path.join(HERE, 'extension', 'popup.js'), 'utf8');
+  const sendFallback = /:\s*'(AUTOSEND-ONCE\s)'\s*\+\s*conversationId/.exec(popup);
+  const triggerFallback = /:\s*'(AUTOTRIGGER-ONCE\s)'\s*\+\s*conversationId/.exec(popup);
+  assert.ok(sendFallback, 'popup.js must keep a fallback phrase for the send grant');
+  assert.ok(triggerFallback, 'popup.js must keep a fallback phrase for the trigger grant');
+  assert.equal(sendFallback[1], autosend.SINGLE_SHOT_CONFIRM_PREFIX,
+    'the popup fallback must be the worker constant, character for character');
+  assert.equal(triggerFallback[1], trigger.ONCE_CONFIRM_PREFIX,
+    'the popup fallback must be the worker constant, character for character');
+  // And the shared view file must agree with both, so the fallback can never be the odd one out.
+  const view = fs.readFileSync(path.join(HERE, 'extension', 'lib', 'single_shot_view.js'), 'utf8');
+  assert.match(view, /const PREFIX = 'AUTOSEND-ONCE '/);
+  assert.match(view, /const ONCE_TRIGGER_PREFIX = 'AUTOTRIGGER-ONCE '/);
 });
