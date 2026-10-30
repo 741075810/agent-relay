@@ -184,8 +184,8 @@ class MutationTest(State, unittest.TestCase):
         copy = os.path.join(self.state, 'permissive_preflight.py')
         with io.open(TOOL, 'r', encoding='utf-8') as handle:
             source = handle.read()
-        mutant = source.replace("        needs_manual = True\n    elif lock['kind'] == 'unknown':",
-                                "        needs_manual = False\n    elif lock['kind'] == 'unknown':")
+        mutant = source.replace("        verdict, code = (VERDICT_LEGACY if lock['kind'] == 'legacy_empty'",
+                                "        verdict, code = (VERDICT_SAFE if lock['kind'] == 'legacy_empty'")
         self.assertNotEqual(mutant, source, 'the mutation target moved')
         with io.open(copy, 'w', encoding='utf-8') as handle:
             handle.write(mutant)

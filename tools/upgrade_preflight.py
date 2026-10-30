@@ -25,6 +25,7 @@ Exit codes: 0 safe to start, 2 needs a human decision, 3 something is damaged.
 import argparse
 import json
 import os
+import stat
 import sys
 
 sys.dont_write_bytecode = True
@@ -56,14 +57,30 @@ def _lock_report(state_dir):
     report = {'path': host.LOCK_FILE, 'present': False, 'kind': 'absent',
               'size': 0, 'token': None}
     try:
-        with open(path, 'rb') as handle:
-            raw = handle.read(4096)
+        info = os.lstat(path)
     except FileNotFoundError:
         return report
     except OSError as exc:
         report.update(kind='unreadable', detail='%s: %s' % (type(exc).__name__, exc))
         return report
     report['present'] = True
+    report['size'] = info.st_size
+    if stat.S_ISLNK(info.st_mode):
+        # Reading through it would mean reporting on a file that is not in this state
+        # directory, and an operator acting on that report would act on the wrong thing.
+        try:
+            target = os.readlink(path)
+        except OSError:
+            target = '?'
+        report.update(kind='symlink', target=target,
+                      detail='symbolic link to %s' % target)
+        return report
+    try:
+        with open(path, 'rb') as handle:
+            raw = handle.read(4096)
+    except OSError as exc:
+        report.update(kind='unreadable', detail='%s: %s' % (type(exc).__name__, exc))
+        return report
     report['size'] = len(raw)
     # Byte 0 belongs to the operating-system lock on Windows, so content starts at 1.
     body = raw[1:] if len(raw) > 1 else b''
@@ -86,9 +103,19 @@ def _queue_report(state_dir):
               'version': None, 'generation': None, 'events': 0, 'acked': 0,
               'unacknowledged': 0, 'handed_over': 0, 'consumers': {}, 'error': None}
     path = os.path.join(state_dir, host.QUEUE_FILE)
-    if not os.path.isfile(path):
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return report
+    except OSError as exc:
+        report.update(readable=False, error='%s: %s' % (type(exc).__name__, exc))
         return report
     report['present'] = True
+    if stat.S_ISLNK(info.st_mode):
+        # Same reason as the lock: a link is not this state directory's queue.
+        report.update(readable=False,
+                      error='the queue file is a symbolic link; refusing to read through it')
+        return report
     try:
         document = host.load_queue(state_dir)
     except host.HostError as exc:
@@ -140,6 +167,9 @@ def inspect(state_dir, host_stopped=False):
         reasons.append('the lock file is empty, which is what a pre-T088 host leaves '
                        'behind; the old protocol and this one cannot exclude each other, '
                        'so remove the file by hand once the old host is gone')
+        needs_manual = True
+    elif lock['kind'] == 'symlink':
+        reasons.append('the lock path is a %s (%s); this tool reports on the state directory, not on whatever a link points at' % (lock['kind'], lock.get('detail')))
         needs_manual = True
     elif lock['kind'] == 'unknown':
         reasons.append('the lock file holds something this tool does not recognise (%s); '
