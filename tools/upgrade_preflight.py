@@ -23,6 +23,7 @@ outage:
 Exit codes: 0 safe to start, 2 needs a human decision, 3 something is damaged.
 """
 import argparse
+import errno
 import json
 import os
 import stat
@@ -52,31 +53,72 @@ EXIT_CONFIRM = 2
 EXIT_DAMAGED = 3
 
 
+_NOFOLLOW = getattr(os, 'O_NOFOLLOW', 0)
+_REPARSE_POINT = 0x400          # FILE_ATTRIBUTE_REPARSE_POINT; junctions land here
+
+
+def _is_link(info):
+    """A junction is a reparse point that `stat.S_ISLNK` does not report as a link."""
+    if getattr(info, 'st_file_attributes', 0) & _REPARSE_POINT:
+        return True
+    return stat.S_ISLNK(info.st_mode)
+
+
+def _open_verified(path):
+    """Open the path and prove that what was opened is what was inspected.
+
+    `lstat` followed by `open` is two syscalls with a window between them, in a directory an
+    operator may be inspecting as root while another process can write to it. `O_NOFOLLOW`
+    refuses a link at the last moment where the platform has it; where it does not, the
+    descriptor's own identity is compared with what `lstat` reported, and any disagreement is
+    reported rather than read.
+
+    Returns (fd, info, problem); exactly one of fd and problem is set.
+    """
+    try:
+        before = os.lstat(path)
+    except FileNotFoundError:
+        return None, None, None
+    except OSError as exc:
+        return None, None, 'cannot be examined (%s: %s)' % (type(exc).__name__, exc)
+    if _is_link(before):
+        return None, before, 'is a link (symlink or reparse point), not a file here'
+    try:
+        fd = os.open(path, os.O_RDONLY | _NOFOLLOW)
+    except FileNotFoundError:
+        return None, before, 'disappeared between the check and the open'
+    except OSError as exc:
+        if exc.errno == getattr(errno, 'ELOOP', -1):
+            return None, before, 'became a link between the check and the open'
+        return None, before, 'cannot be opened (%s: %s)' % (type(exc).__name__, exc)
+    opened = os.fstat(fd)
+    if ((opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            or not stat.S_ISREG(opened.st_mode)):
+        os.close(fd)
+        return None, before, ('was replaced between the check and the open, so a report about '
+                              'it would describe a file that was never inspected')
+    return fd, opened, None
+
+
 def _lock_report(state_dir):
     path = os.path.join(state_dir, host.LOCK_FILE)
     report = {'path': host.LOCK_FILE, 'present': False, 'kind': 'absent',
               'size': 0, 'token': None}
-    try:
-        info = os.lstat(path)
-    except FileNotFoundError:
-        return report
-    except OSError as exc:
-        report.update(kind='unreadable', detail='%s: %s' % (type(exc).__name__, exc))
+    fd, info, problem = _open_verified(path)
+    if info is None and problem is None:
         return report
     report['present'] = True
-    report['size'] = info.st_size
-    if stat.S_ISLNK(info.st_mode):
-        # Reading through it would mean reporting on a file that is not in this state
-        # directory, and an operator acting on that report would act on the wrong thing.
-        try:
-            target = os.readlink(path)
-        except OSError:
-            target = '?'
-        report.update(kind='symlink', target=target,
-                      detail='symbolic link to %s' % target)
+    report['size'] = getattr(info, 'st_size', 0)
+    if problem:
+        report.update(kind=('symlink' if 'link' in problem else 'raced'), detail=problem)
+        if report['kind'] == 'symlink':
+            try:
+                report['target'] = os.readlink(path)
+            except OSError:
+                report['target'] = None
         return report
     try:
-        with open(path, 'rb') as handle:
+        with os.fdopen(fd, 'rb') as handle:
             raw = handle.read(4096)
     except OSError as exc:
         report.update(kind='unreadable', detail='%s: %s' % (type(exc).__name__, exc))
@@ -152,6 +194,10 @@ def _debris_report(state_dir):
 
 def inspect(state_dir, host_stopped=False):
     """Everything the operator needs, and nothing that changes the directory."""
+    real = os.path.realpath(state_dir)
+    declared = os.path.abspath(state_dir)
+    paths = {'declared': declared, 'realpath': real,
+             'through_symlink': os.path.normcase(real) != os.path.normcase(declared)}
     lock = _lock_report(state_dir)
     queue = _queue_report(state_dir)
     debris = _debris_report(state_dir)
@@ -168,8 +214,10 @@ def inspect(state_dir, host_stopped=False):
                        'behind; the old protocol and this one cannot exclude each other, '
                        'so remove the file by hand once the old host is gone')
         needs_manual = True
-    elif lock['kind'] == 'symlink':
-        reasons.append('the lock path is a %s (%s); this tool reports on the state directory, not on whatever a link points at' % (lock['kind'], lock.get('detail')))
+    if paths['through_symlink']:
+        reasons.append('the state path is reached through a symbolic link (%s -> %s); the verdict describes the resolved directory' % (declared, real))
+    if lock['kind'] == 'symlink':
+        reasons.append('the lock path is a symbolic link or junction (%s); this tool reports on the state directory, not on whatever a link points at' % (lock.get('detail'),))
         needs_manual = True
     elif lock['kind'] == 'unknown':
         reasons.append('the lock file holds something this tool does not recognise (%s); '
@@ -204,7 +252,7 @@ def inspect(state_dir, host_stopped=False):
     else:
         verdict, code = VERDICT_SAFE, EXIT_SAFE
 
-    return {'state_dir': os.path.abspath(state_dir), 'verdict': verdict,
+    return {'state_dir': os.path.abspath(state_dir), 'paths': paths, 'verdict': verdict,
             'exit_code': code, 'host_stopped_attested': bool(host_stopped),
             'lock': lock, 'queue': queue, 'debris': debris, 'reasons': reasons}
 

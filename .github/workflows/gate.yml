@@ -115,6 +115,7 @@ jobs:
           test_t095b89_lock_protocol
           test_t095b90_upgrade_preflight
           test_t095b91_ack_and_preflight_edges
+          test_t095b92_preflight_paths
           test_release_gate
           test_release_gate_timeout
 

@@ -31,7 +31,7 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # `AGENTS.md`: with the launcher binary and the real manifest absent, the Python suite
 # must report exactly this many skips. Asserting the number means a check that silently
 # stopped running is noticed; a changed number is a deliberate edit to this constant.
-EXPECTED_SKIPS = 12  # +1: the POSIX-only lock-swap test skips on Windows
+EXPECTED_SKIPS = 13  # +2: POSIX-only lock-swap test, Windows-only junction test
 
 RESULT_LINE = re.compile(r'^RESULT: (\d+) passed, (\d+) failed', re.MULTILINE)
 # Three output conventions live in this repository and all are legitimate:
