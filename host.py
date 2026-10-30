@@ -105,8 +105,14 @@ def save_queue(state_dir, doc, expect=None):
         # whole read-modify-write.
         try:
             current = load_queue(state_dir).get('generation', 0)
-        except HostError:
-            current = None
+        except HostError as exc:
+            # "Could not read it" is not "somebody else wrote it". Collapsing the two sends an
+            # operator looking for a concurrent writer that does not exist, and invites a retry
+            # that overwrites a damaged but possibly recoverable queue.
+            raise HostError(
+                P.E_INTERNAL,
+                'the queue at %s cannot be read, so this save cannot tell whether it would '
+                'overwrite somebody else; refusing instead of guessing: %s' % (path, exc))
         if current != expect:
             raise HostError(P.E_INTERNAL,
                             'the queue changed under this writer (generation %r -> %r)'
@@ -122,6 +128,20 @@ def save_queue(state_dir, doc, expect=None):
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, path)
+        if os.name != 'nt':
+            # The bytes are fsynced, but the *name* the queue lives under is not durable until
+            # the directory entry is. Without this, a power cut can restore the previous file
+            # after a reply that said the event was queued. Windows cannot fsync a directory,
+            # so there the rename's durability is the filesystem's business; this is the
+            # hardware boundary that cannot be closed from user space.
+            try:
+                dir_fd = os.open(state_dir, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass
     except BaseException:
         # A failed save must not leave debris: a full disk would then fill the state
         # directory a little more on every retry, and the next reader has to walk past
