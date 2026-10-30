@@ -195,6 +195,10 @@ class _Lock(object):
             try:
                 self._take(fd)
                 self._check_owner(fd, created)
+                self.token = os.urandom(8).hex().encode()
+                os.lseek(fd, 0, os.SEEK_SET)
+                os.ftruncate(fd, 0)
+                os.write(fd, b'\x00' + LOCK_MARKER + b' ' + self.token)
                 self.handle = fd
                 self.ident = self._identity(fd)
                 return self
@@ -228,12 +232,12 @@ class _Lock(object):
         else's protocol. Refusing is the only honest answer; adopting it would mean writing
         the queue while another host is inside its own critical section.
         """
-        os.lseek(fd, 0, os.SEEK_SET)
+        os.lseek(fd, 1, os.SEEK_SET)      # byte 0 is the byte the Windows lock covers
         head = os.read(fd, len(LOCK_MARKER) + 16).strip(b'\x00')   # Windows pads with NUL
-        if head == LOCK_MARKER:
+        if head.startswith(LOCK_MARKER):
             return
         if created and not head:
-            os.lseek(fd, 0, os.SEEK_SET)
+            os.lseek(fd, 1, os.SEEK_SET)
             os.write(fd, LOCK_MARKER)
             return
         raise HostError(
@@ -247,8 +251,14 @@ class _Lock(object):
     def __exit__(self, exc_type, _exc, _tb):
         problem = None
         if self.handle is not None:
+            # A token, not an inode: Linux happily reuses the inode number of a file that
+            # was unlinked a moment ago, so `st_ino` would call a swapped lock "the same".
+            # The token this acquisition wrote is the only thing the swap cannot reproduce.
             try:
-                if self._identity(self.handle) != self._identity_of_path():
+                with open(self.path, 'rb') as handle:
+                    handle.seek(1)          # never touch the byte the OS lock covers
+                    here = handle.read(len(LOCK_MARKER) + 64)
+                if self.token not in here:
                     problem = HostError(
                         P.E_INTERNAL,
                         'the queue lock file was replaced while this write held it, so '
@@ -263,10 +273,6 @@ class _Lock(object):
         if problem is not None and exc_type is None:
             raise problem
         return False
-
-    def _identity_of_path(self):
-        info = os.stat(self.path)
-        return (info.st_dev, info.st_ino)
 
 
 def known_event_ids(doc):

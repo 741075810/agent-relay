@@ -81,7 +81,7 @@ class LiveHolderTest(QueueScene):
         """The lease must not turn a killed host into a permanent wedge."""
         lock = host.os.path.join(self.state, host.LOCK_FILE)
         with open(lock, 'wb') as handle:
-            handle.write(host.LOCK_MARKER)             # this protocol's file, owner is gone
+            handle.write(b'\x00' + host.LOCK_MARKER)   # this protocol's file, owner is gone
         started = time.time()
         added = host.append_events(self.state, [event('after-death')])
         self.assertEqual(added, 1)

@@ -52,7 +52,8 @@ class LegacyProtocolTest(QueueScene):
         """Round trip: the first write leaves a file this code recognises."""
         self.assertEqual(host.append_events(self.state, [event('first')]), 1)
         with open(os.path.join(self.state, host.LOCK_FILE), 'rb') as handle:
-            self.assertEqual(handle.read().strip(), host.LOCK_MARKER)
+            # byte 0 is the locked one; marker and token follow it
+            self.assertTrue(handle.read()[1:].startswith(host.LOCK_MARKER))
         self.assertEqual(host.append_events(self.state, [event('second')]), 1)
 
     @unittest.skipIf(os.name == 'nt',
