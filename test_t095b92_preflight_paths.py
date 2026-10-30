@@ -106,8 +106,10 @@ class SwapDuringInspectTest(Base):
         with io.open(lock, 'wb') as out:
             out.write(b'\x00' + host.LOCK_MARKER)
         os.chmod(lock, 0o000)
-        report = self.inspect(host_stopped=True)
-        self.assertIn(report['lock']['kind'], ('unreadable', 'symlink'))
+        # No snapshot helper here: it would read the file this test deliberately made
+        # unreadable, and fail in the test rather than in the tool under test.
+        report = PREFLIGHT.inspect(self.state, host_stopped=True)
+        self.assertEqual(report['lock']['kind'], 'unreadable', report['lock'])
         self.assertNotEqual(report['exit_code'], 0)
 
 

@@ -110,7 +110,13 @@ def _lock_report(state_dir):
     report['present'] = True
     report['size'] = getattr(info, 'st_size', 0)
     if problem:
-        report.update(kind=('symlink' if 'link' in problem else 'raced'), detail=problem)
+        if 'link' in problem:
+            kind = 'symlink'
+        elif problem.startswith('cannot be opened') or problem.startswith('cannot be examined'):
+            kind = 'unreadable'          # permissions, not a race
+        else:
+            kind = 'raced'
+        report.update(kind=kind, detail=problem)
         if report['kind'] == 'symlink':
             try:
                 report['target'] = os.readlink(path)
