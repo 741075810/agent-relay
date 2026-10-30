@@ -55,6 +55,10 @@ const context = {
       throw Error('unexpected message ' + msg.type);
     } } },
 };
+// T095B110: the page now loads two scripts, so the harness does too. Without the helper the
+// popup's error wording function is missing and the run fails on a ReferenceError that has
+// nothing to do with what this suite is checking.
+vm.runInNewContext(readFileSync('extension/lib/queue_error_view.js', 'utf8'), context);
 vm.runInNewContext(source, context);
 await new Promise((resolve) => setImmediate(resolve));
 assert.ok(calls.every((msg) => !msg.type.startsWith('t055')));

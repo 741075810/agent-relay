@@ -2,9 +2,13 @@
 // no button that sends anything into a conversation, and none is planned until
 // the read-only half is verified on a real browser by the operator.
 
-// popup.html loads this file as a classic script (no `type="module"`), so it
-// cannot import. The stamp is duplicated on purpose; keep it in step with
-// extension/lib/build_stamp.js, which is the copy the tests assert on.
+// popup.html loads this file as a classic script (no `type="module"`), so it cannot import.
+// T095B110 needs one decision shared with the tests -- how to word a refusal that may have
+// landed anyway -- so lib/queue_error_view.js is loaded first as a plain script and exposes
+// `describeQueueError` on the global. T063 pins the classic script; keep it that way.
+//
+// The stamp is duplicated on purpose; keep it in step with extension/lib/build_stamp.js,
+// which is the copy the tests assert on.
 const BUILD_STAMP = 'T069-terminal-ms';
 
 const els = {
@@ -68,8 +72,11 @@ async function refresh() {
   }
 
   setText(els.lastPoll, stored.lastPollAt || '—');
-  setText(els.lastError, stored.lastError || '—',
-          stored.lastError ? 'bad' : 'ok');
+  // T095B110: an error is not always "nothing happened". A committed-but-unsynced write is on
+  // disk, and painting it red with no further word invites a resend of a notice the queue
+  // already holds. The wording decision lives in lib/queue_error_view.js so it can be tested.
+  const errorView = describeQueueError(stored);
+  setText(els.lastError, errorView.text, errorView.tone);
 }
 
 document.getElementById('hello').addEventListener('click', async () => {
