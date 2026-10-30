@@ -7,9 +7,10 @@
 // landed anyway -- so lib/queue_error_view.js is loaded first as a plain script and exposes
 // `describeQueueError` on the global. T063 pins the classic script; keep it that way.
 //
-// The stamp is duplicated on purpose; keep it in step with extension/lib/build_stamp.js,
-// which is the copy the tests assert on.
-const BUILD_STAMP = 'T069-terminal-ms';
+// T095B112: the stamp is not duplicated here any more. lib/build_stamp.js is loaded before this
+// file and owns the only literal, derived from a digest of the extension tree. A second copy in
+// this file is how it went stale for forty changes without anyone noticing.
+const BUILD_STAMP = globalThis.BUILD_STAMP || 'stamp-missing';
 
 const els = {
   host: document.getElementById('host'),

@@ -154,8 +154,8 @@ console.log('== T064: popup.js was not needed and was not touched ==');
 {
   check(!/^\s*import\s/m.test(source),
     'popup.js stays a classic script (no top-level import)');
-  const stamped = /const BUILD_STAMP = '([^']+)'/.exec(source);
-  check(Boolean(stamped), 'the build stamp is still there');
+  check(source.includes('globalThis.BUILD_STAMP'),
+    'the popup still prints a stamp, now from the single shared definition');
   check(!/querySelector|scrollIntoView/.test(source),
     'no new DOM API the popup stub does not provide');
 }

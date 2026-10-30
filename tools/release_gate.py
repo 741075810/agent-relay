@@ -421,8 +421,31 @@ def worktree_state(root):
     }
 
 
+def extension_stamp(root):
+    """The popup prints a stamp so a stale load is visible. It only means something if the
+    stamp is derived from the tree and cannot silently disagree with it -- a hand-edited label
+    sat at `T069-terminal-ms` for more than forty changes, and a second copy in popup.js went
+    stale with it. `--check` refuses when the two disagree, so this step fails when someone
+    edits the extension and forgets to refresh the stamp.
+    """
+    tool = os.path.join(root, 'tools', 'extension_stamp.py')
+    tree = os.path.join(root, 'extension')
+    if not os.path.exists(tool) or not os.path.isdir(tree):
+        # Fixture repos that only exercise a slice of the gate have no extension at all; there is
+        # nothing to stamp, and reporting that is different from reporting a stale stamp.
+        return {'name': 'stamp', 'ok': True,
+                'detail': {'skipped': 'no extension tree in this repository'}}
+    proc = run([sys.executable, '-B', tool, '--check', '--json'], root)
+    detail = {'ok': proc['returncode'] == 0, 'output': (proc.get('output') or '').strip()}
+    try:
+        detail.update(json.loads(proc.get('output') or ''))
+    except (TypeError, ValueError):
+        pass
+    return {'name': 'stamp', 'ok': detail['ok'], 'detail': detail}
+
+
 def gate(root, clean_clone=False):
-    parts = [worktree_state(root), dependencies(root), hygiene(root),
+    parts = [worktree_state(root), dependencies(root), hygiene(root), extension_stamp(root),
              python_suite(root), js_suites(root)]
     result = {
         'root': root,
@@ -489,6 +512,13 @@ def summarise(result):
         elif part['name'] == 'dependencies':
             extra = ('ok' if part['ok']
                      else '; '.join(part.get('problems') or ['missing']))
+        elif part['name'] == 'stamp':
+            detail = part.get('detail') or {}
+            extra = (detail.get('skipped') or '%s (%s files)'
+                     % (detail.get('declared'), detail.get('files'))
+                     if part['ok'] else
+                     'declared %s, tree %s; run tools/extension_stamp.py --write'
+                     % (detail.get('declared'), detail.get('tree')))
         else:
             extra = '%d suites, %d assertions' % (part['count'], part['assertions'])
             if part['failed']:

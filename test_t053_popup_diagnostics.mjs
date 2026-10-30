@@ -129,12 +129,19 @@ console.log('== T063: a scan with no recorded reasons is flagged, not faked ==')
 
 console.log('== T063: the build stamp is visible in the popup ==');
 {
-  const stamp = /const BUILD_STAMP = '([^']+)'/.exec(source);
-  check(Boolean(stamp), 'popup.js carries a build stamp');
+  // T095B112: one definition. popup.js declares no stamp of its own -- that duplicate is what sat
+  // at T069 through forty changes -- and reads the global loaded before it.
+  check(!/const BUILD_STAMP = '/.test(source),
+    'popup.js holds no literal stamp of its own');
+  check(source.includes('globalThis.BUILD_STAMP'), 'it reads the shared stamp instead');
   const shared = readFileSync(
     new URL('./extension/lib/build_stamp.js', import.meta.url), 'utf8');
-  check(shared.includes("'" + (stamp ? stamp[1] : '\u0000') + "'"),
-    'and it matches the shared module the tests assert on');
+  check(/BUILD_STAMP = 'T\d{3}-[0-9a-f]{8}'/.test(shared),
+    'the shared stamp is the derived T###-<digest> form, not a hand-written label');
+  const htmlSource = readFileSync(new URL('./extension/popup.html', import.meta.url), 'utf8');
+  check(htmlSource.indexOf('src="lib/build_stamp.js"') >= 0
+    && htmlSource.indexOf('src="lib/build_stamp.js"') < htmlSource.indexOf('src="popup.js"'),
+    'popup.html loads it before popup.js, or the popup prints stamp-missing');
   check(source.includes('代码版本: '),
     'the popup prints it so a stale load is visible');
 }
