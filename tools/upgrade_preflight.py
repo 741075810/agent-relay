@@ -300,8 +300,10 @@ def inspect(state_dir, host_stopped=False, accept_realpath=None):
     damaged = False
 
     if lock['kind'] == 'os_v1':
-        reasons.append('the lock file carries this host\'s marker; it holds no lock when '
-                       'no process is running, and this tool does not take one')
+        reasons.append("the lock file carries this host's marker; it holds no lock when "
+                       'no process is running, and this tool does not take one; an older '
+                       'build cannot use this marker at all, so a rollback needs this file '
+                       'removed by hand after the new host is stopped')
     elif lock['kind'] == 'legacy_empty':
         reasons.append('the lock file is empty, which is what a pre-T088 host leaves '
                        'behind; the old protocol and this one cannot exclude each other, '
@@ -343,6 +345,10 @@ def inspect(state_dir, host_stopped=False, accept_realpath=None):
                        'before going any further')
         needs_manual = True
         damaged = False
+    elif lock.get('held_by_a_process') is False:
+        reasons.append('no process is writing right now; this host takes its lock per '
+                       'operation, so an idle host holds nothing and this is not evidence '
+                       'that no host is running')
     elif lock.get('held_by_a_process') is None and lock.get('kind') == 'os_v1':
         reasons.append('whether the lock is currently held could not be determined, so this '
                        'tool will not call the directory safe on the strength of the marker '

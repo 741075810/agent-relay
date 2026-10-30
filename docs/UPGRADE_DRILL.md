@@ -90,3 +90,14 @@ an unknown lock and a damaged queue.
   `CREATE_BREAKAWAY_FROM_JOB`) are outside any kill guarantee, here as in the gate;
 * the window between "preflight said safe" and "the new host took the lock" cannot be closed
   in user space. That is what the maintenance window is for.
+## What the lock probe does and does not establish
+
+held_by_a_process: true means a process was **writing at that moment**, and it stops the
+verdict from being safe_to_start even with --host-stopped. alse means nobody was
+writing right then -- the host takes its lock per operation, so an idle host holds nothing and
+alse is *not* evidence that no host is running.
+
+Proven: a holder **in the same process** is seen (T096), and a killed host's lock is released
+by the operating system (T097, real host subprocess). Unproven: a holder in **another
+process** was not seen in the T097 run, so treat the probe as one more signal, never as the
+evidence that a host is stopped.
