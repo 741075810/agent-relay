@@ -122,17 +122,47 @@ def _sync_directory(state_dir):
         os.close(fd)
 
 
+class _NoGeneration(object):
+    """The queue this writer read carried no generation at all -- the pre-upgrade shape.
+
+    This is a statement about a document that was read, and it is not the same one as `None` in
+    `save_queue`, which means "this caller has no snapshot to defend, do not compare". Collapsing
+    the two is what let two writers on a legacy queue both publish, the second erasing the
+    first's event (T116).
+    """
+
+    def __repr__(self):
+        return 'no generation'
+
+
+NO_GENERATION = _NoGeneration()
+
+
+def _is_generation(value):
+    """A generation is a non-negative integer. `True` is an int in Python and is not one."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
 def save_queue(state_dir, doc, expect=None):
     os.makedirs(state_dir, exist_ok=True)
     path = os.path.join(state_dir, QUEUE_FILE)
     if expect is not None:
+        if expect is not NO_GENERATION and not _is_generation(expect):
+            raise HostError(
+                P.E_INTERNAL,
+                'the caller stated generation %r for %s, which is not a non-negative integer; '
+                'refusing rather than comparing against nothing' % (expect, path))
         # Compare-and-swap. A writer that was evicted from the lock must not publish on top
         # of a document someone else changed in the meantime: it would keep its own addition
         # and silently drop theirs. The reader that handed us this document saw `expect`;
         # if the file no longer says that, this save is stale and the caller has to redo the
         # whole read-modify-write.
+        #
+        # `NO_GENERATION` is the pre-upgrade case, and it is not "do not compare": the caller
+        # read a queue that had no generation, so a file that has one now was written by
+        # somebody else in between and this snapshot is stale.
         try:
-            current = load_queue(state_dir).get('generation', 0)
+            current = load_queue(state_dir)
         except HostError as exc:
             # "Could not read it" is not "somebody else wrote it". Collapsing the two sends an
             # operator looking for a concurrent writer that does not exist, and invites a retry
@@ -141,11 +171,17 @@ def save_queue(state_dir, doc, expect=None):
                 P.E_INTERNAL,
                 'the queue at %s cannot be read, so this save cannot tell whether it would '
                 'overwrite somebody else; refusing instead of guessing: %s' % (path, exc))
-        if current != expect:
+        present = current.get('generation', NO_GENERATION)
+        if present is not NO_GENERATION and not _is_generation(present):
+            raise HostError(
+                P.E_INTERNAL,
+                'the queue at %s has a generation that is not a non-negative integer (%r); '
+                'refusing to build on it' % (path, present))
+        if present != expect:
             raise HostError(P.E_INTERNAL,
                             'the queue changed under this writer (generation %r -> %r)'
-                            % (expect, current))
-        doc['generation'] = expect + 1
+                            % (expect, present))
+        doc['generation'] = 1 if expect is NO_GENERATION else expect + 1
     else:
         doc['generation'] = int(doc.get('generation') or 0) + 1
     tmp = '%s.tmp-%d' % (path, os.getpid())
@@ -506,7 +542,7 @@ def append_events(state_dir, events):
                     added_ids.append(event['eventId'])
                     added += 1
                 if added:
-                    save_queue(state_dir, doc, expect=doc.get('generation', 0))
+                    save_queue(state_dir, doc, expect=doc.get('generation', NO_GENERATION))
             if not added:
                 return added
             # The swap above rules out clobbering a peer; this proves the bytes landed.
@@ -613,7 +649,7 @@ def pending_events(state_dir, cursor=None, limit=20, consumer=None):
             # the lock inode). Without the expectation, a writer that slipped in would have its
             # event or ACK erased by this save and both sides would report success -- the T100
             # failure, on the one path that still had it.
-            save_queue(state_dir, doc, expect=doc.get('generation'))
+            save_queue(state_dir, doc, expect=doc.get('generation', NO_GENERATION))
 
     return out, next_cursor, has_more
 
@@ -639,7 +675,7 @@ def ack_events(state_dir, event_ids, consumer=None):
             # State the generation this document was loaded at. Without it a stale `doc` puts
             # the old file back over a concurrent writer's save, and that writer's event is
             # gone with both sides reporting success (T100).
-            save_queue(state_dir, doc, expect=doc.get('generation'))
+            save_queue(state_dir, doc, expect=doc.get('generation', NO_GENERATION))
             return len(acked) - before
 
         consumer_acks = doc.setdefault('consumer_acks', {})
@@ -663,7 +699,7 @@ def ack_events(state_dir, event_ids, consumer=None):
         _prune_ack_retention(doc, now_seconds())
         # Same reason as the consumer-less branch above: a save that does not say which
         # generation it read cannot be refused when that reading is out of date.
-        save_queue(state_dir, doc, expect=doc.get('generation'))
+        save_queue(state_dir, doc, expect=doc.get('generation', NO_GENERATION))
         return len(prior) - before
 
 
