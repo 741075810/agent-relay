@@ -607,7 +607,13 @@ def pending_events(state_dir, cursor=None, limit=20, consumer=None):
                     row.setdefault('consumerDeliveredAt', {})[consumer] = now
                 row['deliveries'] = int(row.get('deliveries') or 0) + 1
         if out or consumer is not None:
-            save_queue(state_dir, doc)
+            # The same expectation `append_events` and `ack_events` pass. The operating-system
+            # lock is what makes this snapshot current, and a lock is not a guarantee this code
+            # can make for itself (T099: a writable state directory lets another process replace
+            # the lock inode). Without the expectation, a writer that slipped in would have its
+            # event or ACK erased by this save and both sides would report success -- the T100
+            # failure, on the one path that still had it.
+            save_queue(state_dir, doc, expect=doc.get('generation'))
 
     return out, next_cursor, has_more
 
