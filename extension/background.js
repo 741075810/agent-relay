@@ -663,6 +663,48 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: true, result: done.result,
             preArm: Array.isArray(done.state.preArmCandidateKeys)
               ? done.state.preArmCandidateKeys.length : 0 });
+        } else if (msg.type === 't059-trigger-arm-once') {
+          // T123: the restricted trigger. Only the typed phrase and the gesture travel: the
+          // cap, the window and the "one candidate" rule are decided inside the module, so
+          // there is no message field that could turn this back into the standing arm.
+          const extra = Object.keys(msg).filter((key) => !['type', 'confirmation',
+            'userGesture'].includes(key));
+          if (extra.length) {
+            sendResponse({ ok: false, error: 'unexpected_fields', fields: extra });
+            return true;
+          }
+          const binding = await chromeAutoSend.readBinding();
+          const storedOnce = await chrome.storage.local.get({ terminalTrigger: null });
+          const baseOnce = storedOnce.terminalTrigger
+            || terminalTrigger.createTriggerState();
+          const once = terminalTrigger.configureOnce(baseOnce, { binding },
+            msg.confirmation, msg.userGesture === true);
+          if (!once.result.ok) {
+            sendResponse({ ok: true, result: once.result });
+            return true;
+          }
+          const epochOnce = newArmEpoch();
+          const snapOnce = await requestArmSnapshot(epochOnce);
+          if (snapOnce.ok !== true) {
+            sendResponse({ ok: true, result: {
+              ok: false, code: 'arm_' + String(snapOnce.code || 'failed'),
+              snapshot: snapOnce } });
+            return true;
+          }
+          // The same backlog rule as the standing arm: enabling is not consent to deliver what
+          // is already queued. For a restricted arm this matters twice over -- the one trigger
+          // must not be spent on a task that finished before it was armed.
+          const queuedOnce = await chromeAutoSend.readCandidates();
+          once.state.preArmCandidateKeys = queuedOnce.map((item) =>
+            terminalTrigger.key(item.runId, item.status));
+          once.state.armEpoch = epochOnce;
+          once.state.armSnapshotAt = snapOnce.takenAt;
+          once.state.armSnapshotCount = snapOnce.count;
+          await chrome.storage.local.set({ terminalTrigger: once.state });
+          await syncTerminalAlarm();
+          sendResponse({ ok: true, result: once.result,
+            preArm: Array.isArray(once.state.preArmCandidateKeys)
+              ? once.state.preArmCandidateKeys.length : 0 });
         } else if (msg.type === 't059-trigger-disable') {
           const stored = await chrome.storage.local.get({ terminalTrigger: null });
           const base = stored.terminalTrigger || terminalTrigger.createTriggerState();
@@ -1686,7 +1728,9 @@ async function runTerminalTrigger(options = {}) {
   const guard = terminalTrigger.guardSingleCandidate(state, fresh, nowFn());
   if (!guard.ok) {
     for (const candidate of fresh) results.push({ candidate, code: guard.code });
-    return results;
+    // Same shape as the normal exit: an early return that changed the return type would make
+    // every caller read `results` off an array and silently see nothing.
+    return { state, results, fetched };
   }
   for (const candidate of fresh) {
     if (budget <= 0) break;
@@ -1697,6 +1741,15 @@ async function runTerminalTrigger(options = {}) {
     const admitted = terminalTrigger.admit(state, candidate, nowFn());
     if (!admitted.admit) {
       results.push({ candidate, code: admitted.code });
+      // T123: an expired restricted arm is dead, not sleepy. Persist that and clear the alarm,
+      // so it cannot sit in storage waiting for a future candidate to revive it.
+      if (admitted.code === 'trigger_expired') {
+        const expired = terminalTrigger.disable(state, 'single_shot_trigger_expired',
+          nowFn());
+        state = expired.state;
+        await chrome.storage.local.set({ terminalTrigger: state });
+        await syncTerminalAlarm();
+      }
       // Compute the key here rather than reading `admitted.key`: `admit()` only
       // returns a key on the success path, so the old branch compared against
       // `undefined` and never removed anything -- the local candidate list
@@ -1758,6 +1811,20 @@ async function runTerminalTrigger(options = {}) {
     if (outcome.sent === true) {
       await chromeAutoSend.consumeCandidate((item) =>
         terminalTrigger.key(item.runId, item.status) === marked.key);
+    }
+    // T123: a restricted trigger is spent by the first send, or by the first attempt that may
+    // have written. Stopping here -- and clearing the alarm with it -- is what keeps one test
+    // message from being followed by an hourly trigger that keeps proposing new tasks.
+    {
+      const after = await chrome.storage.local.get({ terminalTrigger: null });
+      const spent = terminalTrigger.disarmAfterSendOnce(after.terminalTrigger,
+        { sent: outcome.sent === true,
+          pageWriteAttempted: outcome.pageWriteAttempted === true }, nowFn());
+      if (spent.disarmed === true) {
+        state = spent.state;
+        await chrome.storage.local.set({ terminalTrigger: state });
+        await syncTerminalAlarm();
+      }
     }
     if (state.enabled !== true) break;      // doubt disabled the trigger: stop
   }

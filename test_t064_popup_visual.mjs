@@ -66,11 +66,11 @@ console.log('== T064: no new control can send ==');
     tag.includes('发送') || tag.includes('提交'));
   check(bad.length === 0, 'no button/input mentions sending (' +
     JSON.stringify(bad) + ')');
-  // T122 added exactly two controls: the text box for the restricted phrase and the button
-  // that arms it. The count is a tripwire, not a design rule -- when it moves, say here which
-  // controls were added and why.
-  check(controls.length === 32,
-    'the control count is 30 plus the two T122 single-shot controls ('
+  // The count is a tripwire, not a design rule -- when it moves, say here which controls were
+  // added and why: T122 added the send grant's phrase box and button (+2), T123 added the
+  // trigger grant's phrase box and button (+2).
+  check(controls.length === 34,
+    'the control count is 30 plus two T122 and two T123 restricted controls ('
     + controls.length + ')');
 }
 

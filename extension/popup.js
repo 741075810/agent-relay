@@ -631,6 +631,12 @@ const asEls = {
   result: document.getElementById('notifyAuthResult'),
   triggerState: document.getElementById('terminalTriggerState'),
   triggerPhrase: document.getElementById('terminalTriggerPhrase'),
+  // T123: the restricted trigger's own controls. Separate elements on purpose: the standing
+  // arm must stay reachable, and neither may be mistaken for the other.
+  triggerOncePhrase: document.getElementById('terminalTriggerOncePhrase'),
+  triggerOnceInput: document.getElementById('terminalTriggerOnceConfirmation'),
+  triggerOnceArm: document.getElementById('terminalTriggerOnceArm'),
+  triggerOnceResult: document.getElementById('terminalTriggerOnceResult'),
   triggerInput: document.getElementById('terminalTriggerConfirmation'),
   triggerArm: document.getElementById('terminalTriggerArm'),
   triggerDisarm: document.getElementById('terminalTriggerDisarm'),
@@ -1117,6 +1123,8 @@ async function refreshAutoSend() {  const stateReply = await ask({ type: 't058-s
     asEls.onceArm.disabled = true;
     setText(asEls.oncePhrase, '尚未绑定会话，请先在上一节完成绑定。', 'bad');
     asEls.triggerArm.disabled = true;
+    asEls.triggerOnceArm.disabled = true;
+    setText(asEls.triggerOncePhrase, '尚未绑定会话，请先在上一节完成绑定。', 'bad');
     asEls.disarm.disabled = true;
     asEls.triggerDisarm.disabled = true;
     return;
@@ -1128,6 +1136,12 @@ async function refreshAutoSend() {  const stateReply = await ask({ type: 't058-s
     + '\n后台照抄：AUTOSEND-BACKGROUND ' + conversationId
     + '\n（两句不通用；选哪种模式就抄哪一句）');
   setText(asEls.triggerPhrase, '请照抄：AUTOTRIGGER ' + conversationId);
+  // T123: the restricted phrase. Same rule as T122's: shown, never pre-filled.
+  const triggerOnce = (typeof window !== 'undefined' && window.onceTriggerPhrase)
+    ? window.onceTriggerPhrase(conversationId)
+    : 'AUTOTRIGGER-ONCE ' + conversationId;
+  setText(asEls.triggerOncePhrase, '仅一次照抄：' + triggerOnce
+    + '\n（只放行 1 条 · 15 分钟内有效 · 只认这条 arm 之后结束的任务；发出即停用）');
   // T122: the restricted phrase, shown next to the standing one and typed into its own
   // box. Copying it is the gesture; nothing here pre-fills either field. The prefix comes
   // from lib/single_shot_view.js, which a test pins against the worker's own constant.
@@ -1139,6 +1153,7 @@ async function refreshAutoSend() {  const stateReply = await ask({ type: 't058-s
   asEls.arm.disabled = false;
   asEls.onceArm.disabled = false;
   asEls.triggerArm.disabled = false;
+  asEls.triggerOnceArm.disabled = false;
   asEls.disarm.disabled = false;
   asEls.triggerDisarm.disabled = false;
 }
@@ -1228,6 +1243,27 @@ asEls.triggerDisarm.addEventListener('click', async () => {
     reply.ok ? '终态触发已停用。' : '停用失败：' + reply.error,
     reply.ok ? 'ok' : 'bad');
   await refreshAutoSend();
+});
+
+// T123: arm the trigger for exactly one terminal message. No limits travel with the message --
+// the cap and the window are the worker's decision, so a modified popup cannot widen them.
+asEls.triggerOnceArm.addEventListener('click', async () => {
+  asEls.triggerOnceArm.disabled = true;
+  try {
+    const reply = await ask({
+      type: 't059-trigger-arm-once',
+      confirmation: asEls.triggerOnceInput.value,
+      userGesture: true,
+    });
+    const result = reply.ok ? reply.result : { ok: false, code: reply.error };
+    setText(asEls.triggerOnceResult, result.ok
+      ? '已启用一次性终态触发：只放行 1 条，' +
+        new Date(result.expiresAt).toLocaleString() + ' 到期；发出第一条后自动停用。'
+      : '未启用：' + result.code, result.ok ? 'ok' : 'bad');
+    asEls.triggerOnceInput.value = '';
+  } finally {
+    await refreshAutoSend();
+  }
 });
 
 // T065: chain self-check rendering.

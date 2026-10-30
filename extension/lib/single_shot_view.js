@@ -9,15 +9,25 @@
 (function expose() {
   'use strict';
   const PREFIX = 'AUTOSEND-ONCE ';
+  // T123: the trigger half. Same reasoning as above -- one literal, pinned to the worker's
+  // constant by a test, so the popup cannot show a phrase the trigger gate refuses.
+  const ONCE_TRIGGER_PREFIX = 'AUTOTRIGGER-ONCE ';
   // A phrase is shown only for a bound conversation; without one there is nothing to name.
   function phrase(conversationId) {
     return typeof conversationId === 'string' && conversationId
       ? PREFIX + conversationId : null;
   }
-  const api = { SINGLE_SHOT_PREFIX: PREFIX, singleShotPhrase: phrase };
+  function onceTriggerPhrase(conversationId) {
+    return typeof conversationId === 'string' && conversationId
+      ? ONCE_TRIGGER_PREFIX + conversationId : null;
+  }
+  const api = { SINGLE_SHOT_PREFIX: PREFIX, singleShotPhrase: phrase,
+    ONCE_TRIGGER_PREFIX, onceTriggerPhrase };
   if (typeof window !== 'undefined') {
     window.SINGLE_SHOT_PREFIX = PREFIX;
     window.singleShotPhrase = phrase;
+    window.ONCE_TRIGGER_PREFIX = ONCE_TRIGGER_PREFIX;
+    window.onceTriggerPhrase = onceTriggerPhrase;
   }
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })();

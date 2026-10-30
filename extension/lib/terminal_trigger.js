@@ -18,6 +18,12 @@ import { classifyRefusal, ESCALATING_DEFERRALS, MAX_DEFERRAL_ATTEMPTS }
   from './autosend.js';
 
 export const CONFIRM_PREFIX = 'AUTOTRIGGER ';
+// T123: the restricted trigger. T122 gave the *send* a one-shot form but left the trigger that
+// offers candidates on the standing path, so a spent single shot was followed by an hourly
+// trigger that kept proposing new tasks. This is the missing half: its own phrase, a hard cap
+// of one, and a window, so "one test message" is one candidate as well as one write.
+export const ONCE_CONFIRM_PREFIX = 'AUTOTRIGGER-ONCE ';
+export const ONCE_TTL_MS = 15 * 60 * 1000;
 export const MIN_INTERVAL_FLOOR_MS = 30 * 1000;
 // 30 seconds is the requested floor *and* the default: with a 100/hour ceiling the
 // interval alone could never reach 100, so the two are deliberately independent --
@@ -105,6 +111,10 @@ export function createTriggerState() {
     // by this field, i.e. every existing arm keeps exactly the behaviour it had.
     maxTriggers: null,
     triggers: 0,
+    // T123: absent/false on every stored record written before this field existed, which is
+    // exactly right -- those arms are the standing ones.
+    singleShotTrigger: false,
+    expiresAt: null,
     lastSentAt: null,
     windowStartedAt: null,
     windowCount: 0,
@@ -336,7 +346,12 @@ export function configure(state, input, confirmation, userGesture, now = Date.no
   if (userGesture !== true) {
     return { state, result: { ok: false, code: 'trigger_user_gesture_required' } };
   }
-  if (confirmation !== CONFIRM_PREFIX + binding.conversationId) {
+  // T123: the phrase decides which grant is being asked for. `restricted` is set by
+  // `configureOnce` below, never by a message: a caller that says AUTOTRIGGER-ONCE and then
+  // tries to pass its own cap gets the once bounds regardless.
+  const restricted = input && input.restricted === true;
+  const prefix = restricted ? ONCE_CONFIRM_PREFIX : CONFIRM_PREFIX;
+  if (confirmation !== prefix + binding.conversationId) {
     return { state, result: { ok: false, code: 'trigger_confirmation_mismatch' } };
   }
   const next = normalized(state);
@@ -351,8 +366,13 @@ export function configure(state, input, confirmation, userGesture, now = Date.no
   next.maxPerHour = Math.min(MAX_PER_HOUR_CEILING, Math.max(1, perHour));
   // T122: null (the default) means no per-arm cap. A positive integer caps the total, and
   // the counter restarts because a fresh arm is a fresh grant.
-  next.maxTriggers = Number.isSafeInteger(input.maxTriggers) && input.maxTriggers > 0
-    ? Math.min(input.maxTriggers, MAX_PER_HOUR_CEILING) : null;
+  //
+  // T123: a restricted arm is one, always.
+  next.maxTriggers = restricted ? 1
+    : (Number.isSafeInteger(input.maxTriggers) && input.maxTriggers > 0
+      ? Math.min(input.maxTriggers, MAX_PER_HOUR_CEILING) : null);
+  next.singleShotTrigger = restricted;
+  next.expiresAt = restricted ? now + ONCE_TTL_MS : null;
   next.triggers = 0;
   next.lastError = null;
   next.windowStartedAt = now;
@@ -374,9 +394,38 @@ export function configure(state, input, confirmation, userGesture, now = Date.no
     ok: true, enabled: true,
     minIntervalMs: next.minIntervalMs, maxPerHour: next.maxPerHour,
     maxTriggers: next.maxTriggers, triggers: next.triggers,
+    singleShotTrigger: next.singleShotTrigger, expiresAt: next.expiresAt,
     schemaSuspect: Array.isArray(next.schemaSuspect) ? next.schemaSuspect.slice()
       : [],
   } };
+}
+
+/**
+ * T123: arm the trigger for exactly one terminal message.
+ *
+ * Restated so it cannot be skimmed past: `maxTriggers` is set here and not read from `input`,
+ * because the value that matters must not be the one a caller can supply. Everything else --
+ * phrase check, gesture check, binding check, the arm boundary the whole design rests on --
+ * is the same code the standing arm runs.
+ */
+export function configureOnce(state, input, confirmation, userGesture, now = Date.now()) {
+  return configure(state, Object.assign({}, input, { restricted: true }),
+    confirmation, userGesture, now);
+}
+
+/**
+ * T123: after a send, a restricted trigger is spent -- and "we are not sure whether it landed"
+ * counts as spent, for the same reason it does for the send grant: a second notice about an
+ * uncertain one is worse than none. A pre-write deferral is different: nothing was written, so
+ * the single trigger must survive it.
+ */
+export function disarmAfterSendOnce(state, outcome, now = Date.now()) {
+  if (!state || state.singleShotTrigger !== true) return { state, disarmed: false };
+  if (!outcome || (outcome.sent !== true && outcome.pageWriteAttempted !== true)) {
+    return { state, disarmed: false };
+  }
+  const done = disable(state, 'single_shot_trigger_spent', now);
+  return { state: done.state, disarmed: true };
 }
 
 export function disable(state, reason, now = Date.now()) {
@@ -413,6 +462,11 @@ export function nextRetryAt(attempts, now) {
 export function admit(state, candidate, now = Date.now()) {
   const s = normalized(state);
   if (s.enabled !== true) return { admit: false, code: 'trigger_disabled' };
+  // T123: a restricted trigger has a window. Past it the arm is dead, and dead means refused,
+  // not "renewed because a candidate happened to arrive".
+  if (s.singleShotTrigger === true && Number.isFinite(s.expiresAt) && now >= s.expiresAt) {
+    return { admit: false, code: 'trigger_expired', expiresAt: s.expiresAt };
+  }
   // T122: the per-arm cap, checked before anything about the candidate so a spent one-shot
   // cannot be revived by a candidate that would otherwise be admissible.
   if (Number.isSafeInteger(s.maxTriggers) && s.maxTriggers > 0 &&

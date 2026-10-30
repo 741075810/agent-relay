@@ -248,6 +248,15 @@
     <button id="terminalTriggerDisarm" disabled>停用终态触发</button>
     <pre id="terminalTriggerResult">尚未操作</pre>
     <hr />
+    <div class="mod-note">只测一条时用下面这一组：终态触发<strong>只放行一条</strong>、15 分钟内有效、
+      只认这条 arm 之后才结束的任务；发出第一条（或结果不确定）后自己关掉并清除定时器。
+      短语和上面那组不同，两组不能互相代替，长期那组的行为也不会因此变窄。</div>
+    <div id="terminalTriggerOncePhrase">—</div>
+    <input id="terminalTriggerOnceConfirmation" type="text" autocomplete="off"
+           placeholder="照抄上面那行一次性短语" />
+    <button id="terminalTriggerOnceArm" disabled>仅启用一次终态触发（1 条 · 15 分钟）</button>
+    <pre id="terminalTriggerOnceResult">尚未操作</pre>
+    <hr />
     <h3 class="mod-title"><span class="mod-no">T067</span>直发任务：逐条选择通知</h3>
     <div class="mod-note">经 Bridge 发起的任务（ChatGPT 让你做的）默认每条终态都通知；
       <strong>在 DSH Desktop 里自己开的任务默认不通知</strong>，要在这里逐条点“通知”才算数。
