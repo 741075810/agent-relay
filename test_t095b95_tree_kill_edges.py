@@ -51,6 +51,8 @@ class JobBoundaryTest(unittest.TestCase):
         self.assertEqual(open_jobs, set(),
                          'a job handle stayed open after the step finished')
 
+    @unittest.skipIf(os.name != 'nt',
+                     'a job object only exists on Windows; the POSIX fallback is the case below')
     def test_a_job_that_cannot_be_created_is_not_reported_as_cleanup(self):
         """The fallback has the old weakness; the outcome has to say so."""
         real = GATE_MODULE._assign_job
@@ -74,6 +76,27 @@ class JobBoundaryTest(unittest.TestCase):
         self.assertFalse(outcome['cleanup_guaranteed'],
                          'a best-effort fallback was reported as guaranteed cleanup')
         self.assertEqual(outcome['tree_kill'], 'best_effort')
+
+    def test_a_group_kill_that_cannot_be_done_is_not_reported_as_cleanup(self):
+        """POSIX equivalent: when the group cannot be signalled, `proc.kill()` is all that is
+        left, and it does not reach descendants either."""
+        if os.name == 'nt':
+            self.skipTest('the POSIX fallback does not exist on Windows')
+        real = GATE_MODULE.os.killpg
+
+        def refuse(*args, **kwargs):
+            raise OSError('no such process group')
+
+        GATE_MODULE.os.killpg = refuse
+        try:
+            outcome = GATE_MODULE.run([sys.executable, '-B', '-c',
+                                       'import time; time.sleep(120)'],
+                                      cwd=self.root, timeout=2)
+        finally:
+            GATE_MODULE.os.killpg = real
+        self.assertTrue(outcome['timeout'])
+        self.assertEqual(outcome['tree_kill'], 'best_effort')
+        self.assertFalse(outcome['cleanup_guaranteed'])
 
     def test_a_job_that_is_created_is_reported_as_guaranteed(self):
         if os.name != 'nt':
