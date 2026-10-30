@@ -70,6 +70,17 @@ class HostError(Exception):
         self.message = message
 
 
+class CommitUncertain(HostError):
+    """The write reached the queue, but the disk's word on it is missing.
+
+    Raised when `os.replace` has already put the new file under the queue name and the
+    directory sync that would make the rename durable then fails. The content readers see is
+    the new content, so "it was not written" would be false and a blind retry would be based on
+    a false premise. What is missing is durability, and only the caller can decide what to do
+    with that.
+    """
+
+
 # -- state -------------------------------------------------------------
 def _empty_queue():
     return {'version': 1, 'next_seq': 1, 'events': [], 'acked': []}
@@ -92,6 +103,23 @@ def load_queue(state_dir):
     doc.setdefault('events', [])
     doc.setdefault('acked', [])
     return doc
+
+
+def _sync_directory(state_dir):
+    """Make a rename in `state_dir` durable.
+
+    A file fsync makes the bytes durable; the name the queue lives under is made durable by
+    syncing the directory. Windows cannot fsync a directory handle at all, so there the
+    rename's survival across a power loss is the filesystem's business -- a limit worth
+    stating plainly instead of pretending the platforms behave the same.
+    """
+    if os.name == 'nt':
+        return
+    fd = os.open(state_dir, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def save_queue(state_dir, doc, expect=None):
@@ -128,20 +156,18 @@ def save_queue(state_dir, doc, expect=None):
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, path)
-        if os.name != 'nt':
-            # The bytes are fsynced, but the *name* the queue lives under is not durable until
-            # the directory entry is. Without this, a power cut can restore the previous file
-            # after a reply that said the event was queued. Windows cannot fsync a directory,
-            # so there the rename's durability is the filesystem's business; this is the
-            # hardware boundary that cannot be closed from user space.
-            try:
-                dir_fd = os.open(state_dir, os.O_RDONLY)
-                try:
-                    os.fsync(dir_fd)
-                finally:
-                    os.close(dir_fd)
-            except OSError:
-                pass
+        try:
+            _sync_directory(state_dir)
+        except OSError as exc:
+            # The rename already happened, so the new content is what a reader sees. Saying
+            # "the write failed" would be false and would invite a repeat of a write that
+            # landed; saying "queued" would hide a disk that cannot make it durable.
+            raise CommitUncertain(
+                P.E_INTERNAL,
+                'the queue file was replaced and its content is what a reader now sees, but '
+                'the directory entry could not be synced (%s), so this write is committed and '
+                'may not survive a power loss. Read the queue back before acting; do not '
+                'repeat the write on the assumption that it did not happen' % exc)
     except BaseException:
         # A failed save must not leave debris: a full disk would then fill the state
         # directory a little more on every retry, and the next reader has to walk past
@@ -486,6 +512,10 @@ def append_events(state_dir, events):
             # The swap above rules out clobbering a peer; this proves the bytes landed.
             _verify_written(state_dir, added_ids, 'event(s)')
             return added
+        except CommitUncertain:
+            # Not a case for the retry: the write is already on disk, and a second pass would
+            # see the ids as known, report "0 added", and bury the uncertainty.
+            raise
         except HostError:
             if attempt == 3:
                 raise
