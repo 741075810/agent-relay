@@ -112,8 +112,8 @@ class DamagedQueueTest(QueueScene):
 class StaleLockTest(QueueScene):
     def test_a_lock_left_by_a_killed_host_is_broken(self):
         lock = os.path.join(self.state, host.LOCK_FILE)
-        with io.open(lock, 'w', encoding='utf-8') as handle:
-            handle.write('999999')                     # a pid that is gone
+        with io.open(lock, 'wb') as handle:
+            handle.write(host.LOCK_MARKER)        # this protocol's file, left by a killed host
         started = time.time()
         added = host.append_events(self.state, [event('e1')])
         elapsed = time.time() - started
@@ -128,8 +128,8 @@ class StaleLockTest(QueueScene):
     def test_delivery_resumes_after_the_stale_lock_is_cleared(self):
         host.append_events(self.state, [event('e1')])
         lock = os.path.join(self.state, host.LOCK_FILE)
-        with io.open(lock, 'w', encoding='utf-8') as handle:
-            handle.write('1')
+        with io.open(lock, 'wb') as handle:
+            handle.write(host.LOCK_MARKER)        # left behind, holding no OS lock
         added = host.append_events(self.state, [event('e2')])
         self.assertEqual(added, 1)
         delivered = self.rpc('poll')['result']['events']

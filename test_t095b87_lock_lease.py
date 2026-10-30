@@ -80,8 +80,8 @@ class LiveHolderTest(QueueScene):
     def test_a_dead_holder_is_still_recycled(self):
         """The lease must not turn a killed host into a permanent wedge."""
         lock = host.os.path.join(self.state, host.LOCK_FILE)
-        with open(lock, 'w', encoding='utf-8') as handle:
-            handle.write('999999')                     # a pid that is not running
+        with open(lock, 'wb') as handle:
+            handle.write(host.LOCK_MARKER)             # this protocol's file, owner is gone
         started = time.time()
         added = host.append_events(self.state, [event('after-death')])
         self.assertEqual(added, 1)

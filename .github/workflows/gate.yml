@@ -112,6 +112,7 @@ jobs:
           test_t095b84_ack_durability
           test_t095b85_evidence_layers
           test_t095b86_queue_concurrency
+          test_t095b89_lock_protocol
           test_release_gate
           test_release_gate_timeout
 

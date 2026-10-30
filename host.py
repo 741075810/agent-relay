@@ -42,6 +42,9 @@ DEFAULT_STATE_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), 'state')
 QUEUE_FILE = 'queue.json'
 LOCK_FILE = 'queue.lock'
+# Stamped into the lock file so this protocol can be told apart from the pre-T088 one,
+# which created the same path, wrote nothing into it, and unlinked it. See `_Lock`.
+LOCK_MARKER = b'agent-relay-lock:os-v1'
 
 # How long a delivered-but-unacked event is kept before it is offered again.
 # Chrome may evict the service worker between `poll` and `ack`, and an event
@@ -181,11 +184,26 @@ class _Lock(object):
             os.makedirs(directory, exist_ok=True)
         deadline = time.time() + self.timeout_s
         while True:
-            fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+            created = not os.path.exists(self.path)
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+            except FileNotFoundError:
+                if directory:
+                    os.makedirs(directory, exist_ok=True)   # the dir went away under us
+                    continue
+                raise
             try:
                 self._take(fd)
+                self._check_owner(fd, created)
                 self.handle = fd
+                self.ident = self._identity(fd)
                 return self
+            except HostError:
+                self._give_back(fd)
+                os.close(fd)
+                if time.time() > deadline:
+                    raise
+                time.sleep(0.01)
             except OSError:
                 os.close(fd)
                 if time.time() > deadline:
@@ -196,12 +214,59 @@ class _Lock(object):
                         % self.timeout_s)
                 time.sleep(0.01)
 
-    def __exit__(self, *_exc):
+    def _identity(self, fd):
+        info = os.fstat(fd)
+        return (info.st_dev, info.st_ino)
+
+    def _check_owner(self, fd, created):
+        """Whose lock file is this?
+
+        An OS lock is invisible to the pre-T088 host, which creates the same path with
+        `O_EXCL`, writes nothing, and unlinks it when done. Two protocols on one path are
+        not mutually exclusive, so content decides: this code stamps its file with a marker,
+        and anything else -- an empty file from an old host, a stray pid file -- is somebody
+        else's protocol. Refusing is the only honest answer; adopting it would mean writing
+        the queue while another host is inside its own critical section.
+        """
+        os.lseek(fd, 0, os.SEEK_SET)
+        head = os.read(fd, len(LOCK_MARKER) + 16).strip(b'\x00')   # Windows pads with NUL
+        if head == LOCK_MARKER:
+            return
+        if created and not head:
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.write(fd, LOCK_MARKER)
+            return
+        raise HostError(
+            P.E_INTERNAL,
+            'the queue lock at %s belongs to another protocol (it holds %r, not this '
+            'host\'s marker): an older AgentRelay host is probably still running. Stop it '
+            'before upgrading -- these two lock types cannot exclude each other, and '
+            'deleting the file while one is running is not safe either'
+            % (self.path, head[:16]))
+
+    def __exit__(self, exc_type, _exc, _tb):
+        problem = None
         if self.handle is not None:
+            try:
+                if self._identity(self.handle) != self._identity_of_path():
+                    problem = HostError(
+                        P.E_INTERNAL,
+                        'the queue lock file was replaced while this write held it, so '
+                        'exclusion was lost; the queue was not treated as safe')
+            except OSError:
+                problem = HostError(
+                    P.E_INTERNAL,
+                    'the queue lock file disappeared while this write held it')
             self._give_back(self.handle)
             os.close(self.handle)
             self.handle = None
+        if problem is not None and exc_type is None:
+            raise problem
         return False
+
+    def _identity_of_path(self):
+        info = os.stat(self.path)
+        return (info.st_dev, info.st_ino)
 
 
 def known_event_ids(doc):
