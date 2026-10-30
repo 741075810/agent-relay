@@ -114,8 +114,9 @@ function harness(request) {
   } catch (err) {
     caught = err;
   }
-  check(caught !== null && caught.committed === false,
-        'an older host reports "not committed" rather than undefined');
+  check(caught !== null && caught.committed === null,
+        'an older host reports "unknown" (T111 corrected the earlier default of false, '
+        + 'which claimed a denial the host never made)');
 }
 
 // 3. Delivery: a committed ACK failure must not re-show the event, and must record the flag.

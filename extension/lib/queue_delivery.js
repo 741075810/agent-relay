@@ -174,7 +174,7 @@ export class QueueDelivery {
           cursor: committedCursor,
           lastPollAt: this.now(),
           lastError: null,
-          lastErrorCommitted: false,
+          lastErrorCommitted: null,
         });
       } catch (err) {
         await this._scheduleRetry();
@@ -224,7 +224,8 @@ export class QueueDelivery {
           // "nothing was written" -- anything that reads this later can tell them apart without
           // matching English. The retry itself stays idempotent: `ack` is a set, so repeating it
           // reports `newlyAcked: 0` and no event is displayed twice.
-          lastErrorCommitted: Boolean(err && err.committed),
+          lastErrorCommitted: (err && typeof err.committed === 'boolean')
+            ? err.committed : null,
         });
       } catch (_storageError) {
         // Preserve the original failure; the uncommitted cursor forces a retry.

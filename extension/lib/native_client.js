@@ -24,12 +24,17 @@ export class PortError extends Error {
     super(message);
     this.name = 'PortError';
     this.kind = kind;          // 'disconnect' | 'timeout' | 'send' | 'host' | 'connect'
-    // T095B109: the host can refuse a write that it has already published -- the queue file
-    // was replaced but the directory entry was not synced, so the content is on disk and its
-    // survival across a power cut is not. That refusal must not look like "nothing happened":
-    // a caller that cannot tell the two apart resends a notice for a task that already
-    // finished. Older hosts never send the field, so the default is a plain `false`.
-    this.committed = false;
+    // T095B109/T095B111: the host can refuse a write that it has already published -- the queue
+    // file was replaced but the directory entry was not synced, so the content is on disk and
+    // its survival across a power cut is not. That refusal must not look like "nothing
+    // happened": a caller that cannot tell the two apart resends a notice for a task that
+    // already finished.
+    //
+    // Three states, not two. `null` means the host never said, which is every host built before
+    // this field existed -- and that is the host a refusal will most often come from. Folding
+    // it into `false` would report "the host denies a commit" about a host that was never
+    // asked, and would hide the one hint that actually helps: the host is out of date.
+    this.committed = null;
   }
 }
 
@@ -135,9 +140,10 @@ export class NativeClient {
     const failure = new PortError(
       (detail.code || 'host_error') + ': ' + (detail.message || 'no detail'),
       'host');
-    // Only an explicit `true` counts. A missing field, a string, or an older host means the
-    // write was not published, and guessing the other way would suppress a legitimate retry.
-    failure.committed = detail.committed === true;
+    // Only a real boolean is carried through: `true` claims the write landed, `false` denies it,
+    // and anything else -- a missing field, a string, an old host -- is `null`, meaning nobody
+    // answered. Guessing either way would be worse than admitting the gap.
+    failure.committed = typeof detail.committed === 'boolean' ? detail.committed : null;
     entry.reject(failure);
   }
 
