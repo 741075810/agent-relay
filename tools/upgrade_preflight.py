@@ -23,6 +23,7 @@ outage:
 Exit codes: 0 safe to start, 2 needs a human decision, 3 something is damaged.
 """
 import argparse
+import io
 import errno
 import json
 import os
@@ -169,6 +170,11 @@ def _queue_report(state_dir):
     except host.HostError as exc:
         report['readable'] = False
         report['error'] = '%s: %s' % (type(exc).__name__, exc)
+        try:
+            with io.open(path, 'r', encoding='utf-8') as handle:
+                report['version'] = json.load(handle).get('version')
+        except (OSError, ValueError, AttributeError):
+            pass
         return report
     events = document.get('events') or []
     per_consumer = document.get('consumer_acks') or {}
@@ -198,15 +204,32 @@ def _debris_report(state_dir):
     return sorted(name for name in names if name.startswith(prefix))
 
 
-def inspect(state_dir, host_stopped=False):
-    """Everything the operator needs, and nothing that changes the directory."""
+def _dir_identity(path):
+    """Identity of the directory itself, so the two halves of the report cannot come from
+    two different installations."""
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino)
+
+
+def inspect(state_dir, host_stopped=False, accept_realpath=None):
+    """Everything the operator needs, and nothing that changes the directory.
+
+    `accept_realpath` is the operator saying "I know this path resolves elsewhere, and that
+    is where I meant". Without it a redirected path is reported but never approved: the
+    verdict would otherwise be a claim about a directory nobody named.
+    """
     real = os.path.realpath(state_dir)
     declared = os.path.abspath(state_dir)
     paths = {'declared': declared, 'realpath': real,
              'through_symlink': os.path.normcase(real) != os.path.normcase(declared)}
+    before = _dir_identity(state_dir)
     lock = _lock_report(state_dir)
     queue = _queue_report(state_dir)
     debris = _debris_report(state_dir)
+    after = _dir_identity(state_dir)
 
     reasons = []
     needs_manual = False
@@ -221,7 +244,24 @@ def inspect(state_dir, host_stopped=False):
                        'so remove the file by hand once the old host is gone')
         needs_manual = True
     if paths['through_symlink']:
-        reasons.append('the state path is reached through a symbolic link (%s -> %s); the verdict describes the resolved directory' % (declared, real))
+        accepted = (isinstance(accept_realpath, str) and accept_realpath
+                    and os.path.normcase(os.path.realpath(accept_realpath))
+                    == os.path.normcase(real))
+        if accepted:
+            reasons.append('the state path is reached through a symbolic link (%s -> %s), '
+                           'and that resolved location was acknowledged with '
+                           '--accept-realpath' % (declared, real))
+        else:
+            reasons.append('the state path is reached through a symbolic link (%s -> %s); '
+                           'this verdict describes the resolved directory, so approve it '
+                           'with --accept-realpath %s if that is the tree you meant'
+                           % (declared, real, real))
+            needs_manual = True
+    if before != after:
+        reasons.append('the state directory itself was replaced between the first and the '
+                       'last read (identity %r -> %r), so the lock and the queue in this '
+                       'report may come from different trees' % (before, after))
+        needs_manual = True
     if lock['kind'] == 'symlink':
         reasons.append('the lock path is a symbolic link or junction (%s); this tool reports on the state directory, not on whatever a link points at' % (lock.get('detail'),))
         needs_manual = True
@@ -234,7 +274,7 @@ def inspect(state_dir, host_stopped=False):
         needs_manual = True
 
     if not queue['readable']:
-        reasons.append('the queue is damaged: %s' % queue['error'])
+        reasons.append('the queue is damaged: %s (version field: %r)' % (queue['error'], queue.get('version')))
         damaged = True
     if debris:
         reasons.append('%d interrupted save(s) left behind (%s); the last write did not '
@@ -260,7 +300,8 @@ def inspect(state_dir, host_stopped=False):
 
     return {'state_dir': os.path.abspath(state_dir), 'paths': paths, 'verdict': verdict,
             'exit_code': code, 'host_stopped_attested': bool(host_stopped),
-            'lock': lock, 'queue': queue, 'debris': debris, 'reasons': reasons}
+            'lock': lock, 'queue': queue, 'debris': debris, 'reasons': reasons,
+            'accepted_realpath': accept_realpath}
 
 
 def main(argv=None):
@@ -268,13 +309,16 @@ def main(argv=None):
     parser.add_argument('--state', required=True, help='state directory to inspect')
     parser.add_argument('--host-stopped', action='store_true',
                         help='the operator attests the old host is not running')
+    parser.add_argument('--accept-realpath', default=None,
+                        help='acknowledge that the state path resolves to this directory')
     parser.add_argument('--json', action='store_true', help='machine-readable output')
     args = parser.parse_args(argv)
 
     if not os.path.isdir(args.state):
         print('state directory does not exist: %s' % args.state, file=sys.stderr)
         return EXIT_DAMAGED
-    report = inspect(args.state, host_stopped=args.host_stopped)
+    report = inspect(args.state, host_stopped=args.host_stopped,
+                     accept_realpath=args.accept_realpath)
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
