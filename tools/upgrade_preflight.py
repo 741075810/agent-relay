@@ -204,6 +204,46 @@ def _debris_report(state_dir):
     return sorted(name for name in names if name.startswith(prefix))
 
 
+def _lock_probe(path, kind):
+    """Is a process holding this lock right now?
+
+    True / False / None, and None is not a yes. --host-stopped is the operator's word about
+    a process this tool cannot see; the lock is the one place where the operating system will
+    answer that question, by refusing a second holder. The probe takes the lock and gives it
+    straight back -- it locks byte 0 only, where the marker does not live.
+    """
+    # A lock that cannot be read is not necessarily a corrupt lock: on Windows a byte-range
+    # lock held by a live host makes that byte unreadable through another handle, which is
+    # exactly how a running host looks. Ask the operating system either way.
+    if kind not in ('os_v1', 'unreadable', 'unknown'):
+        return None
+    flags = (os.O_RDWR if os.name == 'nt' else os.O_RDONLY) | getattr(os, 'O_NOFOLLOW', 0)
+    try:
+        handle = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        if os.name == 'nt':
+            import msvcrt
+            try:
+                os.lseek(handle, 0, os.SEEK_SET)
+                msvcrt.locking(handle, msvcrt.LK_NBLCK, 1)
+            except OSError:
+                return True
+            os.lseek(handle, 0, os.SEEK_SET)
+            msvcrt.locking(handle, msvcrt.LK_UNLCK, 1)
+            return False
+        import fcntl
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(handle)
+
+
 def _path_redirected(path):
     """Is any component of this path a link, junction or reparse point?
 
@@ -249,6 +289,8 @@ def inspect(state_dir, host_stopped=False, accept_realpath=None):
              'through_symlink': _path_redirected(declared)}
     before = _dir_identity(state_dir)
     lock = _lock_report(state_dir)
+    lock['held_by_a_process'] = _lock_probe(os.path.join(state_dir, host.LOCK_FILE),
+                                           lock.get('kind'))
     queue = _queue_report(state_dir)
     debris = _debris_report(state_dir)
     after = _dir_identity(state_dir)
@@ -293,6 +335,18 @@ def inspect(state_dir, host_stopped=False, accept_realpath=None):
         needs_manual = True
     elif lock['kind'] == 'unreadable':
         reasons.append('the lock file cannot be read (%s)' % lock.get('detail'))
+        needs_manual = True
+
+    if lock.get('held_by_a_process') is True:
+        reasons.append('a process is holding the queue lock right now, so the host is still '
+                       'running (which is also why the marker may be unreadable); stop it '
+                       'before going any further')
+        needs_manual = True
+        damaged = False
+    elif lock.get('held_by_a_process') is None and lock.get('kind') == 'os_v1':
+        reasons.append('whether the lock is currently held could not be determined, so this '
+                       'tool will not call the directory safe on the strength of the marker '
+                       'alone')
         needs_manual = True
 
     if not queue['readable']:
