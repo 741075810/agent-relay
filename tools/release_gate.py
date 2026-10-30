@@ -112,15 +112,78 @@ def child_env():
 STEP_TIMEOUT = 1800
 
 
+def _assign_job(proc):
+    """Put the child in a Windows job object that dies with its handle.
+
+    	askkill /T walks the tree from the parent's pid, so it cannot find a grandchild whose
+    parent has already exited -- which is exactly the case the kill exists for: a suite that
+    spawns a helper and exits while the helper holds the output pipe. A job object owns the
+    processes rather than the relationship, so closing the handle terminates every process in
+    it, whenever the direct child died.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class Basic(ctypes.Structure):
+        _fields_ = [('PerProcessUserTimeLimit', ctypes.c_int64),
+                    ('PerJobUserTimeLimit', ctypes.c_int64),
+                    ('LimitFlags', wintypes.DWORD),
+                    ('MinimumWorkingSetSize', ctypes.c_size_t),
+                    ('MaximumWorkingSetSize', ctypes.c_size_t),
+                    ('ActiveProcessLimit', wintypes.DWORD),
+                    ('Affinity', ctypes.c_size_t),
+                    ('PriorityClass', wintypes.DWORD),
+                    ('SchedulingClass', wintypes.DWORD)]
+
+    class Io(ctypes.Structure):
+        _fields_ = [('ReadOperationCount', ctypes.c_uint64),
+                    ('WriteOperationCount', ctypes.c_uint64),
+                    ('OtherOperationCount', ctypes.c_uint64),
+                    ('ReadTransferCount', ctypes.c_uint64),
+                    ('WriteTransferCount', ctypes.c_uint64),
+                    ('OtherTransferCount', ctypes.c_uint64)]
+
+    class Extended(ctypes.Structure):
+        _fields_ = [('BasicLimitInformation', Basic), ('IoInfo', Io),
+                    ('ProcessMemoryLimit', ctypes.c_size_t),
+                    ('JobMemoryLimit', ctypes.c_size_t),
+                    ('PeakProcessMemoryUsed', ctypes.c_size_t),
+                    ('PeakJobMemoryUsed', ctypes.c_size_t)]
+
+    kern = ctypes.WinDLL('kernel32', use_last_error=True)
+    kern.CreateJobObjectW.restype = wintypes.HANDLE
+    kern.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+    job = kern.CreateJobObjectW(None, None)
+    if not job:
+        return None
+    limits = Extended()
+    limits.BasicLimitInformation.LimitFlags = 0x2000   # KILL_ON_JOB_CLOSE
+    if not kern.SetInformationJobObject(job, 9, ctypes.byref(limits),
+                                        ctypes.sizeof(limits)):
+        kern.CloseHandle(job)
+        return None
+    if not kern.AssignProcessToJobObject(job, wintypes.HANDLE(int(proc._handle))):
+        kern.CloseHandle(job)
+        return None
+    return job
+
+
 def kill_tree(proc):
-    """Kill a child and everything it started."""
+    """Kill a child and everything it started, by ownership rather than by pid."""
     if os.name == 'nt':
+        job = getattr(proc, '_gate_job', None)
+        if job:
+            import ctypes
+            ctypes.WinDLL('kernel32').CloseHandle(ctypes.c_void_p(int(job)))
+            return
         subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)],
                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL, timeout=60)
     else:
         try:
-            os.killpg(os.getpgid(proc.pid), 9)
+            # start_new_session=True makes the child a session leader, so its pid *is* the
+            # group id by construction -- no getpgid that fails once the leader is gone.
+            os.killpg(proc.pid, 9)
         except OSError:
             proc.kill()
 
@@ -143,6 +206,10 @@ def run(command, cwd, timeout=None):
     proc = subprocess.Popen(command, cwd=cwd, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             env=child_env(), **options)
+    if os.name == 'nt':
+        job = _assign_job(proc)
+        if job:
+            proc._gate_job = job
     timed_out = False
     try:
         out = proc.communicate(timeout=limit)[0]
