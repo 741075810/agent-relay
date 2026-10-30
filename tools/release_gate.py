@@ -165,27 +165,56 @@ def _assign_job(proc):
     if not kern.AssignProcessToJobObject(job, wintypes.HANDLE(int(proc._handle))):
         kern.CloseHandle(job)
         return None
+    _OPEN_JOBS.add(job)
     return job
 
 
+# Every job handle that is currently open. A handle that outlives its step is a leak, and a
+# leaked handle means `KILL_ON_JOB_CLOSE` never fires while the gate is still running.
+_OPEN_JOBS = set()
+
+
+def _release_job(proc):
+    """Close the job handle for a finished step, and say whether one was open."""
+    job = getattr(proc, '_gate_job', None)
+    if not job:
+        return False
+    if os.name == 'nt':
+        import ctypes
+        ctypes.WinDLL('kernel32').CloseHandle(ctypes.c_void_p(int(job)))
+    _OPEN_JOBS.discard(job)
+    proc._gate_job = None
+    return True
+
+
 def kill_tree(proc):
-    """Kill a child and everything it started, by ownership rather than by pid."""
+    """Kill a child and everything it started, by ownership rather than by pid.
+
+    Returns how it was done, because the answer is not always "guaranteed": the `taskkill`
+    fallback walks the tree from a pid that may already be gone, which is the weakness the
+    job object exists to remove. A caller that does not know which one happened would be
+    reporting a cleanup it cannot promise.
+    """
     if os.name == 'nt':
         job = getattr(proc, '_gate_job', None)
         if job:
             import ctypes
             ctypes.WinDLL('kernel32').CloseHandle(ctypes.c_void_p(int(job)))
-            return
+            _OPEN_JOBS.discard(job)
+            proc._gate_job = None
+            return 'job'
         subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)],
                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL, timeout=60)
-    else:
-        try:
-            # start_new_session=True makes the child a session leader, so its pid *is* the
-            # group id by construction -- no getpgid that fails once the leader is gone.
-            os.killpg(proc.pid, 9)
-        except OSError:
-            proc.kill()
+        return 'best_effort'
+    try:
+        # start_new_session=True makes the child a session leader, so its pid *is* the group
+        # id by construction -- no getpgid that fails once the leader is gone.
+        os.killpg(proc.pid, 9)
+        return 'killpg'
+    except OSError:
+        proc.kill()
+        return 'best_effort'
 
 
 def run(command, cwd, timeout=None):
@@ -211,15 +240,20 @@ def run(command, cwd, timeout=None):
         if job:
             proc._gate_job = job
     timed_out = False
+    tree_kill = 'none'
     try:
         out = proc.communicate(timeout=limit)[0]
     except subprocess.TimeoutExpired:
         timed_out = True
-        kill_tree(proc)
+        tree_kill = kill_tree(proc)
         try:
             out = proc.communicate(timeout=60)[0]
         except subprocess.TimeoutExpired:
             out = b''
+    finally:
+        # Every step closes its own handle, timed out or not: a handle left open is a leak,
+        # and while it is open the job's KILL_ON_JOB_CLOSE can never fire.
+        _release_job(proc)
     return {
         'command': ' '.join(command),
         'returncode': None if timed_out else proc.returncode,
@@ -227,6 +261,8 @@ def run(command, cwd, timeout=None):
         'seconds': round(time.time() - started, 1),
         'timeout': timed_out,
         'timeout_seconds': limit,
+        'tree_kill': tree_kill,
+        'cleanup_guaranteed': tree_kill != 'best_effort',
     }
 
 
@@ -235,6 +271,9 @@ def step(name, command, cwd, timeout=None):
     outcome['name'] = name
     if outcome['timeout']:
         outcome['ok'] = False
+        if not outcome.get('cleanup_guaranteed', True):
+            outcome['cleanup_note'] = ('the tree kill fell back to taskkill, which cannot '
+                                      'find a descendant whose parent already exited')
         outcome['problem'] = ('<no verdict> timed out after %ss and was killed with its '
                               'children' % outcome['timeout_seconds'])
     else:

@@ -120,6 +120,7 @@ jobs:
           test_release_gate
           test_release_gate_timeout
           test_t095b94_tree_kill
+          test_t095b95_tree_kill_edges
 
       - name: hygiene, verbose
         if: always()
