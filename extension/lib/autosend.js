@@ -41,6 +41,23 @@ export const DEFAULT_MAX_SENDS = 1000;
 export const MAX_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 export const MAX_SENDS_CEILING = 1000;
 export const PROBE_MAX_AGE_MS = 5000;
+// T122: "one test message" was not expressible. The popup passes neither `maxSends` nor
+// `ttlMs`, so every arm it made was the default 1000 sends over 7 days -- an operator who
+// agreed to a single canary had to grant a working week of them, and the only alternative
+// was to send nothing at all.
+//
+// These are the bounds of the restricted grant: one send, fifteen minutes, and a third
+// phrase so neither existing phrase can arm it out of habit. The restricted arm is an
+// *addition*: `singleShot` defaults to false, the standing defaults are untouched, and
+// nothing here lowers a limit that already exists.
+export const SINGLE_SHOT_TTL_MS = 15 * 60 * 1000;
+export const SINGLE_SHOT_MAX_SENDS = 1;
+export const SINGLE_SHOT_CONFIRM_PREFIX = 'AUTOSEND-ONCE ';
+// Outcomes that mean the grant has done its job or can no longer be trusted. A deferral is
+// absent on purpose: nothing was written, so the shot must survive it.
+export const SINGLE_SHOT_CONSUMING_OUTCOMES = Object.freeze([
+  'sent', 'ambiguous', 'blocked', 'written_not_clicked',
+]);
 
 export function createAutoSendState() {
   return {
@@ -54,6 +71,9 @@ export function createAutoSendState() {
     expiresAt: null,
     maxSends: 0,
     sentCount: 0,
+    // T122: absent means the standing grant, which is what every stored record written
+    // before this field existed actually is.
+    singleShot: false,
     bindingRevision: null,
     conversationId: null,
     documentInstanceId: null,
@@ -187,18 +207,32 @@ export function arm(state, input, confirmation, userGesture, now = Date.now()) {
   if (!DELIVERY_MODES.includes(wanted)) {
     return { state, result: { ok: false, code: 'arm_delivery_mode_unknown' } };
   }
-  const prefix = wanted === 'background' ? BACKGROUND_CONFIRM_PREFIX : CONFIRM_PREFIX;
+  // T122: the restricted grant. It is a third thing, not a flag on the first two: its
+  // phrase is its own, its bounds are its own, and it can only ever narrow.
+  const singleShot = input && input.singleShot === true;
+  const prefix = singleShot ? SINGLE_SHOT_CONFIRM_PREFIX
+    : (wanted === 'background' ? BACKGROUND_CONFIRM_PREFIX : CONFIRM_PREFIX);
   if (confirmation !== prefix + binding.conversationId) {
+    if (singleShot) return { state, result: { ok: false, code: 'arm_confirmation_mismatch',
+      hint: 'the restricted grant needs the AUTOSEND-ONCE phrase' } };
     return { state, result: { ok: false, code: wanted === 'background'
       ? 'arm_background_confirmation_mismatch' : 'arm_confirmation_mismatch' } };
   }
   // Explicit requests are honoured but clamped to the hard bounds, so the stated
   // limit is always the effective limit. A default is never clamped: it already
   // sits inside them.
-  const ttl = Number.isSafeInteger(input.ttlMs) && input.ttlMs > 0
-    ? Math.min(input.ttlMs, MAX_TTL_MS) : DEFAULT_TTL_MS;
-  const maxSends = Number.isSafeInteger(input.maxSends) && input.maxSends > 0
-    ? Math.min(input.maxSends, MAX_SENDS_CEILING) : DEFAULT_MAX_SENDS;
+  //
+  // T122: a single shot has its own ceiling rather than the shared one. Asking for more
+  // than one is not clamped to `MAX_SENDS_CEILING`, it is clamped to one -- a caller that
+  // says "one test" cannot end up holding a working week of permissions.
+  const ttl = singleShot
+    ? Math.min(Number.isSafeInteger(input.ttlMs) && input.ttlMs > 0
+      ? input.ttlMs : SINGLE_SHOT_TTL_MS, SINGLE_SHOT_TTL_MS)
+    : (Number.isSafeInteger(input.ttlMs) && input.ttlMs > 0
+      ? Math.min(input.ttlMs, MAX_TTL_MS) : DEFAULT_TTL_MS);
+  const maxSends = singleShot ? SINGLE_SHOT_MAX_SENDS
+    : (Number.isSafeInteger(input.maxSends) && input.maxSends > 0
+      ? Math.min(input.maxSends, MAX_SENDS_CEILING) : DEFAULT_MAX_SENDS);
   const next = clone(state || createAutoSendState());
   next.enabled = true;
   next.deliveryMode = wanted;
@@ -206,12 +240,36 @@ export function arm(state, input, confirmation, userGesture, now = Date.now()) {
   next.expiresAt = now + ttl;
   next.maxSends = maxSends;
   next.sentCount = 0;
+  next.singleShot = singleShot;
   next.bindingRevision = binding.revision;
   next.conversationId = binding.conversationId;
   next.documentInstanceId = binding.documentInstanceId || null;
   next.lastError = null;
   return { state: next, result: { ok: true, enabled: true, deliveryMode: wanted,
-    expiresAt: next.expiresAt, maxSends } };
+    expiresAt: next.expiresAt, maxSends, singleShot } };
+}
+
+// T122: is this grant actually live *now*? `enabled` alone is not the answer: an expired
+// grant keeps its flag until something reconciles it, and the popup shows the value.
+export function grantIsLive(state, now = Date.now()) {
+  if (!state || state.enabled !== true) return false;
+  if (!Number.isFinite(state.expiresAt)) return true;
+  return now < state.expiresAt;
+}
+
+// T122: one shot, then nothing. Called with the outcome of the attempt, so an ambiguous
+// write disarms exactly like a confirmed one -- the whole point is that the second message
+// must be impossible, and "we are not sure whether the first one landed" is the strongest
+// reason to stop rather than the weakest.
+export function consumeSingleShot(state, outcome, now = Date.now()) {
+  if (!state || state.singleShot !== true) return { state, consumed: false };
+  if (!SINGLE_SHOT_CONSUMING_OUTCOMES.includes(String(outcome))) {
+    return { state, consumed: false };
+  }
+  const done = disarm(state, 'single_shot_consumed:' + outcome, now);
+  done.state.singleShot = true;
+  done.state.singleShotOutcome = String(outcome);
+  return { state: done.state, consumed: true, outcome: String(outcome) };
 }
 
 export function disarm(state, reason, now = Date.now()) {

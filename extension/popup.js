@@ -621,6 +621,13 @@ const asEls = {
   refresh: document.getElementById('notifyAuthRefresh'),
   arm: document.getElementById('notifyAuthArm'),
   disarm: document.getElementById('notifyAuthDisarm'),
+  // T122: the restricted ("one message, 15 minutes") controls. Separate elements, separate
+  // phrase, separate message -- the standing grant is neither reused nor narrowed.
+  onceState: document.getElementById('notifyAuthOnceState'),
+  oncePhrase: document.getElementById('notifyAuthOncePhrase'),
+  onceInput: document.getElementById('notifyAuthOnceConfirmation'),
+  onceArm: document.getElementById('notifyAuthOnceArm'),
+  onceResult: document.getElementById('notifyAuthOnceResult'),
   result: document.getElementById('notifyAuthResult'),
   triggerState: document.getElementById('terminalTriggerState'),
   triggerPhrase: document.getElementById('terminalTriggerPhrase'),
@@ -1090,11 +1097,25 @@ async function refreshAutoSend() {  const stateReply = await ask({ type: 't058-s
       : '读取失败：' + (triggerReply.error || '未知'),
     triggerReply.ok ? 'ok' : 'bad');
   renderDirectOptIn(directReply);
+  // T122: what the restricted grant currently is, in one line. A standing grant leaves this
+  // saying "none", because the two are different permissions and must not look alike.
+  const autoState = stateReply.ok ? stateReply.result : null;
+  if (autoState && autoState.singleShot === true) {
+    setText(asEls.onceState, '一次性授权：最多 ' + autoState.maxSends + ' 条，已发 ' +
+      autoState.sentCount + '，' + (autoState.expiresAt
+        ? new Date(autoState.expiresAt).toLocaleString() + ' 到期' : '无到期时间') +
+      (autoState.enabled === true ? '' : '（已停用：' + (autoState.lastError || '—') + '）'),
+    autoState.enabled === true ? 'ok' : 'warn');
+  } else {
+    setText(asEls.onceState, '当前没有一次性授权（长期授权不影响这一组，反之亦然）。');
+  }
 
   if (!conversationId) {
     setText(asEls.phrase, '尚未绑定会话，请先在上一节完成绑定。', 'bad');
     setText(asEls.triggerPhrase, '尚未绑定会话，请先在上一节完成绑定。', 'bad');
     asEls.arm.disabled = true;
+    asEls.onceArm.disabled = true;
+    setText(asEls.oncePhrase, '尚未绑定会话，请先在上一节完成绑定。', 'bad');
     asEls.triggerArm.disabled = true;
     asEls.disarm.disabled = true;
     asEls.triggerDisarm.disabled = true;
@@ -1107,7 +1128,16 @@ async function refreshAutoSend() {  const stateReply = await ask({ type: 't058-s
     + '\n后台照抄：AUTOSEND-BACKGROUND ' + conversationId
     + '\n（两句不通用；选哪种模式就抄哪一句）');
   setText(asEls.triggerPhrase, '请照抄：AUTOTRIGGER ' + conversationId);
+  // T122: the restricted phrase, shown next to the standing one and typed into its own
+  // box. Copying it is the gesture; nothing here pre-fills either field. The prefix comes
+  // from lib/single_shot_view.js, which a test pins against the worker's own constant.
+  const oncePhrase = (typeof window !== 'undefined' && window.singleShotPhrase)
+    ? window.singleShotPhrase(conversationId)
+    : 'AUTOSEND-ONCE ' + conversationId;
+  setText(asEls.oncePhrase, '仅一次照抄：' + oncePhrase
+    + '\n（最多 1 条 · 15 分钟内有效 · 只对当前绑定会话；发出一条或结果不确定就自行停用）');
   asEls.arm.disabled = false;
+  asEls.onceArm.disabled = false;
   asEls.triggerArm.disabled = false;
   asEls.disarm.disabled = false;
   asEls.triggerDisarm.disabled = false;
@@ -1149,6 +1179,28 @@ asEls.disarm.addEventListener('click', async () => {
   setText(asEls.result, reply.ok ? '已停用自动发送。' : '停用失败：' + reply.error,
     reply.ok ? 'ok' : 'bad');
   await refreshAutoSend();
+});
+
+// T122: arm exactly one message, for fifteen minutes, on this binding only. The typed phrase
+// is the gesture; the bounds are applied by the worker, so a modified popup cannot ask for
+// more than one.
+asEls.onceArm.addEventListener('click', async () => {
+  asEls.onceArm.disabled = true;
+  try {
+    const reply = await ask({
+      type: 't058-arm-once',
+      confirmation: asEls.onceInput.value,
+      userGesture: true,
+    });
+    const result = reply.ok ? reply.result : { ok: false, code: reply.error };
+    setText(asEls.onceResult, result.ok
+      ? '已授权下一条：最多 ' + result.maxSends + ' 条，' +
+        new Date(result.expiresAt).toLocaleString() + ' 到期；发出一条或结果不确定即自动停用。'
+      : '未授权：' + result.code, result.ok ? 'ok' : 'bad');
+    asEls.onceInput.value = '';
+  } finally {
+    await refreshAutoSend();
+  }
 });
 
 asEls.triggerArm.addEventListener('click', async () => {

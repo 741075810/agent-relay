@@ -13,8 +13,8 @@
 // Dependencies are injected so this runs against fakes in tests without a
 // browser, and so the module itself owns no chrome.* surface.
 import {
-  arm, createAutoSendState, decide, disarm, journalKey, reconcileAfterRestart,
-  recordAttempt, settle,
+  arm, consumeSingleShot, createAutoSendState, decide, disarm, journalKey,
+  reconcileAfterRestart, recordAttempt, settle,
 } from './autosend.js';
 
 export function createAutoSendController(deps) {
@@ -40,6 +40,17 @@ export function createAutoSendController(deps) {
     const binding = await readBinding();
     const current = await reconcile();
     const done = arm(current, Object.assign({}, input, { binding }),
+      confirmation, userGesture, now());
+    if (done.result.ok) await save(done.state);
+    return done.result;
+  }
+
+  // T122: the restricted grant. The bounds are set here and not by the caller, so a popup
+  // that grew an extra field -- or a hand-written message -- still cannot ask for two.
+  async function armOnce(confirmation, userGesture) {
+    const binding = await readBinding();
+    const current = await reconcile();
+    const done = arm(current, { binding, singleShot: true },
       confirmation, userGesture, now());
     if (done.result.ok) await save(done.state);
     return done.result;
@@ -126,7 +137,13 @@ export function createAutoSendController(deps) {
     }
 
     const done = settle(written.state, key, outcome, now());
-    await save(done.state);
+    // T122: a single shot is spent by the attempt, and an ambiguous write is the *strongest*
+    // reason to stop, not the weakest -- the message may be on the page already. The deferral
+    // path above returned early, so nothing that never touched the composer reaches here.
+    const consumed = consumeSingleShot(done.state,
+      done.result.ok ? 'sent' : 'ambiguous', now());
+    const nextState = consumed.state;
+    await save(nextState);
     return {
       sent: done.result.ok === true,
       // Past this point the page was definitely touched, whatever came back.
@@ -134,9 +151,10 @@ export function createAutoSendController(deps) {
       code: done.result.ok ? null : done.result.code,
       reason: done.result.reason || (outcome && outcome.reason) || null,
       evidence: outcome && outcome.evidence ? outcome.evidence : null,
-      state: done.state,
+      singleShotConsumed: consumed.consumed === true,
+      state: nextState,
     };
   }
 
-  return { state, reconcile, armWith, stop, sendOnce };
+  return { state, reconcile, armWith, armOnce, stop, sendOnce };
 }

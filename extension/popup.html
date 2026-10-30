@@ -227,6 +227,16 @@
     <button id="notifyAuthDisarm" disabled>立即停用</button>
     <pre id="notifyAuthResult">尚未操作</pre>
     <hr />
+    <div class="mod-note">只在测一条时用下面这一组：最多 1 条、15 分钟内有效、只对当前绑定的这个会话和文档，
+      发出去一条（或结果不确定）就立刻自行停用。它的短语和上面那组不同，两组不能互相代替，
+      也不会因为用了一次就把上面的长期授权改窄或放宽。</div>
+    <pre id="notifyAuthOnceState">尚未读取</pre>
+    <div id="notifyAuthOncePhrase">—</div>
+    <input id="notifyAuthOnceConfirmation" type="text" autocomplete="off"
+           placeholder="照抄上面那行一次性短语" />
+    <button id="notifyAuthOnceArm" disabled>仅授权下一次（1 条 · 15 分钟）</button>
+    <pre id="notifyAuthOnceResult">尚未操作</pre>
+    <hr />
     <h3 class="mod-title"><span class="mod-no">T059</span>任务终态触发（默认关闭，独立开关）</h3>
     <div class="mod-note">只接受终态完成事件，固定短语加任务 ID，不带正文。内置最小间隔与每小时上限；
       同一任务不会重复发送。触发只排队候选，不跳过任何页面检查。</div>
@@ -269,6 +279,7 @@
 
   <script src="lib/build_stamp.js"></script>
 <script src="lib/queue_error_view.js"></script>
+<script src="lib/single_shot_view.js"></script>
 <script src="popup.js"></script>
 </body>
 </html>

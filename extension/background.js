@@ -538,6 +538,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             { ttlMs: msg.ttlMs, maxSends: msg.maxSends,
               deliveryMode: msg.deliveryMode },
             msg.confirmation, msg.userGesture === true) });
+        } else if (msg.type === 't058-arm-once') {
+          // T122: the restricted grant. No ttl/maxSends are read from the message on purpose:
+          // the bounds are constants in `armOnce`, so the popup cannot ask for more than one
+          // message and a rewritten popup cannot either.
+          const extra = Object.keys(msg).filter((key) => !['type', 'confirmation',
+            'userGesture'].includes(key));
+          if (extra.length) {
+            sendResponse({ ok: false, error: 'unexpected_fields',
+              fields: extra });
+          } else {
+            sendResponse({ ok: true, result: await autoSend.armOnce(
+              msg.confirmation, msg.userGesture === true) });
+          }
         } else if (msg.type === 't058-disarm') {
           sendResponse({ ok: true, result: await autoSend.stop('operator_disarmed') });
         } else if (msg.type === 't058-send') {
@@ -1667,6 +1680,14 @@ async function runTerminalTrigger(options = {}) {
   // is spent on candidates that get past `admit`, and a refusal costs nothing. The loop
   // still terminates on the candidate list, and every refusal is still reported.
   let budget = Math.max(0, limit);
+  // T122: a one-shot arm promises "the next terminal message", and the only honest way to keep
+  // that promise is to refuse when two runs could claim it. Checked once, before the loop, so the
+  // refusal is a fact about the candidate set rather than a race between iterations.
+  const guard = terminalTrigger.guardSingleCandidate(state, fresh, nowFn());
+  if (!guard.ok) {
+    for (const candidate of fresh) results.push({ candidate, code: guard.code });
+    return results;
+  }
   for (const candidate of fresh) {
     if (budget <= 0) break;
     if (state.enabled !== true) {

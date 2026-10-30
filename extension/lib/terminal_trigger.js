@@ -100,6 +100,11 @@ export function createTriggerState() {
     armedAt: null,
     minIntervalMs: DEFAULT_MIN_INTERVAL_MS,
     maxPerHour: DEFAULT_MAX_PER_HOUR,
+    // T122: a per-arm cap, null on the standing path. The hourly limit bounds the *rate*;
+    // this bounds the *total*, which is what a one-shot test needs. Absent means unlimited
+    // by this field, i.e. every existing arm keeps exactly the behaviour it had.
+    maxTriggers: null,
+    triggers: 0,
     lastSentAt: null,
     windowStartedAt: null,
     windowCount: 0,
@@ -344,6 +349,11 @@ export function configure(state, input, confirmation, userGesture, now = Date.no
   next.minIntervalMs = Math.min(MAX_INTERVAL_CEILING_MS,
     Math.max(MIN_INTERVAL_FLOOR_MS, wanted));
   next.maxPerHour = Math.min(MAX_PER_HOUR_CEILING, Math.max(1, perHour));
+  // T122: null (the default) means no per-arm cap. A positive integer caps the total, and
+  // the counter restarts because a fresh arm is a fresh grant.
+  next.maxTriggers = Number.isSafeInteger(input.maxTriggers) && input.maxTriggers > 0
+    ? Math.min(input.maxTriggers, MAX_PER_HOUR_CEILING) : null;
+  next.triggers = 0;
   next.lastError = null;
   next.windowStartedAt = now;
   next.windowCount = 0;
@@ -363,6 +373,7 @@ export function configure(state, input, confirmation, userGesture, now = Date.no
   return { state: next, result: {
     ok: true, enabled: true,
     minIntervalMs: next.minIntervalMs, maxPerHour: next.maxPerHour,
+    maxTriggers: next.maxTriggers, triggers: next.triggers,
     schemaSuspect: Array.isArray(next.schemaSuspect) ? next.schemaSuspect.slice()
       : [],
   } };
@@ -402,6 +413,13 @@ export function nextRetryAt(attempts, now) {
 export function admit(state, candidate, now = Date.now()) {
   const s = normalized(state);
   if (s.enabled !== true) return { admit: false, code: 'trigger_disabled' };
+  // T122: the per-arm cap, checked before anything about the candidate so a spent one-shot
+  // cannot be revived by a candidate that would otherwise be admissible.
+  if (Number.isSafeInteger(s.maxTriggers) && s.maxTriggers > 0 &&
+      Number.isFinite(s.triggers) && s.triggers >= s.maxTriggers) {
+    return { admit: false, code: 'trigger_limit_reached',
+      triggers: s.triggers, maxTriggers: s.maxTriggers };
+  }
   // A field we could not trust means we cannot prove dedup, pacing or the window.
   // Refusing to send is recoverable; a duplicate write is not. Only an explicit
   // re-arm clears this, and that is a human decision.
@@ -529,7 +547,40 @@ export function markAttempt(state, candidate, now = Date.now()) {
       : (Number.isFinite(candidate.directArmedAt) ? 'candidate_opt_in' : 'none'),
     provenance: 'unverified_candidate',
   };
+  // T122: the attempt is what spends a one-shot, not the send's outcome. A write that fails
+  // after this point must not get a second try just because the page refused it.
+  next.triggers = (Number.isSafeInteger(next.triggers) ? next.triggers : 0) + 1;
   return { state: next, key: k };
+}
+
+/**
+ * T122: refuse when a one-shot has more than one eligible candidate.
+ *
+ * A restricted arm cannot be bound to a run id, because nothing at arm time knows which run
+ * will finish next. What it can promise instead is the weaker, checkable statement: at the
+ * moment of the send there is exactly one candidate that ended after the arm. If two are
+ * pending -- two tasks finishing in the same window, or a stale entry that slipped in before
+ * the arm was taken -- this refuses *all* of them rather than picking one. Picking is a guess,
+ * and a guess cannot be undone after the write.
+ */
+export function guardSingleCandidate(state, candidates, now = Date.now()) {
+  const s = normalized(state);
+  const unlimited = !(Number.isSafeInteger(s.maxTriggers) && s.maxTriggers > 0);
+  const list = Array.isArray(candidates) ? candidates : [];
+  const eligible = [];
+  for (const candidate of list) {
+    if (!candidate || typeof candidate !== 'object') continue;
+    if (!ALLOWED_STATUS.includes(candidate.status)) continue;
+    if (s.seen[key(candidate.runId, candidate.status)]) continue;
+    if (!completionAfterArm(s, candidate).proven) continue;
+    eligible.push(String(candidate.runId));
+  }
+  if (unlimited) return { ok: true, count: eligible.length, runIds: eligible };
+  if (eligible.length > 1) {
+    return { ok: false, code: 'single_shot_multiple_candidates',
+      count: eligible.length, runIds: eligible.slice() };
+  }
+  return { ok: true, count: eligible.length, runIds: eligible };
 }
 
 /**
