@@ -25,6 +25,7 @@ Standalone check (no Chrome involved):
     python -B host.py --simulate 3 --dump        # print synthetic events
 """
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -190,8 +191,13 @@ class _Lock(object):
         exists and is empty -- and an empty lock file is exactly what a pre-T088 host leaves
         behind, so a second writer reads the cradle as a corpse. A hard link publishes content
         and refuses to overwrite: the target cannot exist without the bytes, and no existing
-        lock is replaced. Where hard links are unavailable the create-then-write path stays,
-        which is a documented window rather than a silent one.
+        lock is replaced.
+
+        Where the filesystem cannot hard-link, this refuses instead of falling back. The fallback
+        would publish the very empty file the design exists to prevent, and the next writer
+        would conclude "another protocol" about a lock that is merely being born. A filesystem
+        that cannot publish atomically cannot hold this lock safely, and saying so is the only
+        honest answer.
         """
         token = os.urandom(8).hex().encode()
         payload = b'\x00' + LOCK_MARKER + b' ' + token
@@ -203,18 +209,30 @@ class _Lock(object):
         finally:
             os.close(fd)
         published = False
+        failure = None
         try:
             os.link(scratch, self.path)
             published = True
         except FileExistsError:
-            published = False
-        except OSError:
-            published = False
+            published = False              # somebody published first; the path is theirs
+        except OSError as exc:
+            failure = exc
         finally:
             try:
                 os.unlink(scratch)          # only ever the file this call created
             except OSError:
                 pass
+        if failure is not None:
+            number = failure.errno
+            name = errno.errorcode.get(number, 'errno %s' % number)
+            raise HostError(
+                P.E_INTERNAL,
+                'the state directory at %s cannot publish the queue lock atomically: hard '
+                'links are unavailable here (%s: %s). Refusing, because the alternative is to '
+                'create an empty lock file that another host would read as a pre-T088 '
+                'remnant. Put the state directory on a filesystem with hard-link support '
+                '(NTFS or ext4 both have it)' % (os.path.dirname(self.path) or '.', name,
+                                                 failure.strerror or 'link refused'))
         return published
 
     def __enter__(self):
@@ -250,9 +268,18 @@ class _Lock(object):
                 self._take(fd)
                 self._check_owner(fd, created)
                 self.token = os.urandom(8).hex().encode()
-                os.lseek(fd, 0, os.SEEK_SET)
-                os.ftruncate(fd, 0)
-                os.write(fd, b'\x00' + LOCK_MARKER + b' ' + self.token)
+                # Never truncate. A file that exists with zero bytes is indistinguishable from
+                # a pre-T088 remnant to anything that looks at the path without holding the
+                # lock, so the token is overwritten in place: the marker is always there and
+                # the length never dips. T101 removed the empty file at creation; the
+                # acquisition path was still creating the same window every time it ran.
+                payload = b'\x00' + LOCK_MARKER + b' ' + self.token
+                if os.fstat(fd).st_size == len(payload):
+                    os.lseek(fd, 1 + len(LOCK_MARKER) + 1, os.SEEK_SET)
+                    os.write(fd, self.token)
+                else:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    os.write(fd, payload)
                 self.handle = fd
                 self.ident = self._identity(fd)
                 return self
