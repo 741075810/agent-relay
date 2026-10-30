@@ -35,6 +35,27 @@ STAMP_RE = re.compile(r"BUILD_STAMP = '([^']*)'")
 EXCLUDE = {os.path.join('lib', 'build_stamp.js')}
 
 
+TEXT_SUFFIXES = ('.js', '.mjs', '.html', '.htm', '.json', '.css', '.txt', '.md', '.py', '.sh')
+
+
+def describe(data):
+    """What the digest sees for one file.
+
+    Text is normalised (`\\r\\n` -> `\\n`) so a Windows checkout and a Linux checkout of the same
+    source agree -- a stamp that changes with the cloner's `core.autocrlf` would fail its own gate
+    inside a clean clone. Everything else is hashed as raw bytes: a PNG with `0D 0A` inside is not
+    a line ending, and normalising it would make two different icons hash alike, which is the one
+    failure this digest exists to catch.
+    """
+    if b'\0' in data:
+        return data
+    try:
+        data.decode('utf-8')
+    except UnicodeDecodeError:
+        return data
+    return data.replace(b'\r\n', b'\n')
+
+
 def tree_digest(root=None):
     """Digest of every shipped file except the stamp, in a fixed order."""
     root = root or EXTENSION
@@ -47,11 +68,7 @@ def tree_digest(root=None):
             if rel.replace('\\', '/') in {item.replace('\\', '/') for item in EXCLUDE}:
                 continue
             with open(full, 'rb') as handle:
-                # Normalise line endings: the digest must describe the source, not the checkout.
-                # A Windows clone with `core.autocrlf` gives every text file CRLF, and a stamp
-                # that changes with the checkout would fail its own gate on a clean clone --
-                # which is exactly where the gate runs.
-                entries.append((rel.replace('\\', '/'), handle.read().replace(b'\r\n', b'\n')))
+                entries.append((rel.replace('\\', '/'), describe(handle.read())))
     digest = hashlib.sha256()
     for rel, data in sorted(entries):
         digest.update(rel.encode('utf-8'))
@@ -97,6 +114,15 @@ def main(argv=None):
     if args.root:
         EXTENSION = os.path.abspath(args.root)
         STAMP_FILE = os.path.join(EXTENSION, 'lib', 'build_stamp.js')
+        # A wrong --root must say so. Without this the walk finds nothing, the digest is of an
+        # empty tree, and the only complaint is a FileNotFoundError from inside the reader --
+        # "I looked in the wrong place" dressed up as a crash.
+        if not os.path.isdir(EXTENSION):
+            print('no extension directory at %s' % EXTENSION)
+            return 2
+        if not os.path.isfile(STAMP_FILE):
+            print('%s has no lib/build_stamp.js, so it is not an extension tree' % EXTENSION)
+            return 2
 
     current, files = tree_digest()
     value, _text = declared()
