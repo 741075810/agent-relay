@@ -10,4 +10,4 @@
 //
 // Loaded as a plain script before popup.js (the popup is a classic script and cannot import), so
 // this file is the single definition: popup.js reads the global and declares no stamp of its own.
-globalThis.BUILD_STAMP = 'T112-d6817e4d';
+globalThis.BUILD_STAMP = 'T112-156c785f';

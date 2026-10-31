@@ -1840,7 +1840,9 @@ async function runTerminalTrigger(options = {}) {
     }
 
     const settled = terminalTrigger.settle(state, marked.key, outcome, nowFn());
-    state = settled.state;
+    // T148: bound the journal after every outcome. It is a no-op below the bound, and above it
+    // it may only let go of runs the boundary gate already refuses for this arm.
+    state = terminalTrigger.compactJournal(settled.state).state;
     await chrome.storage.local.set({ terminalTrigger: state });
     // T068: spend the running opt-in, but only on a conclusive outcome. A deferral or
     // a rate-limit refusal leaves it alone on purpose -- the task still owes a notice,
