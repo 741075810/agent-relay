@@ -1,0 +1,26 @@
+{
+  "version": "goal-plan/1",
+  "_notes": [
+    "Copy this file, replace every <...> placeholder, DELETE _notes, and set approvedBy to your",
+    "identity or ticket id -- an empty approvedBy is refused (not_approved), which is why a template",
+    "can never be mistaken for an approved plan. expiresAt is optional; omit it for no expiry.",
+    "Validate: node tools/continuation/goal_plan.mjs plans/<your-plan>.json"
+  ],
+  "objective": "<one sentence: what the finished work is, in terms a reviewer can check>",
+  "approvedBy": "",
+  "maxRounds": 12,
+  "tasks": [
+    {
+      "id": "<T156-A>",
+      "scope": "repo:agent-relay",
+      "title": "<short imperative: what this round produces>",
+      "acceptance": "<observable check: which command, which file, which gate must pass>"
+    },
+    {
+      "id": "<T156-B>",
+      "scope": "repo:agent-relay",
+      "title": "<next independent round>",
+      "acceptance": "<its observable check>"
+    }
+  ]
+}

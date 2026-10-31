@@ -179,7 +179,9 @@ export function buildGoalHandoff(plan, options = {}) {
     maxRounds: Number.isSafeInteger(plan.maxRounds) && plan.maxRounds > 0 ? plan.maxRounds : 10,
     checklist: [
       'create_goal with the objective above (objective text is the whole authorisation surface)',
-      'work one task per round; update_goal action=edit only to narrow, never to widen scope',
+      'work one task per round, then run the gates: python -m unittest discover, every test_*.mjs,',
+      '  tools/hygiene_scan.py --all and tools/release_gate.py --clean-clone',
+      'update_goal action=edit only to narrow the objective, never to widen scope',
       'after a restart: update_goal action=resume with the same objective, before touching files',
       'when the list is done: update_goal action=complete with the evidence summary',
     ],
