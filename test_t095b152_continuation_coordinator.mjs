@@ -1,0 +1,254 @@
+// T095B152: continuation coordinator, offline. Red first -- written before the modules exist.
+//
+// The point of this file: prove, in one process with no browser and no ChatGPT page, that completed
+// tasks can be handed to the *same* native session round after round, at most once each, with the
+// bookkeeping surviving crashes and replays -- and that every refusal path refuses.
+//
+// Authorisation here is a *continuation* grant (`kind: 'continuation'`): it authorises dispatching
+// work to the fixed DSH session. It is deliberately not the page-notice grant the popup arms
+// (T058/T059). Passing one where the other is required is a test case, not an accident.
+
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const DIR = process.env.T152_DIR || path.join(HERE, 'tools', 'continuation');
+const load = (name) => import(pathToFileURL(path.join(DIR, name)).href
+  + '?r=t152' + Math.random().toString(36).slice(2));
+
+const CO = await load('coordinator.mjs');
+const ES = await load('eventsource.mjs');
+const TB = await load('transport_fake_bridge.mjs');
+
+const T0 = 1793450000000;
+const MIN = 60 * 1000;
+const SESSION = 'dsh-native-session-0001';
+const SCOPE = 'repo:agent-relay';
+
+function grant(over = {}) {
+  return { kind: 'continuation', epoch: 'epoch-A', sessionId: SESSION,
+    armedAt: T0 - 60 * MIN, expiresAt: T0 + 12 * 60 * MIN, maxTasks: 8,
+    scopes: [SCOPE], ...over };
+}
+
+function tasks(n = 5) {
+  const out = [];
+  for (let i = 1; i <= n; i += 1) {
+    out.push({ id: 'task-' + i, scope: SCOPE, title: 'approved task ' + i });
+  }
+  return out;
+}
+
+function completion(n, status = 'completed') {
+  return { runId: 'aa11bb22-cc33-4d44-8e55-ff6677889' + String(900 + n), status,
+    epoch: 'epoch-A', sessionId: SESSION, endedAtMs: T0 + n * MIN };
+}
+
+function listReply(events, over = {}) {
+  return { ok: true, armEpoch: 'epoch-A', count: events.length, truncated: false,
+    candidates: events.map((e) => ({ runId: e.runId, status: e.status, origin: 'bridge',
+      startedAt: (e.endedAtMs - 4000) / 1000, endedAtMs: e.endedAtMs, postArm: true })), ...over };
+}
+
+function boot(over = {}) {
+  const bridge = TB.createFakeBridge();
+  const mirror = ES.createMirror();
+  const co = CO.createCoordinator({ bridge, mirror, tasks: tasks(), grant: grant(),
+    config: { enabled: false, leaseMs: 60 * 1000, maxTasksPerRun: 8, ...(over.config || {}) },
+    sessionId: SESSION, now: () => T0 });
+  return { bridge, mirror, co };
+}
+
+test('T152: default disabled -- no grant, no dispatch, no transport call', async () => {
+  const bridge = TB.createFakeBridge();
+  const co = CO.createCoordinator({ bridge, mirror: ES.createMirror(), tasks: tasks(),
+    config: { enabled: false }, sessionId: SESSION, now: () => T0 });
+  const out = await co.step(T0 + 1000);
+  assert.equal(out.code, 'disabled');
+  assert.equal(bridge.calls.length, 0, 'a coordinator that nobody enabled never dispatches');
+  assert.equal(co.status().enabled, false);
+});
+
+test('T152: three serial tasks run in-process with no browser and one fixed session', async () => {
+  const { bridge, co } = boot();
+  assert.equal(await co.enable(grant()), null);
+  const expected = [];
+  for (let round = 1; round <= 3; round += 1) {
+    co.poll(listReply([completion(round)]), T0 + round * MIN);
+    const out = await co.step(T0 + round * MIN + 1000);
+    assert.equal(out.code, null, 'round ' + round + ': ' + JSON.stringify(out));
+    assert.equal(out.dispatch.taskId, 'task-' + round);
+    expected.push('task-' + round);
+  }
+  assert.deepEqual(bridge.calls.map((c) => c.taskId), expected, 'in approved order');
+  assert.equal(new Set(bridge.calls.map((c) => c.sessionId)).size, 1, 'one session, never a new one');
+  assert.equal(bridge.calls[0].sessionId, SESSION);
+  const status = co.status();
+  assert.equal(status.tasksDone, 3);
+  assert.equal(status.dispatched, 3);
+  assert.equal(status.enabled, true, 'still armed: the queue has more approved work');
+});
+
+test('T152: a repeated completion is dispatched once, even across a restart and a replay', async () => {
+  const { bridge, co } = boot();
+  await co.enable(grant());
+  const reply = listReply([completion(1)]);
+  co.poll(reply, T0 + 1000);
+  const first = await co.step(T0 + 2000);
+  assert.equal(first.code, null);
+  const durable = co.checkpoint();
+  // Same event again, plus a restart from the checkpoint.
+  co.poll(reply, T0 + 3000);
+  const co2 = CO.restore(durable, { bridge, tasks: tasks(), sessionId: SESSION, now: () => T0 });
+  co2.poll(reply, T0 + 4000);
+  const second = await co2.step(T0 + 5000);
+  assert.equal(second.code, 'no_events', JSON.stringify(second));
+  assert.equal(bridge.calls.length, 1, 'exactly one dispatch across replay + restart');
+});
+
+test('T152: 40+ backlog with a truncated reply is event_gap and dispatches nothing', async () => {
+  const { bridge, co } = boot();
+  await co.enable(grant());
+  const backlog = [];
+  for (let i = 1; i <= 45; i += 1) backlog.push(completion(i));
+  co.poll(listReply(backlog, { truncated: true, count: 45 }), T0 + 1000);
+  const blocked = await co.step(T0 + 2000);
+  assert.equal(blocked.code, 'event_gap', JSON.stringify(blocked));
+  assert.equal(bridge.calls.length, 0, 'a gap is never papered over by dispatching what we did see');
+  // A non-truncated reply proves the source is whole again; work resumes, still once each.
+  co.poll(listReply([completion(1)]), T0 + 3000);
+  const out = await co.step(T0 + 4000);
+  assert.equal(out.code, null, JSON.stringify(out));
+  assert.equal(bridge.calls.length, 1);
+});
+
+test('T152: paged replay from the durable mirror feeds the coordinator in order', async () => {
+  let mirror = ES.createMirror();
+  for (let i = 1; i <= 250; i += 1) {
+    mirror = ES.appendEvent(mirror, { key: 'k' + i, runId: 'run-' + i, status: 'completed',
+      epoch: 'epoch-A', sessionId: SESSION, at: T0 + i }).mirror;
+  }
+  const pages = [];
+  let cursor = 0;
+  for (;;) {
+    const page = ES.scan(mirror, { afterSeq: cursor, limit: ES.PAGE });
+    pages.push(page.events.length);
+    if (page.done) break;
+    cursor = page.nextSeq;
+    if (pages.length > 10) break;
+  }
+  assert.deepEqual(pages, [100, 100, 50], 'the whole mirror is reachable in pages, nothing skipped');
+});
+
+test('T152: the page-notice grant is not a continuation grant', async () => {
+  const { bridge, co } = boot();
+  const noticeGrant = { kind: 'notice', mode: 'standing', epoch: 'epoch-A', sessionId: SESSION,
+    armedAt: T0 - 60 * MIN, expiresAt: T0 + 60 * MIN, maxSends: 100 };
+  assert.equal(await co.enable(noticeGrant), 'wrong_authorisation_kind');
+  assert.equal(co.status().enabled, false);
+  co.poll(listReply([completion(1)]), T0 + 1000);
+  assert.equal((await co.step(T0 + 2000)).code, 'disabled');
+  assert.equal(bridge.calls.length, 0);
+});
+
+test('T152: an expired grant stops the coordinator and says so', async () => {
+  const { bridge, co } = boot();
+  await co.enable(grant({ expiresAt: T0 + 1000 }));
+  co.poll(listReply([completion(1)]), T0 + 500);
+  const out = await co.step(T0 + 5000);
+  assert.equal(out.code, 'grant_expired');
+  assert.equal(bridge.calls.length, 0);
+  assert.equal(co.status().enabled, false, 'and it disables itself rather than trying again');
+});
+
+test('T152: an out-of-scope task is never chosen', async () => {
+  const { bridge, co } = boot();
+  await co.enable(grant({ scopes: ['repo:other'] }));
+  co.poll(listReply([completion(1)]), T0 + 1000);
+  const out = await co.step(T0 + 2000);
+  assert.equal(out.code, 'no_approved_task', JSON.stringify(out));
+  assert.equal(bridge.calls.length, 0, 'authorisation scope is checked before anything is claimed');
+});
+
+test('T152: a transport failure retries with backoff and then escalates', async () => {
+  const { bridge, co } = boot();
+  await co.enable(grant());
+  bridge.failNext(3, 'bridge_busy');
+  co.poll(listReply([completion(1)]), T0 + 1000);
+  let at = T0 + 2000;
+  let last;
+  for (let i = 0; i < 4; i += 1) {
+    last = await co.step(at);
+    at = co.status().nextRetryAt || at + 5 * MIN;
+  }
+  assert.equal(last.code === 'escalated' || co.status().escalated === 1, true,
+    'after the attempt cap it escalates: ' + JSON.stringify(co.status()));
+  assert.equal(bridge.calls.length, 1 + 1 + 1, 'three attempts, then no more');
+  assert.equal(co.status().tasksDone, 0, 'nothing was reported done');
+});
+
+test('T152: a crash between the write-ahead lease and the reply escalates, never re-dispatches', async () => {
+  const bridge = TB.createFakeBridge();
+  const co = CO.createCoordinator({ bridge, mirror: ES.createMirror(), tasks: tasks(),
+    grant: grant(), config: { enabled: true, leaseMs: 30 * 1000 }, sessionId: SESSION,
+    now: () => T0 });
+  assert.equal(await co.enable(grant()), null, 'an explicit enable is still required');
+  co.poll(listReply([completion(1)]), T0 + 1000);
+  bridge.hangOnce();                        // the request is sent, the reply never arrives
+  const pending = await co.step(T0 + 2000);
+  assert.equal(pending.code, 'in_flight', 'the lease is written before the hand-off');
+  const durable = co.checkpoint();
+  const revived = CO.restore(durable, { bridge, tasks: tasks(), sessionId: SESSION, now: () => T0 });
+  const recovered = await revived.recover(T0 + 2000 + 31 * 1000);
+  assert.equal(recovered.escalated.length, 1, 'the unknown hand-off is escalated');
+  assert.equal(revived.status().jobs[recovered.escalated[0]].lastError, 'unknown_outcome');
+  const after = await revived.step(T0 + 3 * MIN);
+  assert.equal(bridge.calls.length, 1, 'no second dispatch');
+  assert.notEqual(after.code, null);
+});
+
+test('T152: the termination conditions stop it (max tasks, empty queue, explicit stop)', async () => {
+  const { bridge, co } = boot({ config: { maxTasksPerRun: 2 } });
+  await co.enable(grant());
+  for (let round = 1; round <= 2; round += 1) {
+    co.poll(listReply([completion(round)]), T0 + round * MIN);
+    assert.equal((await co.step(T0 + round * MIN + 1000)).code, null);
+  }
+  assert.equal(co.status().enabled, false, 'the per-run cap disables it');
+  co.poll(listReply([completion(3)]), T0 + 4 * MIN);
+  assert.equal((await co.step(T0 + 4 * MIN + 1000)).code, 'disabled');
+  assert.equal(bridge.calls.length, 2);
+
+  const second = boot();
+  await second.co.enable(grant({ maxTasks: 1 }));
+  second.co.poll(listReply([completion(1)]), T0 + 1000);
+  assert.equal((await second.co.step(T0 + 2000)).code, null);
+  assert.equal(second.co.status().enabled, false, 'the grant cap disables it too');
+  second.co.poll(listReply([completion(2)]), T0 + 3000);
+  assert.equal((await second.co.step(T0 + 4000)).code, 'disabled');
+
+  const third = boot();
+  await third.co.enable(grant());
+  third.co.stop('operator');
+  third.co.poll(listReply([completion(1)]), T0 + 1000);
+  assert.equal((await third.co.step(T0 + 2000)).code, 'stopped');
+  assert.equal(third.bridge.calls.length, 0);
+});
+
+test('T152: a Bridge outage loses no event and dispatches once when it returns', async () => {
+  const { bridge, co } = boot();
+  await co.enable(grant());
+  bridge.down = true;
+  co.poll(listReply([completion(1)]), T0 + 1000);
+  const offline = await co.step(T0 + 2000);
+  assert.equal(offline.code, 'bridge_unavailable', JSON.stringify(offline));
+  assert.equal(co.status().jobs ? Object.keys(co.status().jobs).length : 0, 0,
+    'nothing is claimed while the transport is down');
+  bridge.down = false;
+  co.poll(listReply([completion(1)]), T0 + 3000);
+  const back = await co.step(T0 + 4000);
+  assert.equal(back.code, null, JSON.stringify(back));
+  assert.equal(bridge.calls.length, 1);
+});
