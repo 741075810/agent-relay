@@ -40,7 +40,8 @@ SAMPLES = {
     # Not 32 copies of one letter: the scanner deliberately excuses self-evidently synthetic ids, so a
     # repeated-letter sample would prove nothing.
     "extension-id": "URL = 'chrome-extension://" + "cbfomfmdgjhgkhaljnmkjhpmhjlnkfaj" + "/popup.html'\n",
-    "private-key": "-----BEGIN RSA PRIVATE KEY-----\n",
+    # Split so this file does not match the rule it tests.
+    "private-key": "-----BEGIN RSA " + "PRIVATE KEY-----\n",
     "host-token": "TOKEN = 'ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8'\n",
 }
 

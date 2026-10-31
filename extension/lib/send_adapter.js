@@ -112,6 +112,33 @@ const CLICKED_REASONS = [
 ];
 
 /** `never_written` | `written_not_clicked` | `clicked_unknown` | null. */
+/**
+ * T165: is the text already in the composer ours, or the operator's?
+ *
+ * The live symptom was a notice sitting in the composer with nothing sent. A retry then hit the
+ * "a non-empty composer belongs to whoever typed into it" refusal, which is correct as a *policy* but
+ * useless as a *diagnosis*: it told the operator nothing about whether the stranded text was our own
+ * previous write (retry is pointless, the draft is intact, delivery is unproven) or something they had
+ * typed (hands off entirely).
+ *
+ * This decides that one question and nothing else. It never writes, never clicks and never reports
+ * delivery -- it only names whose text it is looking at.
+ */
+export function composerOccupancy(before, noticeText) {
+  const occupant = typeof before === 'string' ? before : '';
+  if (occupant.trim() === '') return { code: 'composer_empty', ours: false };
+  if (typeof noticeText === 'string' && noticeText && occupant === noticeText) {
+    return { code: 'composer_holds_notice', ours: true };
+  }
+  // Same notice with the page's own whitespace handling applied: a trailing newline is still ours.
+  if (typeof noticeText === 'string' && noticeText
+      && occupant.trim() === noticeText.trim()
+      && occupant.trim().startsWith(noticeText.trim().slice(0, Math.max(1, noticeText.trim().length - 1)))) {
+    return { code: 'composer_holds_notice', ours: true, normalised: true };
+  }
+  return { code: 'composer_holds_foreign_text', ours: false };
+}
+
 export function classifySendReason(reason) {
   if (typeof reason !== 'string' || reason === '') return null;
   const code = reason
@@ -897,10 +924,18 @@ export async function deliverInto(doc,
       evidence: null };
   }
   if (before.trim() !== '') {
-    // A non-empty composer belongs to whoever typed into it.
+    // T165: a composer that already holds *this exact notice* is our own earlier write that never got
+    // sent -- the stranded-draft state behind the live screenshot. Diagnosing it as unknown operator
+    // text buried the one fact that matters: nothing was delivered, and the draft is still intact.
+    const occupancy = composerOccupancy(before, text);
+    // A non-empty composer belongs to whoever typed into it. The refusal code stays one value -- the
+    // callers and the readiness suites pin it -- but the *evidence* now names whose text it is, because
+    // "our own stranded write" and "the operator is typing" call for opposite next steps.
     return { status: 'refused', reason: 'composer_not_empty',
       composerTouched: false, composerWritten: false, clickPerformed: false,
-      evidence: null };
+      evidence: { observedAt: now, deliveryMode: mode, composerOccupancy: occupancy.code,
+        composerHoldsNotice: occupancy.ours, priorWriteDetected: occupancy.ours,
+        normalisedMatch: occupancy.normalised === true } };
   }
 
   // T051: a dialog over the page is a page the operator is using right now.
