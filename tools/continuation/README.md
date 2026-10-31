@@ -64,13 +64,60 @@ interchangeable.
 * scope, expiry, session binding and the two termination conditions (per-run cap, grant cap) all
   refuse.
 
+## Why there is still no real transport (T153, read-only evidence)
+
+The DSH side of the Bridge is the installed package `@codex-bridge/dsh-desktop-connector` v1.0.0,
+protocol `codex-bridge-dsh/1`. Read from that install:
+
+* `transport.mjs` builds the interface with `net.createServer` — it is a **server**;
+* its dispatch table, from the module sources, is exactly
+  `pairing/state`, `pairing/request`, `pairing/revoke`, `project/sync`,
+  `run/start`, `run/observe`, `run/steer`, `run/cancel`,
+  `session/list`, `session/open`, `session/read`, `session/rename`, `session/event`;
+* `index.mjs` also registers a POST route `/api/codex-bridge-desktop` that forwards a Bridge
+  `client-request` into `clientRpc`.
+
+Every one of those is the Bridge addressing DSH. There is no outbound call, no "list my tasks" and
+no "submit a task" in that package, so a coordinator in this process has nothing supported to call.
+
+The `mcp__Codex_Bridge__list_tasks|get_task|submit_task` tools are the **ChatGPT client's** tools.
+They prove a capability of that client; they say nothing about the DSH host process, which registers
+no such MCP client. Treating the two as the same thing is the mistake `transport_capability.mjs`
+exists to make impossible.
+
+`transport_capability.mjs` therefore takes a declaration instead of a guess:
+
+```js
+{ api: 'codex-bridge-dsh/1', version: '1.0.0', direction: 'inbound',
+  docsRef: 'connector:transport.mjs + dispatch table',
+  ops: { listTasks: false, getTask: false, submitTask: false, observeRuns: true } }
+// -> code: 'direction_not_outbound'
+```
+
+and a well-formed outbound declaration with no injected client reports `client_absent`, with
+`probeEnvironment()` returning `unavailable / no_supported_outbound_channel`. Submission is refused
+twice over: `submit_not_authorised` without a `kind: 'continuation'` grant, and
+`submit_not_implemented` even with one, because no supported submission path exists here.
+
+The read-only adapter (`createReadOnlyAdapter`) is the only part that can be exercised: it pages
+`list_tasks` by cursor, redacts task bodies, accepts both `tasks`/`items` and
+`next_cursor`/`nextCursor` spellings, errors on malformed replies instead of returning an empty
+list, and refuses any tool outside `list_tasks` / `get_task` before a call is made.
+
+### What would make a real adapter possible
+
+1. The Bridge publishes a **documented, outbound** interface for task read/submit (a client API, not
+   its current DSH-facing server), with a version string and an auth scheme; then a declaration with
+   `direction: 'outbound'` and that `docsRef` passes validation.
+2. Or DSH is given an MCP client for the same Bridge MCP server the ChatGPT client already uses,
+   with a token the operator issues; the adapter then takes that client as an injected dependency.
+3. Either way the operator issues a `kind: 'continuation'` grant; page-notice grants (T058/T059) do
+   not authorise execution.
+
 ## What it does not provide
 
-* **No real transport.** `transport_fake_bridge.mjs` fakes `request/ack/unknown/failed`. A real
-  adapter must implement the same `request({sessionId, taskId, key, title, epoch})` shape through an
-  interface that is documented and supported by the thing being called. Nothing in this repository
-  currently documents such an interface for submitting a DSH/Bridge task, so the seam stays a seam.
-  Do not guess one from the host's binary or from an internal endpoint.
+* **No real transport.** `transport_fake_bridge.mjs` fakes `request/ack/unknown/failed`. Do not
+  guess an interface from the host's binary or from an internal endpoint.
 * **No Bridge ledger reader.** Reading the ledger's private JSON by guesswork is how wrong joins
   happen. The event source here is the mirror the coordinator maintains itself; a `LedgerAdapter`
   that pages over a *supported* source could replace it, and until one exists `event_gap` stays
