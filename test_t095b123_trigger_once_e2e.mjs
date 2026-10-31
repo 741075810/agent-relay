@@ -275,9 +275,18 @@ test('T123 e2e: an expired restricted trigger stops instead of waiting', async (
       return { sent: true, pageWriteAttempted: true, code: null, state: {} }; },
   });
   assert.equal(writes.length, 0);
-  assert.ok(run.results.some((row) => row.code === 'trigger_expired'),
-    JSON.stringify(run.results));
+  // T137 moved this decision earlier: `reconcileAfterRestart()` now retires an expired
+  // restricted arm before any candidate is looked at, so the tick returns `trigger_disabled`
+  // with an empty `results` list instead of walking the queue and refusing one entry at a time.
+  // That is the stronger outcome -- a dead arm does not inspect candidates at all -- and both
+  // paths must keep the three guarantees below.
+  assert.ok(run.results.length === 0
+    || run.results.some((row) => row.code === 'trigger_expired'),
+  JSON.stringify(run.results));
+  assert.equal(run.fetched.code, 'trigger_disabled',
+    'an expired arm must not even ask the host for candidates: ' + JSON.stringify(run.fetched));
   assert.equal(world.store.local.terminalTrigger.enabled, false,
     'expiry must disable, not leave it dormant for a later candidate');
+  assert.equal(world.store.local.terminalTrigger.lastError, 'single_shot_trigger_expired');
   assert.ok(world.clears.includes('dsh-terminal-trigger'));
 });

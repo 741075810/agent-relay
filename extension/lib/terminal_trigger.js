@@ -1036,5 +1036,22 @@ export function reconcileAfterRestart(state, now = Date.now()) {
     next.enabled = false;
     next.lastError = 'stopped:worker_restarted_during_attempt';
   }
+  // T137: a restricted arm has a window, and this is the one path where it can outlive it.
+  // `admit()` refuses an expired arm, but nothing calls `admit()` while the store sits untouched,
+  // so the record came back `enabled: true`: the popup described a live arm that could never
+  // fire, and `syncTerminalAlarm()` kept the hourly alarm scheduled because it only clears an
+  // alarm for `enabled !== true`. The grant store already expires itself here
+  // (`authorization_expired`); the two must reach the same verdict at the same instant, or the UI
+  // ends up describing two different truths.
+  //
+  // Deliberate: when the journal repair above already disabled the arm, it keeps its reason. An
+  // attempt that may have written is the sharper fact, and one field cannot say both.
+  if (next.enabled === true && next.singleShotTrigger === true
+      && Number.isFinite(next.expiresAt) && now >= next.expiresAt) {
+    next.enabled = false;
+    next.lastError = 'single_shot_trigger_expired';
+    next.disabledAt = now;
+    changed = true;
+  }
   return { state: next, changed };
 }

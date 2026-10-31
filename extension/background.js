@@ -582,6 +582,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           if (reconciled.changed) {
             await chrome.storage.local.set({ terminalTrigger: reconciled.state });
           }
+          // T137: a repair that disabled the arm must also drop its alarm, or the popup reads
+          // `alarm: 1` next to a disabled arm and an ended authorization keeps a wake-up.
+          if (reconciled.state.enabled !== true) {
+            await syncTerminalAlarm();
+          }
           const candidates = await chromeAutoSend.readCandidates();
           const preArmKeys = new Set(Array.isArray(reconciled.state.preArmCandidateKeys)
             ? reconciled.state.preArmCandidateKeys : []);
@@ -1539,6 +1544,12 @@ async function runTerminalTrigger(options = {}) {
   if (reconciled.changed) {
     state = reconciled.state;
     await chrome.storage.local.set({ terminalTrigger: state });
+  }
+  // T137: the same rule on the tick path. The `disable()` paths further down clear the alarm
+  // explicitly; this one used to leave it scheduled, so an arm that ended with its window kept
+  // waking the worker every hour to be told `trigger_disabled`.
+  if (state.enabled !== true) {
+    await syncTerminalAlarm();
   }
 
   // Default off, and off means "do not even ask the host". Polling a source
