@@ -1000,6 +1000,15 @@ export function optInFor(state, candidate) {
 export function optInUsable(entry, candidate, now = Date.now()) {
   if (!entry) return { ok: false, code: 'no_opt_in' };
   if (entry.consumedAt) return { ok: false, code: 'already_settled' };
+  // T161: consent belongs to the run it was given for. Two identifiers that are both present and
+  // different mean the notice is about another task, whatever the timestamps say; legacy entries
+  // without a run id keep the old behaviour, where the time rule decides.
+  const entryRun = typeof entry.runId === 'string' && entry.runId ? entry.runId : null;
+  const candidateRun = candidate && typeof candidate.runId === 'string' && candidate.runId
+    ? candidate.runId : null;
+  if (entryRun && candidateRun && entryRun !== candidateRun) {
+    return { ok: false, code: 'opt_in_run_mismatch', entryRun, candidateRun };
+  }
   if (!Number.isFinite(entry.armedAt) || entry.armedAt <= 0) {
     return { ok: false, code: 'opt_in_unreadable' };
   }
