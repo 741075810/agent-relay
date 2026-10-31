@@ -154,7 +154,26 @@ joins three things so it becomes evidence:
 no log was supplied so existence was never checked. The renderer prints `unverified` for `null`, because
 "not checked" reported as "present" is the failure this module exists to prevent.
 
-## 10. Files
+## 10. What to do after a restart
+
+`tools/continuation/round_recovery.mjs` decides, from artefacts, what a returning run may do next. One
+decision, and the steps that follow from it:
+
+| Decision | When | First step |
+|---|---|---|
+| `discard_tail` | the ledger's last line was cut off -- checked **before** `complete`, because completion may have been decided from a view missing that round | drop the torn line, keep the complete rounds, record the index |
+| `nothing_to_do` | the goal is `complete` | report the finished run |
+| `revision_drift` | a round ran under a newer goal revision than the goal now reports | stop; compare `roundsStarted`, do not re-run the round |
+| `plan_changed` | a round's `planDigest` differs from the approved plan | stop; re-approve, record the new digest |
+| `blocked` | the plan is missing, or a row cannot name its revision (`row_revision_missing`) | stop and report the code |
+| `finish_open_round_first` | any round has no terminal outcome | record how it ended before any new work |
+| `needs_human_resume` | the goal is `disarmed` | ask for `update_goal action=resume`; do not create a second goal |
+| `resume_ok` | armed, no open round, plan matches | let the driver start the next round; never start one by hand |
+
+The order is the design: an unreadable tail beats every judgement, drift beats a plan mismatch, an open
+round beats "armed", and a disarmed goal beats "resume ok".
+
+## 11. Files
 
 | File | Purpose |
 |---|---|
