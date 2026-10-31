@@ -404,29 +404,37 @@ async function main() {
     let cursor = first.state;
     let last = first;
     let tried = 0;
-    // Stop as soon as it blocks. Continuing past that point would
-    // re-defer against a disabled trigger and report the wrong thing.
-    while (last.result.status === 'deferred' && tried < 6) {
+    // T146: a frozen or discarded tab is a state the operator ends by coming back to the
+    // tab, so this refusal must keep waiting instead of escalating to a permanent block.
+    // Escalating it disabled the arm and journaled the completion as delivered, which meant
+    // the notice was silently destroyed -- exactly the case a background delivery exists for.
+    let cappedAt = 0;
+    while (tried < 6) {
       tried += 1;
-      const marked = TT.markAttempt(cursor, candidate, 5000 + tried * 600000);
+      const marked = TT.markAttempt(cursor, candidate, 5000 + tried * 3600000);
       last = TT.settle(marked.state, marked.key,
         { sent: false, pageWriteAttempted: false,
           code: 'target_background_unobservable', cause: 'discarded' },
-        5000 + tried * 600000);
+        5000 + tried * 3600000);
       cursor = last.state;
+      cappedAt = cursor.deferred[TT.key(RUN, 'completed')].retryAt - (5000 + tried * 3600000);
     }
-    check(tried < 6, 'it stops on its own after a bounded number of tries (' +
-      tried + ')');
-    // `settle` reports a block through `code`, not `status` -- the two outcomes
-    // have different shapes, and the deferral branch is the only one with status.
-    check(last.result.code === 'blocked',
-      'after the bounded deferrals it blocks instead of waiting for ever (' +
-      last.result.code + '/' + last.result.status + ')');
-    check(last.result.reason === 'target_background_unobservable',
-      'and the block names the cause (' + last.result.reason + ')');
-    check(cursor.enabled === false, 'and the trigger is disabled for a human to look');
-    check(/blocked:target_background_unobservable/.test(cursor.lastError || ''),
-      'with a reason that names the cause (' + cursor.lastError + ')');
+    check(last.result.status === 'deferred',
+      'six refusals later it is still waiting, not blocking (' + last.result.status + ')');
+    check(cursor.enabled === true, 'and the trigger is still armed for when the tab returns');
+    check(cursor.seen[TT.key(RUN, 'completed')] === undefined,
+      'the completion is never journaled as delivered by a deferral');
+    check(cursor.deferred[TT.key(RUN, 'completed')].attempts === 7,
+      'every refusal is counted (' + cursor.deferred[TT.key(RUN, 'completed')].attempts + ')');
+    check(cappedAt <= TT.DEFER_MAX_MS,
+      'the retry backoff is capped, so waiting is bounded (' + cappedAt + ')');
+    // And the tab comes back: the same completion goes out, exactly once.
+    const back = TT.markAttempt(cursor, candidate, 999999999);
+    const sent = TT.settle(back.state, back.key,
+      { sent: true, pageWriteAttempted: true, code: null }, 999999999);
+    check(sent.result.status === 'sent', 'the notice is delivered when the page returns');
+    check(sent.state.seen[TT.key(RUN, 'completed')].state === 'sent',
+      'and the run is journaled once, as sent');
   }
 
   // =====================================================================

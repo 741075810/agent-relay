@@ -165,9 +165,17 @@ export const PRE_WRITE_BLOCKED = Object.freeze([
 // Codes whose deferral is expected to resolve on its own given time. A deferral
 // that keeps repeating means the page is not what we think it is, so the trigger
 // escalates it to a block instead of waiting for ever.
+// T146: `target_background_unobservable` used to live in this list, and that cost the
+// notice. The code means the bound tab could not be observed *right now* -- discarded,
+// frozen, or a document the browser is not running -- and every one of those states ends
+// when the operator comes back to the tab. Escalating it after four ticks turned "went to
+// dinner" into a permanent block: the arm was disabled and the completion was journaled
+// as delivered, so it could never be sent at all. Waiting is bounded anyway --
+// `nextRetryAt` caps at `DEFER_MAX_MS`, and the arm itself carries a TTL -- and the retry
+// is still a proven pre-write refusal. `send_control_missing` stays: a page with no send
+// control is not the page we know, and a human has to look at it.
 export const ESCALATING_DEFERRALS = Object.freeze([
   'send_control_missing',
-  'target_background_unobservable',
 ]);
 export const MAX_DEFERRAL_ATTEMPTS = 3;
 
