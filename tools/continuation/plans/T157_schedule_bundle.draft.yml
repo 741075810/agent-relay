@@ -1,0 +1,40 @@
+# T157 profile-diff DRAFT -- NOT APPLIED, revocable, additive only
+#
+# Purpose: enable the officially documented schedule facility so a due reminder can carry a prompt
+# back into the SAME session that created it. That is the only documented primitive which is
+# timer-driven and survives a Host restart.
+#
+# Why this is a draft and not a change: T157 forbids touching the production DSH profile, restarting
+# the app, and enabling Jobs/Schedule. Applying this needs (a) the operator's approval and (b) one
+# restart window, because a plugin row is read at composition time.
+#
+# Documented facts this draft relies on, from `@deepseek-ai/dsh-schedule@0.2.0-rc.2/README.md`:
+#   * "Tasks remain available after Host restart"  -> restart durability is a product property;
+#   * deliveries are "follow-up messages in their original Session" -> the session binding is the
+#     original one, no new session is created;
+#   * "The shipped Web composition carries no `schedule` row; enable the optional experimental bundle
+#     `@deepseek-ai/dsh-experimental-schedule-bundle` from the Plugins page"  -> this is the
+#     documented (not invented) way to turn it on;
+#   * tools after enabling: schedule_create, schedule_list, schedule_delete, schedule_update;
+#   * one Host timer drives due tasks; every task records its sessionId and `active`/`inactive`.
+#
+# What it does NOT buy: after a resume/fork an active goal "stays disarmed until an explicit human-authorized resume",
+# so a scheduled prompt must itself ask for the resume; a reminder cannot arm a goal on its own.
+
+# --- additive patch: one bundle row, nothing else changed ---
+- insert:
+    - id: experimental-schedule-bundle
+      name: '@deepseek-ai/dsh-experimental-schedule-bundle'
+
+# --- rollback (exact) ---
+# 1. remove exactly the `- insert:` block above from the patch file;
+# 2. restart the harness once;
+# 3. verify: the model's tool list no longer contains schedule_create / schedule_list /
+#    schedule_delete / schedule_update, and no `schedule` domain rows remain in the profile.
+#
+# --- verification after applying (read-only, no task creation) ---
+# 1. tool list contains schedule_list;
+# 2. `schedule_list` returns an empty list (nothing pre-existing was disturbed);
+# 3. the goal in this session is unchanged: get_goal still reports the same id/revision/phase
+#    (enabling a bundle must not touch goal state);
+# 4. rollback steps above, executed once in a scratch profile first, return an identical tool list.

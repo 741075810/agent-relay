@@ -1,0 +1,26 @@
+{
+  "version": "goal-plan/1",
+  "objective": "Raise background continuation quality in agent-relay: prove the native round path, harden the plan tooling, and document the restart boundary, offline only.",
+  "approvedBy": "",
+  "maxRounds": 3,
+  "tasks": [
+    {
+      "id": "T157-A",
+      "scope": "repo:agent-relay",
+      "title": "pin the documented round/delivery claims to package versions",
+      "acceptance": "node test_t095b157_native_rounds.mjs passes; every probe in native_rounds.mjs is satisfied by the installed README text it names, and a mutated README fixture flips it red"
+    },
+    {
+      "id": "T157-B",
+      "scope": "repo:agent-relay",
+      "title": "make the plan validator refuse a plan whose acceptance cannot be checked",
+      "acceptance": "tools/continuation/goal_plan.mjs exits 2 on an empty acceptance; full node suite green; release_gate --clean-clone may-push"
+    },
+    {
+      "id": "T157-C",
+      "scope": "repo:agent-relay",
+      "title": "document the restart boundary and the opt-in schedule bundle honestly",
+      "acceptance": "GOAL_RUNBOOK.md states that resume/fork disarms a goal and that the schedule row is an opt-in experimental bundle; the doc-consistency test asserts both strings"
+    }
+  ]
+}
