@@ -1066,6 +1066,11 @@ async function refreshTerminalCandidates() {
     // release exists to remove would quietly come back.
     if (candidate.postArm === true || candidate.postArm === false) {
       entry.postArm = candidate.postArm;
+      // T150: bind. The verdict belongs to the snapshot the host computed it against, and the
+      // reply says which arm that is. Without this stamp the flag outlives its snapshot and the
+      // gate would honour it under any later arm.
+      entry.postArmEpoch = typeof report.armEpoch === 'string' && report.armEpoch
+        ? report.armEpoch : null;
     }
     // T067: the channel, decided by the host from the dispatch bindings. Recorded
     // once, at intake, and never rewritten: a re-offer of the same run must not be
@@ -1698,7 +1703,10 @@ async function runTerminalTrigger(options = {}) {
       if (stateEpoch !== null) {
         if (hostEpoch === null) return 'arm_snapshot_missing';
         if (hostEpoch !== stateEpoch) return 'arm_epoch_mismatch';
-        if (item.postArm === true) return null;
+        // T150: only a verdict from *this* arm counts. A `true` stamped with an older epoch (or
+        // with none, i.e. written before the stamp existed) is not evidence about this snapshot,
+        // so it falls through to the time gate below instead of being trusted.
+        if (terminalTrigger.postArmUsable(state, item)) return null;
         if (item.postArm === false) return 'in_arm_snapshot';
         // Epoch matched but this entry was stored before `postArm` existed.
         const proof = terminalTrigger.completionAfterArm(state, item);

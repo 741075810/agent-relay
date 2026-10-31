@@ -374,6 +374,30 @@ export function compactJournal(state) {
   return { state: next, evicted: [], remaining, overflow, receipts: 0 };
 }
 
+// T150: bind
+//
+// `postArm` is the host's verdict, produced against one arm snapshot. It is a *proof about a
+// snapshot*, not a property of the run, so it may only be honoured while the extension is still in
+// the arm whose snapshot produced it. Two reasons that matters:
+//
+//   * a stale `true` is an authorisation with no expiry. Recorded at intake, it would keep saying
+//     "this finished after the arm" under every later arm, including ones it predates;
+//   * the journal is the only other guard, and T149 proved it can forget a run. Layering a stale
+//     permission on top of a forgotten run is how the same completion gets written twice.
+//
+// The stamp is host-owned (`terminal-list` replies carry `armEpoch`), so nothing here invents a
+// value: an entry with no stamp -- written before this field existed -- falls back to the strict
+// time gate rather than being grandfathered.
+export function postArmUsable(state, item) {
+  if (!item || item.postArm !== true) return false;
+  const current = state && typeof state.armEpoch === 'string' && state.armEpoch
+    ? state.armEpoch : null;
+  const stamp = typeof item.postArmEpoch === 'string' && item.postArmEpoch
+    ? item.postArmEpoch : null;
+  if (current === null || stamp === null) return false;
+  return stamp === current;
+}
+
 export function configure(state, input, confirmation, userGesture, now = Date.now()) {
   const binding = input && input.binding;
   if (!binding || binding.manuallyConfirmed !== true) {

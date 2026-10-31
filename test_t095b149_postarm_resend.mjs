@@ -59,14 +59,18 @@ const LONG_RUN = { runId: uuid(4242), status: 'completed', origin: 'bridge',
   startedAt: (ARM - 40 * 60 * 1000) / 1000, endedAtMs: ARM + 60 * 1000,
   postArm: true, armEpoch: 'epoch-A' };
 
-test('T149: the epoch branch accepts postArm=true without any time check (static evidence)', () => {
+test('T149/T150: a bare truthy postArm is no longer an authorisation (static evidence)', () => {
   const epochBranch = BG_SRC.slice(BG_SRC.indexOf('const stateEpoch = typeof state.armEpoch'));
   assert.ok(epochBranch.length > 0, 'the epoch branch exists');
-  const postArmAccept = epochBranch.indexOf('if (item.postArm === true) return null;');
+  // T149 shipped while the branch read `if (item.postArm === true) return null;` -- a bare boolean
+  // accepted before any time check. T150 replaced it with an epoch-bound check; this assertion is
+  // what fails if that regresses.
+  assert.equal(epochBranch.includes('if (item.postArm === true) return null;'), false,
+    'a bare `postArm` boolean must not authorise anything');
+  const accept = epochBranch.indexOf('terminalTrigger.postArmUsable(state, item)');
   const timeGate = epochBranch.indexOf('terminalTrigger.completionAfterArm(state, item)');
-  assert.ok(postArmAccept > 0, 'a postArm=true candidate is accepted outright');
-  assert.ok(timeGate > postArmAccept,
-    'and that acceptance happens *before* any completionAfterArm call -- there is no time check');
+  assert.ok(accept > 0, 'the epoch-bound acceptance exists');
+  assert.ok(timeGate > accept, 'and every stale or unbound verdict still reaches the time gate');
 });
 
 test('T149: with the journal entry gone, a postArm=true re-offer is admitted (the hazard)', () => {
