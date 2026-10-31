@@ -83,7 +83,35 @@ Rules the tool description states, and which the runbook relies on:
 * no page dependency: rounds are driven by the session, so the ChatGPT page may be closed, backgrounded
   or on another tab — but that is a property of this session, not of the page.
 
-## 7. Files
+## 7. Reading an unattended run
+
+`tools/continuation/round_guard.mjs` gives a run two things prose cannot: a durable record per round
+and a decision about the next one.
+
+Ledger: one JSON line per round, appended by `createLedger(file).append(entry)`. Fields:
+
+| Field | Meaning |
+|---|---|
+| `roundId` | identity of the round; a replay returns `duplicate` and appends nothing |
+| `taskId` | which plan task the round worked on — an unknown id is a scope stop |
+| `planDigest` | sha256 of the approved plan, so the record is tied to what was authorised |
+| `gates` | `[{name, result}]` with `result ∈ pass\|fail\|skip` |
+| `outcome` | `done`, `continue`, `blocked`, `stop_and_report` |
+| `recordDigest` | sha256 over the row's own content, so a silent edit is detectable |
+
+`evaluateStop({plan, records, finishedTaskIds, maxRounds})` returns one of four codes:
+
+| Code | When |
+|---|---|
+| `continue` | tasks remain, no repeat failure, cap not reached |
+| `done` | every approved task has an outcome of `done` |
+| `blocked` | the same gate failed twice in a row, or the round cap is reached |
+| `stop_and_report` | a round reported a scope stop, or worked outside the plan |
+
+Nothing here creates, arms or resumes a goal: the driver decides when a round starts, and these
+functions decide what the finished round left behind and whether another may start.
+
+## 8. Files
 
 | File | Purpose |
 |---|---|

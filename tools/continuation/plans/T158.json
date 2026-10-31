@@ -1,0 +1,26 @@
+{
+  "version": "goal-plan/1",
+  "objective": "Make background DSH goal rounds auditable in agent-relay: every round appends a durable ledger record, stop conditions are evaluated by code instead of by memory, and the runbook documents how to read both.",
+  "approvedBy": "",
+  "maxRounds": 3,
+  "tasks": [
+    {
+      "id": "T158-A",
+      "scope": "repo:agent-relay",
+      "title": "round ledger: append-only, one record per round, replay-safe",
+      "acceptance": "tools/continuation/round_guard.mjs records a round as {roundId, at, planDigest, gates, outcome}; recording the same roundId twice changes nothing and returns duplicate; node test_t095b158_round_guard.mjs green"
+    },
+    {
+      "id": "T158-B",
+      "scope": "repo:agent-relay",
+      "title": "stop conditions evaluated by code, not by memory",
+      "acceptance": "evaluateStop() returns blocked when the same gate failed twice in a row, stop_and_report when a round's scope is outside the plan, done when the task list is exhausted, continue otherwise; each code covered by a test"
+    },
+    {
+      "id": "T158-C",
+      "scope": "repo:agent-relay",
+      "title": "runbook section for reading a background run",
+      "acceptance": "GOAL_RUNBOOK.md documents the ledger fields and the four stop codes; the doc-consistency test asserts each string; full node suite and release_gate --clean-clone pass"
+    }
+  ]
+}
