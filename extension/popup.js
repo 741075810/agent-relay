@@ -793,7 +793,28 @@ function formatTrigger(state, preArm, extras) {
   if (typeof preArm === 'number' && preArm > 0) {
     lines.push('启用前遗留候选：' + preArm + ' 条（已保留，不会自动发送）');
   }
-  return lines.join('\n');
+    // T142: an arm that consumed nothing and sent nothing used to look exactly like a broken
+  // one. Say what the last tick decided, how much of the one-shot budget is left, and whether
+  // a write is in flight. Read-only: this renders state, it never changes it.
+  if (state.singleShotTrigger === true) {
+    const max = Number.isSafeInteger(state.maxTriggers) ? state.maxTriggers : null;
+    const used = Number.isSafeInteger(state.triggers) ? state.triggers : 0;
+    lines.push('单次额度：' + (max === null ? '—'
+      : '剩余 ' + Math.max(0, max - used) + ' / ' + max));
+  }
+  if (state.pendingAttempt) {
+    lines.push('写入进行中：' + (state.pendingAttempt.runId || '—'));
+  }
+  if (state.lastTick && state.lastTick.guard) {
+    const verdict = state.lastTick.guard;
+    const when = state.lastTick.at ? new Date(state.lastTick.at).toLocaleString() : '—';
+    const what = verdict.ok === false
+      ? '否决 ' + (verdict.code || '—') + ' ×' + verdict.count + '（一个都不会发）'
+      : '候选 ' + verdict.count + '，放行 ' + (verdict.chosen ? 1 : 0)
+        + (verdict.count > 1 && verdict.chosen ? '（其余 ' + (verdict.count - 1) + ' 排队）' : '');
+    lines.push('上次 tick：' + when + '；' + what + '；已发 ' + (state.lastTick.sent || 0));
+  }
+return lines.join('\n');
 }
 
 // T067: what the popup shows about the A/B split, and the one action it offers.

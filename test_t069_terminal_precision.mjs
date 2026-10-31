@@ -232,7 +232,15 @@ test('precision does not disturb single-delivery', () => {
   assert.equal(first.admit, true);
   // Re-admitting against the state the first attempt left behind must not pass again.
   const afterFirst = T.markAttempt(armed, cand, MS + 60_000).state;
-  const second = T.admit(afterFirst, cand, MS + 60_000);
+  // T142: an unsettled attempt is an explicit barrier now -- the sharper statement of the
+  // same property: one run, one write.
+  const inFlight = T.admit(afterFirst, cand, MS + 60_000);
+  assert.equal(inFlight.admit, false);
+  assert.equal(inFlight.code, 'attempt_in_flight', JSON.stringify(inFlight));
+  // And once it is settled, the journal is what refuses the second offer.
+  const settled = T.settle(afterFirst, T.key(cand.runId, cand.status),
+    { sent: true, pageWriteAttempted: true }, MS + 61_000).state;
+  const second = T.admit(settled, cand, MS + 61_500);
   assert.equal(second.admit, false);
   assert.ok(['duplicate_run', 'duplicate_event'].includes(second.code),
     'a second write for one run must be refused, got ' + second.code);

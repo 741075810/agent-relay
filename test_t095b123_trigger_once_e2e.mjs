@@ -217,17 +217,21 @@ test('T123 e2e: two competing candidates spend nothing', async () => {
     candidate('cccccccc-3333-4333-8333-cccccccccccc', armedAt / 1000 + 1),
     candidate('dddddddd-4444-4444-8444-dddddddddddd', armedAt / 1000 + 2),
   ];
+  const firstId = world.store.local.terminalCandidates[0].runId;
   const writes = [];
   const run = await bg.runTerminalTrigger({
     now: () => armedAt + 5000,
     sendOnce: async (cand) => { writes.push(cand.runId);
       return { sent: true, pageWriteAttempted: true, code: null, state: {} }; },
   });
-  assert.equal(writes.length, 0, 'competition must fail closed');
-  assert.ok(run.results.every((row) => row.code === 'single_shot_multiple_candidates'),
-    JSON.stringify(run.results));
-  assert.equal(world.store.local.terminalTrigger.enabled, true,
-    'nothing was sent, so the one trigger is still available');
+  // T142: two queued completions used to veto the whole batch, which on a live install meant
+  // forty-three of them and zero sends. Exactly one is released now -- the earliest one -- and
+  // the rest stay queued for a later arm.
+  assert.deepEqual(writes, [firstId], 'exactly one candidate is released');
+  assert.ok(run.results.some((row) => row.code === 'single_shot_queued'),
+    JSON.stringify(run.results.map((row) => row.code)));
+  assert.equal(world.store.local.terminalTrigger.enabled, false,
+    'the shot was spent by the send, so nothing further can fire');
 });
 
 test('T123 e2e: a completion from before the arm cannot be the one trigger', async () => {

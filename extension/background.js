@@ -1519,6 +1519,34 @@ async function revokeRunningOptIn(sessionId, turn) {
 // Every iteration can only ever lower what is allowed: `admit` refusals skip,
 // `sendOnce` refusals skip, a non-sent outcome disables the trigger, and any
 // exception disables it and stops the loop.
+// T142: keep the last verdict where the popup can read it. Deliberately a
+// read-modify-write of one field: a tick that snapshotted the state earlier must never
+// overwrite an arm the operator took in the meantime.
+async function recordTickVerdict(guard, options = {}) {
+  const patch = {
+    at: Date.now(),
+    guard: {
+      ok: guard && guard.ok !== false,
+      code: (guard && guard.code) || null,
+      count: guard && Number.isSafeInteger(guard.count) ? guard.count : 0,
+      chosen: guard && typeof guard.chosen === 'string' ? guard.chosen : null,
+      waiting: guard && Number.isSafeInteger(guard.waiting) ? guard.waiting : 0,
+    },
+    sent: Number.isSafeInteger(options.sent) ? options.sent : 0,
+  };
+  try {
+    const stored = await chrome.storage.local.get({ terminalTrigger: null });
+    const base = stored.terminalTrigger || options.state || null;
+    if (!base) return patch;
+    await chrome.storage.local.set({
+      terminalTrigger: Object.assign({}, base, { lastTick: patch }),
+    });
+  } catch (_err) {
+    // A diagnostic must never be the reason a tick fails.
+  }
+  return patch;
+}
+
 async function runTerminalTrigger(options = {}) {
   const limit = Number.isSafeInteger(options.limit) ? options.limit : 3;
   // Test seam only: the offline suites replace the page writer so they can prove
@@ -1736,12 +1764,29 @@ async function runTerminalTrigger(options = {}) {
   // T122: a one-shot arm promises "the next terminal message", and the only honest way to keep
   // that promise is to refuse when two runs could claim it. Checked once, before the loop, so the
   // refusal is a fact about the candidate set rather than a race between iterations.
+  // T142: a restricted arm releases exactly one candidate, chosen by the module (the
+  // earliest completion after the arm; a genuine tie is still refused). T122 refused the
+  // whole set instead, which on a live install with a backlog meant the arm could never
+  // fire at all: 43 completions, zero page writes, `single_shot_multiple_candidates` for ever.
   const guard = terminalTrigger.guardSingleCandidate(state, fresh, nowFn());
   if (!guard.ok) {
     for (const candidate of fresh) results.push({ candidate, code: guard.code });
+    await recordTickVerdict(guard, { state, sent: 0 });
     // Same shape as the normal exit: an early return that changed the return type would make
     // every caller read `results` off an array and silently see nothing.
     return { state, results, fetched };
+  }
+  if (typeof guard.chosen === 'string' && guard.chosen) {
+    // Everything else stays queued: reported, never sent, never acknowledged, and never
+    // allowed to hold this arm -- or the next one -- hostage.
+    const chosenList = fresh.filter((candidate) => candidate.runId === guard.chosen);
+    for (const candidate of fresh) {
+      if (candidate.runId === guard.chosen) continue;
+      results.push({ candidate, code: 'single_shot_queued', sent: false,
+        chosen: guard.chosen, note: 'held_for_a_later_arm' });
+    }
+    fresh.length = 0;
+    for (const candidate of chosenList) fresh.push(candidate);
   }
   for (const candidate of fresh) {
     if (budget <= 0) break;
@@ -1839,6 +1884,8 @@ async function runTerminalTrigger(options = {}) {
     }
     if (state.enabled !== true) break;      // doubt disabled the trigger: stop
   }
+  await recordTickVerdict(guard, { state,
+    sent: results.filter((row) => row.sent === true).length });
   return { state, results, fetched };
 }
 

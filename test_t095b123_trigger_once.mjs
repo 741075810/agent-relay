@@ -99,7 +99,13 @@ test('T123: two candidates that both ended after the arm are refused', () => {
     trigger.ONCE_CONFIRM_PREFIX + BINDING.conversationId, true, now).state;
   const a = candidate('22222222-2222-4222-8222-222222222222', now / 1000 + 1);
   const b = candidate('33333333-3333-4333-8333-333333333333', now / 1000 + 2);
-  const conflict = trigger.guardSingleCandidate(armed, [a, b], now + 1000);
+  // T142: two completions no longer deadlock the one-shot; the earlier one is released
+  // and the other stays queued. Only a real tie is refused.
+  const picked = trigger.guardSingleCandidate(armed, [a, b], now + 1000);
+  assert.equal(picked.ok, true, JSON.stringify(picked));
+  assert.equal(picked.chosen, a.endedAtMs <= b.endedAtMs ? a.runId : b.runId);
+  const tie = Object.assign({}, b, { endedAtMs: a.endedAtMs, startedAt: a.startedAt });
+  const conflict = trigger.guardSingleCandidate(armed, [a, tie], now + 1000);
   assert.equal(conflict.ok, false);
   assert.equal(conflict.code, 'single_shot_multiple_candidates');
   assert.equal(trigger.guardSingleCandidate(armed, [a], now + 1000).ok, true);

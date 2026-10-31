@@ -136,8 +136,14 @@ test('T122: the trigger carries a one-shot cap and refuses after it is spent', (
   const candidate = terminalCandidate('11111111-1111-4111-8111-111111111111', now / 1000);
   const first = trigger.admit(configured, candidate, now + 1000);
   assert.equal(first.admit, true, JSON.stringify(first));
-  const spent = trigger.markAttempt(configured, candidate, now + 2000);
-  const second = trigger.admit(spent.state, terminalCandidate('22222222-2222-4222-8222-222222222222',
+  const marked = trigger.markAttempt(configured, candidate, now + 2000);
+  // T142: the marker is a barrier; the *outcome* is what spends the cap.
+  assert.equal(trigger.admit(marked.state, terminalCandidate(
+    '22222222-2222-4222-8222-222222222222', now / 1000), now + 3000).code,
+  'attempt_in_flight');
+  const spent = trigger.settle(marked.state, marked.key,
+    { sent: true, pageWriteAttempted: true }, now + 2500).state;
+  const second = trigger.admit(spent, terminalCandidate('22222222-2222-4222-8222-222222222222',
     now / 1000), now + 3000);
   assert.equal(second.admit, false);
   assert.equal(second.code, 'trigger_limit_reached');
@@ -150,10 +156,17 @@ test('T122: two candidates that both ended after the arm are refused, not raced'
     trigger.CONFIRM_PREFIX + BINDING.conversationId, true, now).state;
   const a = terminalCandidate('33333333-3333-4333-8333-333333333333', now / 1000 + 1);
   const b = terminalCandidate('44444444-4444-4444-8444-444444444444', now / 1000 + 2);
-  const conflict = trigger.guardSingleCandidate(armed, [a, b], now + 5000);
+  // T142: the earliest completion after the arm is what this arm is about.
+  const picked = trigger.guardSingleCandidate(armed, [a, b], now + 5000);
+  assert.equal(picked.ok, true, JSON.stringify(picked));
+  assert.equal(picked.count, 2);
+  assert.equal(picked.chosen, a.endedAtMs <= b.endedAtMs ? a.runId : b.runId);
+  // A genuine tie cannot be ordered, so it is still refused rather than guessed.
+  const tie = Object.assign({}, b, { endedAtMs: a.endedAtMs, startedAt: a.startedAt });
+  const conflict = trigger.guardSingleCandidate(armed, [a, tie], now + 5000);
   assert.equal(conflict.ok, false);
   assert.equal(conflict.code, 'single_shot_multiple_candidates');
-  assert.deepEqual(conflict.runIds.slice().sort(), [a.runId, b.runId].sort());
+  assert.deepEqual(conflict.runIds.slice().sort(), [a.runId, tie.runId].sort());
 
   const one = trigger.guardSingleCandidate(armed, [a], now + 5000);
   assert.equal(one.ok, true, JSON.stringify(one));

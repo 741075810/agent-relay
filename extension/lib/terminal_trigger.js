@@ -125,6 +125,13 @@ export function createTriggerState() {
     // on purpose: `seen` is "this run has been offered to the page", and putting a
     // deferral there would both poison the dedup and lose the retry.
     deferred: {},
+    // T142: the write that is in flight right now -- `{key, runId, status, at}` or null.
+    // It is the concurrency barrier: while one is on record no other candidate may be
+    // admitted, and a restart that finds one treats the write as possibly-landed.
+    pendingAttempt: null,
+    // T142: what the last tick decided, so the popup can say "43 candidates, one
+    // released" instead of showing an arm that looks silently broken.
+    lastTick: null,
   };
 }
 
@@ -462,6 +469,14 @@ export function nextRetryAt(attempts, now) {
 export function admit(state, candidate, now = Date.now()) {
   const s = normalized(state);
   if (s.enabled !== true) return { admit: false, code: 'trigger_disabled' };
+  // T142: an attempt already on record means a write may be in flight, or was
+  // interrupted. Admitting a second candidate here is how one arm writes twice, so this
+  // refuses everything until `settle()` or a restart reconcile clears the barrier.
+  if (s.pendingAttempt && typeof s.pendingAttempt === 'object') {
+    return { admit: false, code: 'attempt_in_flight',
+      pending: s.pendingAttempt.key || null,
+      since: Number.isFinite(s.pendingAttempt.at) ? s.pendingAttempt.at : null };
+  }
   // T123: a restricted trigger has a window. Past it the arm is dead, and dead means refused,
   // not "renewed because a candidate happened to arrive".
   if (s.singleShotTrigger === true && Number.isFinite(s.expiresAt) && now >= s.expiresAt) {
@@ -601,25 +616,75 @@ export function markAttempt(state, candidate, now = Date.now()) {
       : (Number.isFinite(candidate.directArmedAt) ? 'candidate_opt_in' : 'none'),
     provenance: 'unverified_candidate',
   };
-  // T122: the attempt is what spends a one-shot, not the send's outcome. A write that fails
-  // after this point must not get a second try just because the page refused it.
-  next.triggers = (Number.isSafeInteger(next.triggers) ? next.triggers : 0) + 1;
+  // T142: the attempt is a *write barrier*, not a spend. It must be persisted before the
+  // page is touched -- a restart cannot tell "never started" from "half done" -- but the
+  // quota belongs to the outcome: a refusal that provably never reached the page (the tab
+  // lost focus, a draft was in the composer) must not cost a one-shot its only chance.
+  // T122 spent it here, and a live install lost its one shot to a single focus blip.
+  next.pendingAttempt = { key: k, runId: String(candidate.runId),
+    status: String(candidate.status), at: now };
   return { state: next, key: k };
 }
 
+// T142: the quota is spent by an outcome that reached (or may have reached) the page.
+function spendShot(state) {
+  state.triggers = (Number.isSafeInteger(state.triggers) ? state.triggers : 0) + 1;
+}
+
+// The barrier is only cleared by the settle/reconcile of the very attempt that set it.
+function clearPendingAttempt(state, k) {
+  if (!state.pendingAttempt) return;
+  if (k && state.pendingAttempt.key !== k) return;
+  delete state.pendingAttempt;
+}
+
 /**
- * T122: refuse when a one-shot has more than one eligible candidate.
+ * T142: what a one-shot has left, in the shape the popup renders.
  *
- * A restricted arm cannot be bound to a run id, because nothing at arm time knows which run
- * will finish next. What it can promise instead is the weaker, checkable statement: at the
- * moment of the send there is exactly one candidate that ended after the arm. If two are
- * pending -- two tasks finishing in the same window, or a stale entry that slipped in before
- * the arm was taken -- this refuses *all* of them rather than picking one. Picking is a guess,
- * and a guess cannot be undone after the write.
+ * `remaining` is null for a standing arm: it has no total to run out of, and showing a
+ * number there would invent a limit the operator never granted.
+ */
+export function singleShotRemaining(state) {
+  const s = normalized(state);
+  const capped = Number.isSafeInteger(s.maxTriggers) && s.maxTriggers > 0;
+  const triggers = Number.isSafeInteger(s.triggers) ? s.triggers : 0;
+  return {
+    capped,
+    enabled: s.enabled === true,
+    triggers,
+    maxTriggers: capped ? s.maxTriggers : null,
+    remaining: capped ? Math.max(0, s.maxTriggers - triggers) : null,
+    pendingAttempt: s.pendingAttempt || null,
+  };
+}
+
+/**
+ * T142: which single completion a restricted arm releases.
+ *
+ * T122 refused the whole set as soon as two candidates were eligible. On a live install
+ * with a backlog that is not a safety property but a deadlock: 43 completions queued, 0
+ * writes, and every 30s tick answering `single_shot_multiple_candidates` until the window
+ * expired. What the arm actually promises is "the next terminal message", and the next one
+ * is well defined: the earliest completion that started after the arm was taken.
+ *
+ * The choice is therefore a rule, not a guess:
+ *
+ *   * eligibility is unchanged -- terminal status, not in the journal, and a proven
+ *     post-arm start (`completionAfterArm`), so pre-arm and historical entries can never
+ *     be selected;
+ *   * ordering uses `endedAtMs` when the host proved it, else the (already proven) start
+ *     instant. It never uses the wall clock, a file mtime, or a reading order;
+ *   * a candidate waiting out its deferral backoff is skipped, so one unreachable page
+ *     state cannot pin the arm to the same entry forever;
+ *   * two candidates whose ordering key is equal are refused, not tie-broken: an arm that
+ *     cannot say which task it is about must not pick one.
+ *
+ * Returns `{ok, count, runIds, chosen, waiting}`. `chosen` is null for a standing arm (the
+ * caller keeps its old behaviour) and for "nothing sendable right now".
  */
 export function guardSingleCandidate(state, candidates, now = Date.now()) {
   const s = normalized(state);
-  const unlimited = !(Number.isSafeInteger(s.maxTriggers) && s.maxTriggers > 0);
+  const capped = Number.isSafeInteger(s.maxTriggers) && s.maxTriggers > 0;
   const list = Array.isArray(candidates) ? candidates : [];
   const eligible = [];
   for (const candidate of list) {
@@ -627,14 +692,29 @@ export function guardSingleCandidate(state, candidates, now = Date.now()) {
     if (!ALLOWED_STATUS.includes(candidate.status)) continue;
     if (s.seen[key(candidate.runId, candidate.status)]) continue;
     if (!completionAfterArm(s, candidate).proven) continue;
-    eligible.push(String(candidate.runId));
+    const order = Number.isFinite(candidate.endedAtMs) ? candidate.endedAtMs
+      : Math.floor(candidate.startedAt) * 1000;
+    const waiting = deferralOf(s, candidate);
+    const inBackoff = Boolean(waiting) && Number.isFinite(waiting.retryAt)
+      && now < waiting.retryAt;
+    eligible.push({ runId: String(candidate.runId),
+      order: Number.isFinite(order) ? order : null, inBackoff });
   }
-  if (unlimited) return { ok: true, count: eligible.length, runIds: eligible };
-  if (eligible.length > 1) {
+  const runIds = eligible.map((entry) => entry.runId);
+  if (!capped) return { ok: true, count: eligible.length, runIds, chosen: null };
+  const sendable = eligible.filter((entry) => entry.inBackoff !== true
+    && entry.order !== null);
+  const waiting = eligible.filter((entry) => entry.inBackoff === true).length;
+  if (sendable.length === 0) {
+    return { ok: true, count: eligible.length, runIds, chosen: null, waiting };
+  }
+  const earliest = Math.min(...sendable.map((entry) => entry.order));
+  const winners = sendable.filter((entry) => entry.order === earliest);
+  if (winners.length > 1) {
     return { ok: false, code: 'single_shot_multiple_candidates',
-      count: eligible.length, runIds: eligible.slice() };
+      count: eligible.length, runIds: winners.map((entry) => entry.runId) };
   }
-  return { ok: true, count: eligible.length, runIds: eligible };
+  return { ok: true, count: eligible.length, runIds, chosen: winners[0].runId };
 }
 
 /**
@@ -910,6 +990,12 @@ export function settle(state, k, outcome, now = Date.now()) {  const next = norm
   if (!item || item.state !== 'attempting') {
     return { state, result: { ok: false, code: 'trigger_not_attempting' } };
   }
+  // T142: settling a key other than the in-flight one would clear the barrier while the
+  // real attempt is still running. Refuse; reconcile handles a genuine leftover.
+  if (next.pendingAttempt && next.pendingAttempt.key !== k) {
+    return { state, result: { ok: false, code: 'trigger_attempt_mismatch',
+      pending: next.pendingAttempt.key, settled: k } };
+  }
   if (outcome && outcome.sent === true) {
     item.state = 'sent';
     item.settledAt = now;
@@ -923,6 +1009,9 @@ export function settle(state, k, outcome, now = Date.now()) {  const next = norm
     } else {
       next.windowCount += 1;
     }
+    // T142: this is where a shot is actually spent -- a write that reached the page.
+    spendShot(next);
+    clearPendingAttempt(next, k);
     return { state: next, result: { ok: true, status: 'sent' } };
   }
 
@@ -979,6 +1068,10 @@ export function settle(state, k, outcome, now = Date.now()) {  const next = norm
           delete next.deferred[stale];
         }
       }
+      // T142: the line below was true about everything except the quota, which
+      // `markAttempt` had already spent. Clearing the barrier here is what makes "no
+      // quota consumed" a fact instead of an intention.
+      clearPendingAttempt(next, k);
       // No quota consumed, no `lastSentAt` touched, `enabled` untouched.
       return { state: next, result: { ok: true, status: 'deferred',
         reason: outcome.code, detail: next.deferred[k].detail,
@@ -995,6 +1088,8 @@ export function settle(state, k, outcome, now = Date.now()) {  const next = norm
       // would show the operator a queue entry that is dead, and would hold a slot
       // in the bounded `deferred` map that a genuinely waiting run needs.
       delete next.deferred[k];
+      spendShot(next);
+      clearPendingAttempt(next, k);
       next.enabled = false;
       next.lastError = 'blocked:' + outcome.code;
       return { state: next, result: { ok: false, code: 'blocked',
@@ -1002,6 +1097,10 @@ export function settle(state, k, outcome, now = Date.now()) {  const next = norm
     }
   }
 
+  // T142: an outcome that is not a proven pre-write refusal may have written. Spend the
+  // shot before disabling, so the popup cannot show "1 remaining" on a dead arm.
+  spendShot(next);
+  clearPendingAttempt(next, k);
   item.state = 'stopped';
   item.settledAt = now;
   item.reason = (outcome && (outcome.reason || outcome.code)) || 'send_not_confirmed';
@@ -1029,8 +1128,17 @@ export function reconcileAfterRestart(state, now = Date.now()) {
       // Same leak as `settle()`: this run is finished now, so a deferral left over
       // from an earlier refusal is a claim about a re-check that will never come.
       delete next.deferred[key];
+      // T142: the write may have landed, so the shot goes with it -- the same verdict
+      // `settle()` reaches for an uncertain outcome, and the reason T122 counted it at
+      // `markAttempt` in the first place. Now it is counted here, where it belongs.
+      spendShot(next);
+      clearPendingAttempt(next, key);
       changed = true;
     }
+  }
+  if (next.pendingAttempt && typeof next.pendingAttempt === 'object') {
+    delete next.pendingAttempt;
+    changed = true;
   }
   if (changed && next.enabled) {
     next.enabled = false;
