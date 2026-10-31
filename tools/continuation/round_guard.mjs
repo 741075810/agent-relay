@@ -59,6 +59,18 @@ export function createLedger(file) {
   };
 }
 
+function rowProblem(row) {
+  if (!row || typeof row !== 'object' || Array.isArray(row)) return 'row_not_an_object';
+  if (typeof row.roundId !== 'string' || !row.roundId) return 'round_id_missing';
+  if (typeof row.taskId !== 'string' || !row.taskId) return 'task_id_missing';
+  if (!Array.isArray(row.gates)) return 'gates_missing';
+  for (const gate of row.gates) {
+    if (!gate || typeof gate.name !== 'string') return 'gate_name_missing';
+    if (!['pass', 'fail', 'skip'].includes(gate.result)) return 'gate_result_invalid';
+  }
+  return null;
+}
+
 export function validateEntry(entry) {
   if (!entry || typeof entry !== 'object') return 'entry_missing';
   if (typeof entry.roundId !== 'string' || entry.roundId.length === 0) return 'round_id_missing';
@@ -86,6 +98,16 @@ export function evaluateStop({ plan, records, finishedTaskIds = [], maxRounds })
   const cap = Number.isSafeInteger(maxRounds) ? maxRounds
     : (Number.isSafeInteger(plan && plan.maxRounds) ? plan.maxRounds : 0);
   const rows = Array.isArray(records) ? records : [];
+
+  // A ledger row that cannot be read is an unknown state, not a clean one: the stop decision must say
+  // so instead of throwing (round B found this by passing a row with no `gates`).
+  for (const row of rows) {
+    const problem = rowProblem(row);
+    if (problem) {
+      return { code: STOP.BLOCKED, why: 'ledger row is not a usable round: ' + problem,
+        round: row && row.roundId ? row.roundId : null };
+    }
+  }
 
   if (rows.length > 0) {
     const last = rows[rows.length - 1];
