@@ -305,6 +305,9 @@ def self_test():
     two = bslash + bslash                # how source code stores one
     slash = chr(47)
     canaries = {
+        # T161: `conversation-id` had a rule and no canary, so nobody had ever watched it fire. A
+        # covered-looking list with an untested entry is the exact failure AGENTS.md warns about.
+        'canary_conversation.json': '{"conversationId": "' + secretish + '"}\n',
         'canary_session.py': "SESSION = 'session-" + secretish + "'\n",
         # Two separators: how Python source stores one. The prose gate could not see
         # this form, which is why a real interpreter path survived for months.
