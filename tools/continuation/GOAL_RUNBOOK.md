@@ -135,7 +135,26 @@ A resumed run should call `recoverTail` on the ledger and stop on a non-empty `o
 starting a new task; `verifyPlanBinding` returning `plan_drift` means the plan was edited mid-run and
 the operator must re-approve rather than let rounds continue under the old approval.
 
-## 9. Files
+## 9. Proving a round came from the driver
+
+A commit message saying "native goal round N" is a claim. `tools/continuation/round_provenance.mjs`
+joins three things so it becomes evidence:
+
+* `normalizeRecord({goal, taskId, planDigest, commit, outcome})` -> one record with the goal's real
+  `id`, `revision`, `roundsStarted`, `phase`, `activation`, plus refusal codes (`goal_id_missing`,
+  `rounds_started_missing`, `revision_missing`, `plan_digest_invalid`, `commit_invalid`,
+  `phase_invalid`, `activation_invalid`);
+* `linkProvenance({goal, records, commits, planDigest})` -> `ok` or `provenance_gap`, with each
+  problem named: `foreign_goal`, `duplicate_rounds_started`, `rounds_started_went_backwards`,
+  `ledger_ahead_of_goal`, `goal_ahead_of_ledger`, `plan_mismatch`, `commit_not_in_log`,
+  `done_without_commit`, `unreadable_record`;
+* `renderProvenanceMarkdown(report)` -> the table an operator reads, ending in a verdict and a digest.
+
+`commitPresent` is tri-state: `true` the commit is in the supplied `git log`, `false` it is not, `null`
+no log was supplied so existence was never checked. The renderer prints `unverified` for `null`, because
+"not checked" reported as "present" is the failure this module exists to prevent.
+
+## 10. Files
 
 | File | Purpose |
 |---|---|
