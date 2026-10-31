@@ -14,22 +14,35 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 
 export function recoverTail(text) {
-  const raw = typeof text === 'string' ? text : '';
-  const lines = raw.split('\n');
+  const raw = typeof text === "string" ? text : "";
+  const lines = raw.split(/\r?\n/);
   const records = [];
+  const invalid = [];
+  const unparsable = [];
   let torn = null;
   lines.forEach((line, index) => {
     const trimmed = line.trim();
     if (trimmed.length === 0) return;
+    let parsed;
     try {
-      records.push(JSON.parse(trimmed));
+      parsed = JSON.parse(trimmed);
     } catch (error) {
-      torn = { lineIndex: index, length: trimmed.length,
+      const item = { lineIndex: index, length: trimmed.length,
         reason: String(error && error.message ? error.message : error) };
+      if (index === lines.length - 1) torn = item;
+      else unparsable.push(item);
+      return;
     }
+    // A line can parse and still not be a round: `null`, a number, a string or an array. Those are
+    // dropped with a reason instead of reaching openRounds/buildEvidence as objects with no fields.
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      invalid.push({ lineIndex: index, reason: 'non_object_json_line',
+        parsedType: parsed === null ? 'null' : typeof parsed, isArray: Array.isArray(parsed) });
+      return;
+    }
+    records.push(parsed);
   });
-  return { records, torn: torn && torn.lineIndex === lines.length - 1 ? torn : null,
-    unparsable: torn && torn.lineIndex === lines.length - 1 ? [] : [torn].filter(Boolean) };
+  return { records, torn, invalid, unparsable };
 }
 
 /** A round is open when it has no terminal outcome, or its outcome is `continue` for its task. */
@@ -76,7 +89,10 @@ export function verifyPlanBinding({ records, plan }) {
 export function buildEvidence({ plan, records, commit, gates = [] }) {
   const tasks = new Map((plan && Array.isArray(plan.tasks) ? plan.tasks : [])
     .map((task) => [task.id, task]));
-  const rows = Array.isArray(records) ? records : [];
+  const all = Array.isArray(records) ? records : [];
+  // Garbage that slipped into the input must not become a round with undefined fields.
+  const rows = all.filter((row) => row && typeof row === "object" && !Array.isArray(row));
+  const invalid = all.length - rows.length;
   const rounds = rows.map((row) => ({
     roundId: row.roundId,
     taskId: row.taskId,
@@ -94,6 +110,7 @@ export function buildEvidence({ plan, records, commit, gates = [] }) {
     commit: commit ?? null,
     gates: Array.isArray(gates) ? gates : [],
     rounds,
+    invalid,
     open,
     complete: rounds.length > 0 && open.length === 0
       && rounds.every((round) => round.outcome === 'done'),
@@ -113,6 +130,9 @@ export function renderEvidenceMarkdown(bundle) {
   lines.push('', 'Plan digest: `' + (bundle.planDigest || 'none') + '`');
   lines.push('Open rounds: ' + (bundle.open.length === 0 ? 'none'
     : bundle.open.map((o) => o.roundId + '(' + o.why + ')').join(', ')));
+  if (Number.isInteger(bundle.invalid) && bundle.invalid > 0) {
+    lines.push('Invalid lines: ' + bundle.invalid + ' (not rounds)');
+  }
   lines.push('Complete: ' + bundle.complete);
   return lines.join('\n') + '\n';
 }
