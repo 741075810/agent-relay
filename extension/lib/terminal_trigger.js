@@ -345,93 +345,33 @@ export function completionAfterArm(state, candidate) {
   return { proven: false, reason: 'started_before_arm' };
 }
 
-// T148: bounded journal.
+// T149: the journal bound, as a refusal rather than a trim.
 //
-// `seen` grows by one entry per delivered / blocked / stopped run and nothing ever removes them,
-// while `chrome.storage.local` is one 5 MB bucket (T147 measured ~95 B per entry, ~228 KB/day at
-// the shipped ceiling, i.e. a full bucket in about three weeks). Trimming it carelessly is the one
-// change that can resurrect a notice, so the rules are explicit:
+// `seen` grows by one entry per delivered / blocked / stopped run and nothing removes them, while
+// `chrome.storage.local` is one 5 MB bucket (T147: ~95 B/entry, ~228 KB/day at the ceiling, ~22
+// days to full). b8103e7 tried to bound it by evicting entries whose run ended before the current
+// arm, arguing that `completionAfterArm` refuses such a run forever. That argument is wrong: the
+// epoch branch in background.js accepts any candidate carrying `postArm === true` without a time
+// check, and `postArm` is a host verdict recorded at intake that is not bound to the epoch it was
+// computed under. A re-offered run could therefore be admitted after its entry had been evicted --
+// a second write of the same run, which is the one outcome this module exists to prevent.
 //
-//   * trim only at capacity (`MAX_SEEN_ENTRIES`), never eagerly -- a normal install and every
-//     historical test keep their journal verbatim;
-//   * trim only entries the *boundary gate* already refuses: `armedAt >= endedAtMs`, or, for
-//     entries written before `endedAtMs` was recorded, `attemptedAt <= armedAt`. An attempt only
-//     happens after the run reached a terminal status, so `startedAt <= endedAtMs <= attemptedAt`;
-//     `completionAfterArm` compares `startedAt` against `armedAt`, which only grows, so such a run
-//     is refused for this arm and every later one. Losing the entry cannot produce a second write;
-//   * never touch `attempting` entries, the in-flight key, or anything whose run ended after the
-//     arm: those are the entries that stop a duplicate;
-//   * leave a receipt for every evicted entry so `admit` answers `duplicate_event` /
-//     `duplicate_run` exactly as before. Receipts are bounded (`MAX_RECEIPTS`) and drop oldest
-//     first; a lost receipt costs the *reason*, not the refusal;
-//   * if nothing is provably evictable and the journal is still over the bound, stop the arm with
-//     `journal_over_capacity`. That is a fail-closed answer, not a silent trim.
+// The safe direction is to stop rather than to forget: at capacity the arm is disabled with
+// `journal_over_capacity`, every entry is kept, and re-arming over capacity is refused with the
+// same code. Recovery is an explicit operator decision (reset the journal, or raise the ceiling by
+// understanding the cost), never a silent trim made by the code while nobody is looking.
 export const MAX_SEEN_ENTRIES = 1024;
-export const MAX_RECEIPTS = 2048;
 export const JOURNAL_OVERFLOW_CODE = 'journal_over_capacity';
-
-function receiptKey(runId, status) {
-  return String(runId) + '|' + String(status);
-}
-
-function addReceipt(state, receipt) {
-  if (!state.receipts || typeof state.receipts !== 'object' || Array.isArray(state.receipts)) {
-    state.receipts = {};
-  }
-  state.receipts[receiptKey(receipt.runId, receipt.status)] = receipt;
-  const keys = Object.keys(state.receipts);
-  if (keys.length > MAX_RECEIPTS) {
-    keys.sort((a, b) => (state.receipts[a].settledAt || 0) - (state.receipts[b].settledAt || 0));
-    for (const stale of keys.slice(0, keys.length - MAX_RECEIPTS)) delete state.receipts[stale];
-  }
-}
-
-/** End time the journal can prove for an entry, or null when it cannot. */
-function provableEnd(item) {
-  if (Number.isFinite(item.endedAtMs)) return item.endedAtMs;
-  if (Number.isFinite(item.endedAt)) return item.endedAt * 1000;
-  if (Number.isFinite(item.attemptedAt)) return item.attemptedAt;
-  return null;
-}
 
 export function compactJournal(state) {
   const next = normalized(state);
-  const armedAt = Number.isFinite(next.armedAt) ? next.armedAt : null;
-  const pendingKey = next.pendingAttempt && typeof next.pendingAttempt === 'object'
-    ? next.pendingAttempt.key : null;
-  const evicted = [];
-  if (armedAt !== null && Object.keys(next.seen).length > MAX_SEEN_ENTRIES) {
-    const candidates = [];
-    for (const key of Object.keys(next.seen)) {
-      if (key === pendingKey) continue;
-      const item = next.seen[key];
-      if (!item || item.state === 'attempting') continue;
-      const endedAt = provableEnd(item);
-      if (endedAt === null) continue;
-      // The strict comparison the boundary gate uses: armedAt >= end means "refused by time".
-      if (!(armedAt >= endedAt)) continue;
-      candidates.push({ key, item,
-        at: Number.isFinite(item.settledAt) ? item.settledAt : endedAt });
-    }
-    candidates.sort((a, b) => a.at - b.at);
-    for (const entry of candidates) {
-      if (Object.keys(next.seen).length <= MAX_SEEN_ENTRIES) break;
-      delete next.seen[entry.key];
-      evicted.push(entry.key);
-      addReceipt(next, {
-        runId: entry.item.runId, status: entry.item.status, state: entry.item.state,
-        settledAt: Number.isFinite(entry.item.settledAt) ? entry.item.settledAt : null,
-      });
-    }
-  }
   const remaining = Object.keys(next.seen).length;
   const overflow = remaining > MAX_SEEN_ENTRIES;
   if (overflow) {
     next.enabled = false;
     next.lastError = JOURNAL_OVERFLOW_CODE;
   }
-  return { state: next, evicted, remaining, overflow,
-    receipts: next.receipts ? Object.keys(next.receipts).length : 0 };
+  return { state: next, evicted: [], remaining, overflow, receipts: 0 };
 }
 
 export function configure(state, input, confirmation, userGesture, now = Date.now()) {
@@ -486,9 +426,8 @@ export function configure(state, input, confirmation, userGesture, now = Date.no
     if (left.length > 0) next.schemaSuspect = left;
     else delete next.schemaSuspect;
   }
-  // T148: a fresh arm is a fresh boundary, so it is also the cheap moment to let go of runs the
-  // gate can no longer admit. Below the bound this is a no-op, which keeps every small journal
-  // verbatim.
+  // T149: arming is also when the journal bound is checked, so an over-capacity journal is
+  // refused here instead of being silently trimmed into something the operator did not ask for.
   const compacted = compactJournal(next);
   if (compacted.overflow) {
     return { state: compacted.state, result: { ok: false, code: JOURNAL_OVERFLOW_CODE,
@@ -620,22 +559,6 @@ export function admit(state, candidate, now = Date.now()) {
     if (item && item.runId === runId) {
       return { admit: false, code: 'duplicate_run',
         previous: item.state, status: item.status };
-    }
-  }
-  // T148: the receipts left behind by evicted entries answer the same two questions, so a run
-  // that has aged out of the journal is still reported as a duplicate rather than as "older than
-  // the arm". Either answer refuses; only the code differs, and the code is what the popup shows.
-  if (s.receipts && typeof s.receipts === 'object' && !Array.isArray(s.receipts)) {
-    const receipt = s.receipts[key(runId, status)];
-    if (receipt) {
-      return { admit: false, code: 'duplicate_event', previous: receipt.state,
-        key: key(runId, status), from: 'receipts' };
-    }
-    for (const item of Object.values(s.receipts)) {
-      if (item && item.runId === runId) {
-        return { admit: false, code: 'duplicate_run', previous: item.state,
-          status: item.status, from: 'receipts' };
-      }
     }
   }
   // T067: the channel gate. Placed after the identity checks (a duplicate or a

@@ -1840,8 +1840,8 @@ async function runTerminalTrigger(options = {}) {
     }
 
     const settled = terminalTrigger.settle(state, marked.key, outcome, nowFn());
-    // T148: bound the journal after every outcome. It is a no-op below the bound, and above it
-    // it may only let go of runs the boundary gate already refuses for this arm.
+    // T149: check the journal bound after every outcome. Below the bound this is a no-op; above
+    // it the arm stops, and nothing is trimmed (see `compactJournal`).
     state = terminalTrigger.compactJournal(settled.state).state;
     await chrome.storage.local.set({ terminalTrigger: state });
     // T068: spend the running opt-in, but only on a conclusive outcome. A deferral or
