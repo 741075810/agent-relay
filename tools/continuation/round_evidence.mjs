@@ -104,6 +104,26 @@ export function buildEvidence({ plan, records, commit, gates = [] }) {
     commit: commit ?? null,
   }));
   const open = openRounds(rows);
+
+  // `complete` is the claim a reader trusts without re-deriving it, so it is derived from problems
+  // rather than from the absence of visible ones: an out-of-plan round, a round with no record digest,
+  // a duplicated round id or any open round all keep the run open (round C's audit).
+  const problems = [];
+  const seen = new Set();
+  for (const row of rows) {
+    const roundId = row.roundId;
+    if (seen.has(roundId)) {
+      if (!problems.includes('duplicate_round:' + roundId)) problems.push('duplicate_round:' + roundId);
+    }
+    seen.add(roundId);
+    if (!tasks.has(row.taskId)) problems.push('out_of_plan:' + roundId + ':' + row.taskId);
+    if (typeof row.recordDigest !== 'string' || !/^[0-9a-f]{64}$/.test(row.recordDigest)) {
+      problems.push('missing_record_digest:' + roundId);
+    }
+  }
+  for (const item of open) problems.push('open_round:' + item.roundId);
+  if (rows.length === 0) problems.push('no_rounds');
+
   return {
     version: 1,
     planDigest: planDigestOf(plan),
@@ -112,9 +132,10 @@ export function buildEvidence({ plan, records, commit, gates = [] }) {
     rounds,
     invalid,
     open,
-    complete: rounds.length > 0 && open.length === 0
-      && rounds.every((round) => round.outcome === 'done'),
-    evidenceDigest: digest(rounds.map((r) => [r.roundId, r.taskId, r.outcome, r.recordDigest])),
+    problems,
+    complete: problems.length === 0,
+    evidenceDigest: digest([commit ?? null,
+      rounds.map((r) => [r.roundId, r.taskId, r.outcome, r.recordDigest])]),
   };
 }
 
@@ -130,6 +151,9 @@ export function renderEvidenceMarkdown(bundle) {
   lines.push('', 'Plan digest: `' + (bundle.planDigest || 'none') + '`');
   lines.push('Open rounds: ' + (bundle.open.length === 0 ? 'none'
     : bundle.open.map((o) => o.roundId + '(' + o.why + ')').join(', ')));
+  if (Array.isArray(bundle.problems) && bundle.problems.length > 0) {
+    lines.push('Problems: ' + bundle.problems.join(', '));
+  }
   if (Number.isInteger(bundle.invalid) && bundle.invalid > 0) {
     lines.push('Invalid lines: ' + bundle.invalid + ' (not rounds)');
   }

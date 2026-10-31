@@ -125,6 +125,12 @@ functions take their input as arguments; none reads production state.
 | `buildEvidence({plan, records, commit, gates})` | one entry per round — task, outcome, gates, `recordDigest`, commit, and whether the task is even in the plan (`knownTask`) |
 | `renderEvidenceMarkdown(bundle)` | a table plus plan digest, open rounds and `Complete:`, for reading after the fact |
 
+`buildEvidence` reports `problems` and derives `complete` from that list, not from the absence of a
+visible one: `out_of_plan:<round>:<task>`, `missing_record_digest:<round>`, `duplicate_round:<round>`,
+`open_round:<round>` and `no_rounds`. A run is complete only when the list is empty, and the markdown
+renderer prints `Problems:` whenever it is not -- so a done-looking round against a task the plan never
+had cannot close the run.
+
 A resumed run should call `recoverTail` on the ledger and stop on a non-empty `openRounds` before
 starting a new task; `verifyPlanBinding` returning `plan_drift` means the plan was edited mid-run and
 the operator must re-approve rather than let rounds continue under the old approval.
