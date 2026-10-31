@@ -111,7 +111,25 @@ Ledger: one JSON line per round, appended by `createLedger(file).append(entry)`.
 Nothing here creates, arms or resumes a goal: the driver decides when a round starts, and these
 functions decide what the finished round left behind and whether another may start.
 
-## 8. Files
+## 8. Surviving and reviewing a real run
+
+`tools/continuation/round_evidence.mjs` closes the three gaps a real run leaves behind. All of its
+functions take their input as arguments; none reads production state.
+
+| Function | What it answers |
+|---|---|
+| `recoverTail(text)` | which rounds survived a write that was cut off: complete lines are kept, a partial **last** line comes back as `torn`, and a broken line that is *not* last is reported as `unparsable` (corruption, not a tear) |
+| `openRounds(records)` | which rounds did not close — `no_outcome`, or an outcome other than `done`/`blocked`/`stop_and_report` for a task that never reached one |
+| `planDigestOf(plan)` | the same digest `goal_plan.mjs` prints, recomputed from the plan, so the two cannot disagree |
+| `verifyPlanBinding({records, plan})` | `ok`, or `plan_drift` naming the rounds recorded against a different plan, or `plan_missing` |
+| `buildEvidence({plan, records, commit, gates})` | one entry per round — task, outcome, gates, `recordDigest`, commit, and whether the task is even in the plan (`knownTask`) |
+| `renderEvidenceMarkdown(bundle)` | a table plus plan digest, open rounds and `Complete:`, for reading after the fact |
+
+A resumed run should call `recoverTail` on the ledger and stop on a non-empty `openRounds` before
+starting a new task; `verifyPlanBinding` returning `plan_drift` means the plan was edited mid-run and
+the operator must re-approve rather than let rounds continue under the old approval.
+
+## 9. Files
 
 | File | Purpose |
 |---|---|

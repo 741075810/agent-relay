@@ -1,0 +1,26 @@
+{
+  "version": "goal-plan/1",
+  "objective": "Make the first real DSH goal round run survivable and reviewable in agent-relay: recover a ledger whose last round was cut off, detect a plan that drifted from what rounds were approved against, and assemble a per-round evidence bundle. Offline source, tests and docs only.",
+  "approvedBy": "",
+  "maxRounds": 3,
+  "tasks": [
+    {
+      "id": "T159-A",
+      "scope": "repo:agent-relay",
+      "title": "crash-safe ledger tail: report an unfinished round instead of skipping it",
+      "acceptance": "recoverTail(text) returns {records, torn} and drops a partial final line without throwing; openRounds(records) lists rounds whose outcome is missing or still continue-for-the-same-task; node test_t095b159_round_evidence.mjs green and every other test_*.mjs still green"
+    },
+    {
+      "id": "T159-B",
+      "scope": "repo:agent-relay",
+      "title": "plan drift detection between the approved plan file and the recorded rounds",
+      "acceptance": "planDigestOf(plan) equals the digest goal_plan.mjs prints; verifyPlanBinding reports plan_drift when a record's planDigest differs from the file on disk and ok when they match; both paths covered by a test"
+    },
+    {
+      "id": "T159-C",
+      "scope": "repo:agent-relay",
+      "title": "per-round evidence bundle an operator can read after a background run",
+      "acceptance": "buildEvidence({plan, records, commit, gates}) emits one entry per round with taskId, outcome, gate results, recordDigest and the commit sha, plus a markdown renderer; GOAL_RUNBOOK.md documents the bundle; release_gate --clean-clone passes"
+    }
+  ]
+}
