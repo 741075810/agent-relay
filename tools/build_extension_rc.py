@@ -255,6 +255,14 @@ def candidate_identity(root: Path) -> tuple[bool, str]:
     for rel in files:
         if not (root / rel).is_file():
             return False, f"{root} is missing {rel}, so its manifest no longer describes it"
+    # T180: a manifest describes *the whole directory*. A foreign file inside it would be deleted along with
+    # the candidate, so it must refuse rather than be silently destroyed.
+    listed = set(files) | {MANIFEST}
+    present = set(shipped_files(root)) | ({MANIFEST} if (root / MANIFEST).is_file() else set())
+    extra = sorted(present - listed)
+    if extra:
+        return False, (f"{root} contains files its manifest does not list ({', '.join(extra[:3])}), so it is "
+                       "not a directory this tool may replace")
     return True, ""
 
 
@@ -293,6 +301,7 @@ def build(out: Path, source: Path = SOURCE, allow_temp: bool = False) -> int:
     #    half-written candidate where the operator expects a good one.
     out.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=out.name + ".staging-", dir=str(out.parent)))
+    retired_path_holder = None
     try:
         staged = staging / "payload"
         shutil.copytree(source, staged, ignore=shutil.ignore_patterns(".*"))
@@ -311,13 +320,25 @@ def build(out: Path, source: Path = SOURCE, allow_temp: bool = False) -> int:
         if verify(staged, check_parse=True, source=source) != 0:
             print(f"FAIL staged candidate did not verify; {out} left untouched")
             return 1
+        # T180: the retired copy is parked *beside* the staging directory, not inside it. The `finally`
+        # removes only staging, so a failed rename can no longer take the previous candidate with it -- and if
+        # the swap fails, the original is put back.
+        retired = out.parent / (staging.name + ".retired") if replaced else None
+        retired_path_holder = retired
         if replaced:
-            retired = staging / "retired"
             out.rename(retired)
-        staged.rename(out)
+        try:
+            staged.rename(out)
+        except OSError:
+            if retired is not None and retired.exists() and not out.exists():
+                retired.rename(out)
+                print(f"restored {out} after a failed swap")
+            raise
         print(f"built {out} ({len(files)} files, stamp {manifest['stamp']})")
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+        if retired_path_holder and retired_path_holder.exists():
+            shutil.rmtree(retired_path_holder, ignore_errors=True)
     return verify(out, check_parse=True, source=source)
 
 
