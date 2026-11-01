@@ -34,6 +34,22 @@ POPUP_ORDER = ["lib/build_stamp.js", "lib/queue_error_view.js", "lib/single_shot
                "lib/readiness_queue_view.js", "lib/diagnostic_view.js", "popup.js"]
 
 
+def _rename(src: Path, dst: Path) -> None:
+    """Single hook for every directory move, so a test can fail the real branch instead of miming it."""
+    src.rename(dst)
+
+
+def all_files(root: Path) -> list[str]:
+    """Every file, hidden ones included. `shipped_files` skips dotfiles on purpose; identity checks may not."""
+    out = []
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            rel = path.relative_to(root).as_posix()
+            if rel != MANIFEST:
+                out.append(rel)
+    return out
+
+
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -252,13 +268,18 @@ def candidate_identity(root: Path) -> tuple[bool, str]:
     files = manifest.get("files")
     if not isinstance(files, dict) or not files:
         return False, f"{root}/{MANIFEST} lists no files"
-    for rel in files:
+    for rel, digest in files.items():
+        rel_path = Path(rel)
+        if rel_path.is_absolute() or ".." in rel_path.parts:
+            return False, f"{root}/{MANIFEST} lists {rel}, which is not a path inside the candidate"
         if not (root / rel).is_file():
             return False, f"{root} is missing {rel}, so its manifest no longer describes it"
+        if sha256(root / rel) != digest:
+            return False, f"{root}/{rel} does not match the digest its manifest records"
     # T180: a manifest describes *the whole directory*. A foreign file inside it would be deleted along with
     # the candidate, so it must refuse rather than be silently destroyed.
-    listed = set(files) | {MANIFEST}
-    present = set(shipped_files(root)) | ({MANIFEST} if (root / MANIFEST).is_file() else set())
+    listed = set(files)
+    present = set(all_files(root))
     extra = sorted(present - listed)
     if extra:
         return False, (f"{root} contains files its manifest does not list ({', '.join(extra[:3])}), so it is "
@@ -301,7 +322,7 @@ def build(out: Path, source: Path = SOURCE, allow_temp: bool = False) -> int:
     #    half-written candidate where the operator expects a good one.
     out.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=out.name + ".staging-", dir=str(out.parent)))
-    retired_path_holder = None
+    retired = staging.parent / (staging.name + ".retired")
     try:
         staged = staging / "payload"
         shutil.copytree(source, staged, ignore=shutil.ignore_patterns(".*"))
@@ -320,26 +341,36 @@ def build(out: Path, source: Path = SOURCE, allow_temp: bool = False) -> int:
         if verify(staged, check_parse=True, source=source) != 0:
             print(f"FAIL staged candidate did not verify; {out} left untouched")
             return 1
-        # T180: the retired copy is parked *beside* the staging directory, not inside it. The `finally`
-        # removes only staging, so a failed rename can no longer take the previous candidate with it -- and if
-        # the swap fails, the original is put back.
-        retired = out.parent / (staging.name + ".retired") if replaced else None
-        retired_path_holder = retired
+        # T180/T181: the retired copy is parked beside the staging directory (never inside it) and is only
+        # removed once the new candidate is in place *and* verified. A failed swap puts it back; if even that
+        # fails, it is left exactly where it is so the operator still has the bytes.
         if replaced:
-            out.rename(retired)
+            _rename(out, retired)
         try:
-            staged.rename(out)
-        except OSError:
-            if retired is not None and retired.exists() and not out.exists():
-                retired.rename(out)
-                print(f"restored {out} after a failed swap")
-            raise
-        print(f"built {out} ({len(files)} files, stamp {manifest['stamp']})")
+            _rename(staged, out)
+        except OSError as exc:
+            restored = False
+            if retired.exists():
+                try:
+                    _rename(retired, out)
+                    restored = True
+                except OSError as restore_exc:
+                    print(f"FAIL swap failed ({exc}) and the restore failed ({restore_exc})")
+                    print(f"  the previous candidate is intact at {retired}")
+                    return 1
+            print(f"FAIL swap failed ({exc}); previous candidate "
+                  + ("restored" if restored else "was not present"))
+            return 1
     finally:
         shutil.rmtree(staging, ignore_errors=True)
-        if retired_path_holder and retired_path_holder.exists():
-            shutil.rmtree(retired_path_holder, ignore_errors=True)
-    return verify(out, check_parse=True, source=source)
+    print(f"built {out} ({len(files)} files, stamp {manifest['stamp']})")
+    code = verify(out, check_parse=True, source=source)
+    # Only a landed, verified candidate earns the right to delete the recovery copy.
+    if code == 0 and retired.exists():
+        shutil.rmtree(retired, ignore_errors=True)
+    elif code != 0:
+        print(f"FAIL the candidate did not verify; the previous copy is kept at {retired}")
+    return code
 
 
 def verify(root: Path, check_parse: bool = False, source: Path = SOURCE) -> int:
