@@ -96,10 +96,54 @@ export function createChromeAutoSend(chromeApi, deps) {
       deliveryMode: deliveryMode === 'background' ? 'background' : 'foreground',
     });
     if (!reply || reply.ok !== true || !reply.result) {
-      return { status: 'unconfirmed',
+      const refusal = { status: 'unconfirmed',
         reason: 'content_refused:' + (reply && reply.error ? reply.error : 'no_reply') };
+      // T174: the refusal is an outcome too, and it is the one the operator can never see otherwise.
+      void noteDelivery(refusal, candidate, deliveryMode);
+      return refusal;
     }
+    // T174: this is the one place in the trusted worker that holds the adapter's own return value, so
+    // it is where a delivery outcome becomes visible. Recording is best-effort by construction: the
+    // write result is captured first, the diagnostics happen afterwards, and any failure here is
+    // swallowed so the notice path and the host ACK cannot be affected by a diagnostic problem.
+    void noteDelivery(reply.result, candidate, deliveryMode);
     return reply.result;
+  }
+
+  // Loaded lazily and tolerated when absent: the e2e harness copies this module into a temp directory,
+  // and a hard import of a sibling it does not know about would break the send path over a diagnostic.
+  // In the shipped extension the sibling is there, so this resolves.
+  let diagnosticStore = null;
+  async function loadDiagnosticStore() {
+    if (diagnosticStore === null) {
+      try {
+        diagnosticStore = await import('./diagnostic_store.js');
+      } catch (err) {
+        diagnosticStore = false;
+      }
+    }
+    return diagnosticStore || null;
+  }
+
+  /** Store the outcome for the popup. Never throws, never changes what was returned to the caller. */
+  async function noteDelivery(result, candidate, deliveryMode) {
+    try {
+      const store = await loadDiagnosticStore();
+      if (!store || typeof store.recordDelivery !== 'function') return;
+      const observation = {};
+      await store.recordDelivery(chromeApi.storage.local, {
+        result,
+        request: {
+          runId: candidate && candidate.runId ? candidate.runId : null,
+          status: candidate && candidate.status ? candidate.status : null,
+          deliveryMode: deliveryMode === 'background' ? 'background' : 'foreground',
+        },
+        observation,
+      });
+    } catch (err) {
+      // A diagnostic that cannot be written must cost nothing else. Deliberately silent here: the
+      // popup already shows `no_diagnostic_recorded` when there is nothing to read.
+    }
   }
 
   const controller = createAutoSendController({
