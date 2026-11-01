@@ -44,7 +44,10 @@ class QueueTest(unittest.TestCase):
         self.assertEqual(len(terminal_source.load_state(self.dir)['pendingIds']), 1)
 
     def test_a_candidate_that_cannot_name_itself_is_reported_not_invented(self):
-        report = notice_queue.enqueue(self.dir, [candidate(sessionId=None), candidate(runId=None)],
+        # A runId alone *is* enough identity (the scanner keys on it), so the drops here need a candidate
+        # with neither a runId nor a (session, turn) pair to fall back on.
+        report = notice_queue.enqueue(self.dir, [candidate(runId=None, sessionId=None, turn=None),
+                                                candidate(runId=None, turn=None)],
                                       now=1000)
         self.assertEqual(report['added'], [])
         self.assertIn('session_missing', report['drops'])

@@ -52,23 +52,30 @@ def save(state_dir, doc):
 
 
 def queue_key(candidate):
-    """One ending, one key -- the same shape the extension uses (T167 `terminalEventId`).
+    """The key the scanner itself uses, so one event cannot occupy two rows.
 
-    Built from identifiers only. A candidate that cannot name its session, its task and its turn has no
-    key, and is reported as a drop rather than queued under a made-up one.
+    T169 correction: `terminal_source.candidates_from` already writes `pendingIds` (line 651) using the
+    candidate's own `runId`, and `running_report` persists it (lines 808-817). Inventing a composite key
+    here would therefore queue every event twice -- once under the scanner's id, once under mine -- which
+    is the duplicate delivery this module exists to prevent. So the key *is* the scanner's id, and a
+    native turn without one gets the id the scanner would have synthesised
+    (`terminal_source.native_run_id`).
     """
     if not isinstance(candidate, dict):
         return None, 'candidate_not_a_dict'
-    source = candidate.get('origin') or candidate.get('source') or 'unknown'
+    run_id = candidate.get('runId') or candidate.get('run_id')
+    if isinstance(run_id, str) and run_id:
+        return run_id, None
     session = candidate.get('sessionId') or candidate.get('session_id')
-    task = candidate.get('runId') or candidate.get('run_id') or candidate.get('taskId')
+    turn = candidate.get('turn')
     if not session:
         return None, 'session_missing'
-    if not task:
+    if turn is None or turn == '':
         return None, 'task_missing'
-    turn = candidate.get('turn')
-    kind = candidate.get('status') or candidate.get('kind') or 'completed'
-    return '%s:%s:%s:%s:%s' % (source, session, task, '-' if turn is None else turn, kind), None
+    try:
+        return terminal_source.native_run_id(session, turn), None
+    except Exception:
+        return None, 'task_missing'
 
 
 def enqueue(state_dir, candidates, now=None):
@@ -118,9 +125,16 @@ def mark(state_dir, key, state, reason=None, now=None):
     if state == 'acked':
         raise QueueError('acked is produced by terminal_source.acknowledge, not by mark()')
     doc = load(state_dir)
-    entry = (doc.get('noticeStates') or {}).get(key)
+    states = doc.setdefault('noticeStates', {})
+    entry = states.get(key)
     if not isinstance(entry, dict):
-        raise QueueError('%s is not queued' % key)
+        # T169: the scanner queues ids by writing `pendingIds` itself, so a real queued notice can exist
+        # with no state entry yet. Treat that as `queued` instead of refusing a notice that is in fact
+        # pending -- refusing here would hide exactly the work this module is meant to show.
+        if key not in (doc.get('pendingIds') or []):
+            raise QueueError('%s is not queued' % key)
+        entry = {'state': 'queued', 'attempts': 0, 'lastReason': None}
+        states[key] = entry
     if entry.get('state') in NO_RETRY_STATES:
         raise QueueError('%s is %s: retrying could duplicate the notice'
                          % (key, entry['state']))
