@@ -2393,6 +2393,15 @@ async function readCanaryReadiness(now = Date.now(), options = {}) {
     // permission either.
     unknownBy: codes(unsure),
     items,
+    // T171: the same function already counts waiting notices for its own deferral report; the popup
+    // needs that number next to the blocked layers, because "blocked" with an empty queue and "blocked"
+    // with three finished tasks behind it are different situations for the operator. Reporting only --
+    // nothing here sends, retries or clears anything.
+    queue: {
+      waiting: deferredCount,
+      waitingKnown: true,
+      uncertainStates: ['written_not_clicked', 'clicked_unknown'],
+    },
     // This diagnostic observes *readiness*, never delivery. Nothing here can
     // prove a page write happened, so it must never be read as "canary passed".
     realWriteConfirmed: false,

@@ -1435,6 +1435,14 @@ if (chainEls.run) {
       if (ready && ready.ok && ready.result) {
         const blocked = ready.result.blockedBy || [];
         const unsure = ready.result.unknownBy || [];
+        // T171: one extra line, same panel, no new interaction. `waiting` is only trusted when the
+        // worker says it is known, so a missing count renders as unknown instead of a comforting 0.
+        if (typeof window.readinessQueueLine === 'function') {
+          const q = ready.result.queue;
+          const waiting = q && q.waitingKnown === true && Number.isSafeInteger(q.waiting)
+            ? q.waiting : null;
+          chainEls.detail.textContent += '\n' + window.readinessQueueLine(ready.result, waiting);
+        }
         // `unknown` gets its own marker and its own line: it is neither a pass nor
         // a proven blocker, and rendering it as either one would be a lie.
         const mark = (item) => (item.state === 'ok' ? '  ok  '
