@@ -93,6 +93,10 @@ const NEVER_WRITTEN_REASONS = [
   // T051: an open dialog over the composer. Nothing was typed, so this belongs to
   // the "page is exactly as it was found" class and not to the attempt class.
   'modal_open',
+  // T166: returned by the pre-write preflight and by the background visibility precondition, and
+  // missing from this list -- so the two most common "the page would not let us send" refusals
+  // classified as unknown. Both happen strictly before the composer is written.
+  'send_button_unavailable', 'target_background_unobservable',
 ];
 const WRITTEN_NOT_CLICKED_REASONS = [
   'insert_mismatch', 'insert_lost_before_click',
