@@ -1429,6 +1429,15 @@ if (chainEls.run) {
     }
     renderChainVerdict(reply.result);
     renderChainDetail(reply.result);
+    // T173: the last delivery outcome, as the worker stored it -- or an explicit "nothing recorded".
+    try {
+      const diag = await ask({ type: 't166-diagnostic' });
+      if (diag && diag.ok && diag.result && typeof window.diagnosticLines === 'function') {
+        chainEls.detail.textContent += '\n' + window.diagnosticLines(diag.result).join('\n');
+      }
+    } catch (err) {
+      chainEls.detail.textContent += '\nlast notice: diagnostic unreadable (' + (err && err.message) + ')';
+    }
     // Added to the same panel: one extra line, no new button, no new interaction.
     try {
       const ready = await ask({ type: 't069-canary-readiness' });

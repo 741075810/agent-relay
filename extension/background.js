@@ -16,6 +16,7 @@
 // "instant" would be false.
 
 import { NativeClient } from './lib/native_client.js';
+import { readLatest as readLatestDiagnostic, recordDelivery } from './lib/diagnostic_store.js';
 import { QueueDelivery } from './lib/queue_delivery.js';
 import {
   classifyTab,
@@ -797,6 +798,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: false, error: 'extension_popup_required' });
         } else {
           sendResponse({ ok: true, result: await readCanaryReadiness() });
+        }
+      } else if (msg && msg.type === 't166-diagnostic') {
+        // Popup-only, like every other read-only panel: this names the last delivery outcome.
+        if (sender.id !== chrome.runtime.id ||
+            sender.url !== chrome.runtime.getURL('popup.html') || sender.tab) {
+          sendResponse({ ok: false, error: 'extension_popup_required' });
+        } else {
+          sendResponse({ ok: true, result: await readLatestDiagnostic(chrome.storage.local) });
+        }
+      } else if (msg && msg.type === 't173-record-delivery') {
+        // The runtime entry for the store: a send path holding a `deliverInto`-shaped result posts it
+        // here and nothing else. Content scripts are refused -- the outcome names page facts.
+        if (sender.id !== chrome.runtime.id || sender.tab) {
+          sendResponse({ ok: false, error: 'extension_worker_required' });
+        } else {
+          sendResponse({ ok: true, result: await recordDelivery(chrome.storage.local, msg.input || {}) });
         }
       } else if (msg && msg.type === 't074-chain-evidence') {
         // Same boundary again: this reports where a specific completion got to,
