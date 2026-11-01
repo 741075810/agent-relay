@@ -77,24 +77,37 @@ export function createChromeAutoSend(chromeApi, deps) {
   }
 
   async function write(candidate, binding, deliveryMode) {
-    const reply = await chromeApi.tabs.sendMessage(binding.tabId, {
-      type: 't058-write-notice', runId: candidate.runId, status: candidate.status,
-      // The gate already compared the probe with the binding, but the page can
-      // still navigate during the round trip to the content script. Handing the
-      // expected id down lets the adapter refuse *before* typing, instead of
-      // discovering the mismatch in the evidence afterwards -- by then the notice
-      // is already in whatever conversation the tab moved to.
-      expectedConversationId: binding.conversationId,
-      // T052: the same argument, for the document instead of the route. A
-      // same-URL reload keeps the conversation id but replaces the document, and
-      // the content script that answers this message may be the new one. Without
-      // this field the page layer has nothing to compare and a reload in this
-      // window gets the notice.
-      expectedDocumentInstanceId: binding.documentInstanceId,
-      // T048: which grant authorised this write. The content script re-checks the
-      // mode against the live page instead of assuming the worker got it right.
-      deliveryMode: deliveryMode === 'background' ? 'background' : 'foreground',
-    });
+    // T175: `tabs.sendMessage` rejects when the receiving end is gone -- tab closed, message port closed,
+    // extension reloaded mid-flight. Before this catch such a rejection left `write()` and was converted to
+    // `adapter_error:` by the controller's own catch, so the single most common real failure was the one
+    // outcome no diagnostic ever saw. The shape built here is the controller's own
+    // (`autosend_controller.js`: `status: 'unconfirmed'`, `reason: 'adapter_error:' + message`), so
+    // settle / ambiguous / single-shot semantics do not move, and no second message is ever sent.
+    let reply;
+    try {
+      reply = await chromeApi.tabs.sendMessage(binding.tabId, {
+        type: 't058-write-notice', runId: candidate.runId, status: candidate.status,
+        // The gate already compared the probe with the binding, but the page can still navigate during
+        // the round trip to the content script. Handing the expected id down lets the adapter refuse
+        // *before* typing, instead of discovering the mismatch in the evidence afterwards -- by then the
+        // notice is already in whatever conversation the tab moved to.
+        expectedConversationId: binding.conversationId,
+        // T052: the same argument, for the document instead of the route. A same-URL reload keeps the
+        // conversation id but replaces the document, and the content script that answers this message may
+        // be the new one. Without this field the page layer has nothing to compare.
+        expectedDocumentInstanceId: binding.documentInstanceId,
+        // T048: which grant authorised this write. The content script re-checks the mode against the live
+        // page instead of assuming the worker got it right.
+        deliveryMode: deliveryMode === 'background' ? 'background' : 'foreground',
+      });
+    } catch (err) {
+      const outcome = { status: 'unconfirmed',
+        reason: 'adapter_error:' + String(err && err.message ? err.message : err) };
+      // Diagnostics receive the normalised code only: Chrome's text can carry a tab id or an extension
+      // URL, and neither belongs in a stored record.
+      void noteDelivery({ status: 'unconfirmed', reason: 'adapter_error' }, candidate, deliveryMode);
+      return outcome;
+    }
     if (!reply || reply.ok !== true || !reply.result) {
       const refusal = { status: 'unconfirmed',
         reason: 'content_refused:' + (reply && reply.error ? reply.error : 'no_reply') };
@@ -102,17 +115,17 @@ export function createChromeAutoSend(chromeApi, deps) {
       void noteDelivery(refusal, candidate, deliveryMode);
       return refusal;
     }
-    // T174: this is the one place in the trusted worker that holds the adapter's own return value, so
-    // it is where a delivery outcome becomes visible. Recording is best-effort by construction: the
-    // write result is captured first, the diagnostics happen afterwards, and any failure here is
-    // swallowed so the notice path and the host ACK cannot be affected by a diagnostic problem.
+    // T174: this is the one place in the trusted worker that holds the adapter's own return value, so it
+    // is where a delivery outcome becomes visible. Recording is best-effort and unawaited by construction:
+    // the write result is captured first and any diagnostics failure is swallowed, so the notice path and
+    // the host ACK cannot be affected by a diagnostic problem.
     void noteDelivery(reply.result, candidate, deliveryMode);
     return reply.result;
   }
 
-  // Loaded lazily and tolerated when absent: the e2e harness copies this module into a temp directory,
-  // and a hard import of a sibling it does not know about would break the send path over a diagnostic.
-  // In the shipped extension the sibling is there, so this resolves.
+  // Loaded lazily and tolerated when absent: the e2e harness copies this module into a temp directory, and
+  // a hard import of a sibling it does not know about would break the send path over a diagnostic. In the
+  // shipped extension the sibling is there, so this resolves.
   let diagnosticStore = null;
   async function loadDiagnosticStore() {
     if (diagnosticStore === null) {
@@ -130,7 +143,6 @@ export function createChromeAutoSend(chromeApi, deps) {
     try {
       const store = await loadDiagnosticStore();
       if (!store || typeof store.recordDelivery !== 'function') return;
-      const observation = {};
       await store.recordDelivery(chromeApi.storage.local, {
         result,
         request: {
@@ -138,11 +150,11 @@ export function createChromeAutoSend(chromeApi, deps) {
           status: candidate && candidate.status ? candidate.status : null,
           deliveryMode: deliveryMode === 'background' ? 'background' : 'foreground',
         },
-        observation,
+        observation: {},
       });
     } catch (err) {
-      // A diagnostic that cannot be written must cost nothing else. Deliberately silent here: the
-      // popup already shows `no_diagnostic_recorded` when there is nothing to read.
+      // A diagnostic that cannot be written must cost nothing else. Deliberately silent: the popup
+      // already shows `no_diagnostic_recorded` when there is nothing to read.
     }
   }
 

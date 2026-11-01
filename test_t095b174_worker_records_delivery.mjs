@@ -145,3 +145,46 @@ test('T174: a diagnostics failure cannot break the send result or the response s
   assert.equal(out.status, 'unconfirmed');
   assert.equal(out.reason, 'send_button_not_ready');
 });
+
+test('T175: a rejected tabs.sendMessage is recorded as adapter_error, once, and shape-identical', async () => {
+  const env = fakeChrome(() => Promise.reject(new Error('Receiving end does not exist.')));
+  const controller = WIRE.createChromeAutoSend(env.chrome, {
+    probeSpecificTab: async () => ({ ok: true }),
+    getBindingState: async () => ({ tabId: 7, conversationId: CONV, documentInstanceId: 'doc-1' }),
+    now: () => 1000,
+  });
+  const out = await controller.write({ runId: 'run-5', status: 'completed' },
+    { tabId: 7, conversationId: CONV, documentInstanceId: 'doc-1' }, 'foreground');
+  // Exactly the shape the controller's own catch produced before this fix.
+  assert.deepEqual(out, { status: 'unconfirmed',
+    reason: 'adapter_error:Receiving end does not exist.' });
+  assert.equal(env.sent.length, 1, 'the rejection must not cause a second message');
+  await new Promise((r) => setTimeout(r, 10));
+  const record = env.data.lastDeliveryDiagnostic;
+  assert.ok(record, 'the rejection must leave a record behind');
+  assert.equal(record.fields.reason, 'adapter_error', 'normalised code, not the raw Chrome text');
+  assert.equal(record.fields.status, 'unconfirmed');
+  assert.equal(record.delivered, false, 'a rejection is never delivery');
+  const serialised = JSON.stringify(record);
+  assert.equal(serialised.includes('Receiving end'), false,
+    'the raw Chrome message may carry a tab id or an extension URL');
+  assert.equal(serialised.includes(NOTICE), false);
+});
+
+test('T175: tab closed and message port closed normalise the same way', async () => {
+  for (const message of ['Could not establish connection. Receiving end does not exist.',
+    'The message port closed before a response was received.']) {
+    const env = fakeChrome(() => Promise.reject(new Error(message)));
+    const controller = WIRE.createChromeAutoSend(env.chrome, {
+      probeSpecificTab: async () => ({ ok: true }),
+      getBindingState: async () => ({ tabId: 7, conversationId: CONV, documentInstanceId: 'doc-1' }),
+      now: () => 1000,
+    });
+    const out = await controller.write({ runId: 'run-6', status: 'completed' },
+      { tabId: 7, conversationId: CONV, documentInstanceId: 'doc-1' }, 'foreground');
+    assert.equal(out.reason, 'adapter_error:' + message);
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(env.data.lastDeliveryDiagnostic.fields.reason, 'adapter_error', message);
+    assert.equal(env.sent.length, 1);
+  }
+});
