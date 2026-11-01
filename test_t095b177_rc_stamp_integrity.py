@@ -25,6 +25,12 @@ def run(*args):
     return subprocess.run([sys.executable, "-B", *map(str, args)], capture_output=True, text=True)
 
 
+def run_build(*args):
+    """Builds the real tree into a temp directory on purpose, so the opt-in is explicit."""
+    return subprocess.run([sys.executable, "-B", str(BUILD), "--allow-temp-out", *map(str, args)],
+                          capture_output=True, text=True)
+
+
 def copy_source(tmp: Path) -> Path:
     copy = tmp / "src"
     shutil.copytree(SOURCE, copy, ignore=shutil.ignore_patterns(".*"))
@@ -57,7 +63,7 @@ class ReleaseCandidateStampIntegrity(unittest.TestCase):
             src = copy_source(Path(tmp))
             set_literal(src, "T112-00000000")
             out = Path(tmp) / "rc"
-            built = run(BUILD, "--out", out, "--source", src)
+            built = run_build("--out", out, "--source", src)
             self.assertEqual(built.returncode, 1, built.stdout)
             self.assertIn("stale stamp", built.stdout)
             self.assertIn("T112-00000000", built.stdout)
@@ -69,10 +75,10 @@ class ReleaseCandidateStampIntegrity(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             src = copy_source(Path(tmp))
             out = Path(tmp) / "rc"
-            self.assertEqual(run(BUILD, "--out", out, "--source", src).returncode, 0)
+            self.assertEqual(run_build("--out", out, "--source", src).returncode, 0)
             (src / "popup.js").write_text(
                 (src / "popup.js").read_text(encoding="utf-8") + "\n// drift\n", encoding="utf-8")
-            checked = run(BUILD, "--verify", out, "--source", src)
+            checked = run_build("--verify", out, "--source", src)
             self.assertEqual(checked.returncode, 1)
             self.assertIn("differs from src/", checked.stdout)
 
@@ -80,9 +86,9 @@ class ReleaseCandidateStampIntegrity(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             src = copy_source(Path(tmp))
             out = Path(tmp) / "rc"
-            self.assertEqual(run(BUILD, "--out", out, "--source", src).returncode, 0)
+            self.assertEqual(run_build("--out", out, "--source", src).returncode, 0)
             set_literal(out, "T112-deadbeef")
-            checked = run(BUILD, "--verify", out, "--source", src)
+            checked = run_build("--verify", out, "--source", src)
             self.assertEqual(checked.returncode, 1)
             self.assertRegex(checked.stdout, r"(changed: lib/build_stamp\.js|declares T112-deadbeef)")
 
@@ -90,24 +96,24 @@ class ReleaseCandidateStampIntegrity(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             src = copy_source(Path(tmp))
             out = Path(tmp) / "rc"
-            built = run(BUILD, "--out", out, "--source", src)
+            built = run_build("--out", out, "--source", src)
             self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
             manifest = json.loads((out / "RC_MANIFEST.json").read_text(encoding="utf-8"))
             tree = run(STAMP, "--check", "--root", src).stdout
             digest = re.search(r"tree\s+([0-9a-f]{8})", tree).group(1)
             self.assertEqual(manifest["stamp"], "T112-" + digest,
                              "the manifest must carry the checker's digest, not a first line of output")
-            checked = run(BUILD, "--verify", out, "--source", src, "--check-parse")
+            checked = run_build("--verify", out, "--source", src, "--check-parse")
             self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
 
     def test_the_repository_tree_still_builds_and_verifies(self):
         """The shipped tree is the real case: build a candidate beside it and check it."""
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "rc"
-            built = run(BUILD, "--out", out)
+            built = run_build("--out", out)
             self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
             self.assertIn("stamp T112-", built.stdout)
-            checked = run(BUILD, "--verify", out, "--check-parse")
+            checked = run_build("--verify", out, "--check-parse")
             self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
             self.assertEqual((SOURCE / "manifest.json").read_bytes(),
                              (out / "manifest.json").read_bytes())

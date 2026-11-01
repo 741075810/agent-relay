@@ -16,8 +16,9 @@ TOOL = ROOT / "tools" / "build_extension_rc.py"
 
 
 def run(*args):
-    return subprocess.run([sys.executable, "-B", str(TOOL), *map(str, args)],
-                          capture_output=True, text=True)
+    # Explicit opt-in: this suite builds the real tree into a temp directory.
+    return subprocess.run([sys.executable, "-B", str(TOOL), "--allow-temp-out",
+                           *map(str, args)], capture_output=True, text=True)
 
 
 class ReleaseCandidateBuild(unittest.TestCase):

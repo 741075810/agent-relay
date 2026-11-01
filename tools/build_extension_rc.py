@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import sys
 from pathlib import Path
 
@@ -188,33 +189,135 @@ def parse_problems(root: Path) -> list[str]:
     return problems
 
 
-def build(out: Path, source: Path = SOURCE) -> int:
-    if out.exists():
-        shutil.rmtree(out)
-    # The source must be fresh *before* it is copied: a stale source produces a stale candidate, and the
-    # candidate is what an operator would load.
-    source_info, problems = stamp_probe(source, "source")
+def _fold(path: Path) -> str:
+    """Case-folded, symlink-resolved key. Windows is case-insensitive, and a junction can hide the target."""
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path.absolute()
+    return os.path.normcase(str(resolved))
+
+
+def _is_within(child: Path, parent: Path) -> bool:
+    child_key, parent_key = _fold(child), _fold(parent)
+    return child_key == parent_key or child_key.startswith(parent_key + os.sep)
+
+
+def guard_out(out: Path, source: Path = SOURCE, allow_temp: bool = False) -> list[str]:
+    """Every reason to refuse to touch `out`, checked before any delete or write.
+
+    T178: `build()` used to call `shutil.rmtree(out)` as its first statement, so a bad `--out` could delete
+    the source tree, the repository root or anything else the operator named. Deletion is now gated on the
+    path being a place this tool is allowed to write, and never on the source or one of its ancestors.
+    """
+    problems: list[str] = []
+    out_key, source_key, root_key = _fold(out), _fold(source), _fold(ROOT)
+    dist_root = ROOT / "dist"
+
+    if out_key == source_key:
+        problems.append(f"refusing --out {out}: it is the source tree")
+    elif _is_within(source, out):
+        problems.append(f"refusing --out {out}: it contains the source tree")
+    elif _is_within(out, source):
+        problems.append(f"refusing --out {out}: it is inside the source tree")
+    if out_key == root_key:
+        problems.append(f"refusing --out {out}: it is the repository root")
+    elif _is_within(ROOT, out) and out_key != root_key:
+        problems.append(f"refusing --out {out}: it contains the repository")
+    # Default is the controlled dist/ area. A drill that ships a *temporary* source (the test harness) may
+    # also write under the system temp directory -- but never when the real extension tree is the source,
+    # which is the only case an operator runs by hand.
+    in_dist = _is_within(out, dist_root) and out_key != _fold(dist_root)
+    drill_out = allow_temp and _is_within(out, Path(tempfile.gettempdir()))
+    if not (in_dist or drill_out):
+        problems.append(f"refusing --out {out}: candidates may only be created under {dist_root}" +
+                        ("" if drill_out else " (or, for a --source outside the repo, under the temp dir)"))
+    # A path that exists and is not a directory cannot be an RC either.
+    if out.exists() and not out.is_dir():
+        problems.append(f"refusing --out {out}: it exists and is not a directory")
+    return problems
+
+
+def candidate_identity(root: Path) -> tuple[bool, str]:
+    """Is this directory a candidate of ours, judged by its own manifest? Says why not when it is not."""
+    manifest_path = root / MANIFEST
+    if not manifest_path.is_file():
+        return False, f"{root} has no {MANIFEST}, so it is not a candidate this tool created"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        return False, f"{root}/{MANIFEST} does not parse: {exc}"
+    if manifest.get("kind") != "extension-release-candidate":
+        return False, f"{root}/{MANIFEST} is not an extension-release-candidate"
+    files = manifest.get("files")
+    if not isinstance(files, dict) or not files:
+        return False, f"{root}/{MANIFEST} lists no files"
+    for rel in files:
+        if not (root / rel).is_file():
+            return False, f"{root} is missing {rel}, so its manifest no longer describes it"
+    return True, ""
+
+
+def build(out: Path, source: Path = SOURCE, allow_temp: bool = False) -> int:
+    # 1) Safety, before anything is deleted or written.
+    problems = guard_out(out, source, allow_temp=allow_temp)
     if problems:
         print("FAIL refusing to build")
         for item in problems:
             print(f"  {item}")
+        return 1
+
+    # 2) Freshness of the source. A stale source must leave an existing candidate exactly as it was.
+    source_info, stamp_problems = stamp_probe(source, "source")
+    if stamp_problems:
+        print("FAIL refusing to build")
+        for item in stamp_problems:
+            print(f"  {item}")
         print(f"  (source declared {source_info['declared'] or 'unknown'}, "
               f"tree {source_info['tree'] or 'unknown'}; run python -B tools/extension_stamp.py --write)")
+        if out.exists():
+            print(f"  existing candidate {out} left untouched")
         return 1
-    shutil.copytree(source, out, ignore=shutil.ignore_patterns(".*"))
-    files = {rel: sha256(out / rel) for rel in shipped_files(out)}
-    manifest = {
-        "kind": "extension-release-candidate",
-        "source": source.name + "/",
-        # The concrete digest, taken from the checker -- never `stdout.splitlines()[0]`.
-        "stamp": "T112-" + source_info["tree"],
-        "files": files,
-        "fileCount": len(files),
-        "popupOrder": POPUP_ORDER,
-    }
-    (out / MANIFEST).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-                               encoding="utf-8", newline="\n")
-    print(f"built {out} ({len(files)} files, stamp {manifest['stamp']})")
+
+    # 3) An existing directory may only be replaced if it proves it is one of ours.
+    replaced = False
+    if out.exists():
+        ours, why = candidate_identity(out)
+        if not ours:
+            print("FAIL refusing to build")
+            print(f"  {why}; refusing to delete a directory this tool cannot account for")
+            return 1
+        replaced = True
+
+    # 4) Build and verify in a temporary sibling, then swap. A failed build therefore cannot leave a
+    #    half-written candidate where the operator expects a good one.
+    out.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=out.name + ".staging-", dir=str(out.parent)))
+    try:
+        staged = staging / "payload"
+        shutil.copytree(source, staged, ignore=shutil.ignore_patterns(".*"))
+        files = {rel: sha256(staged / rel) for rel in shipped_files(staged)}
+        manifest = {
+            "kind": "extension-release-candidate",
+            "source": source.name + "/",
+            # The concrete digest, taken from the checker -- never `stdout.splitlines()[0]`.
+            "stamp": "T112-" + source_info["tree"],
+            "files": files,
+            "fileCount": len(files),
+            "popupOrder": POPUP_ORDER,
+        }
+        (staged / MANIFEST).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                                       encoding="utf-8", newline="\n")
+        if verify(staged, check_parse=True, source=source) != 0:
+            print(f"FAIL staged candidate did not verify; {out} left untouched")
+            return 1
+        if replaced:
+            retired = staging / "retired"
+            out.rename(retired)
+        staged.rename(out)
+        print(f"built {out} ({len(files)} files, stamp {manifest['stamp']})")
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
     return verify(out, check_parse=True, source=source)
 
 
@@ -278,11 +381,13 @@ def main() -> int:
     parser.add_argument("--out", type=Path, help="candidate directory to create")
     parser.add_argument("--verify", type=Path, help="existing candidate directory to check")
     parser.add_argument("--check-parse", action="store_true", help="also run node parse checks")
+    parser.add_argument("--allow-temp-out", action="store_true",
+                        help="test harness only: permit --out under the system temp directory")
     parser.add_argument("--source", type=Path, default=SOURCE,
                         help="tree to ship (default extension/); overridable so tests never touch it")
     args = parser.parse_args()
     if args.out:
-        return build(args.out, source=args.source)
+        return build(args.out, source=args.source, allow_temp=args.allow_temp_out)
     if args.verify:
         return verify(args.verify, check_parse=args.check_parse, source=args.source)
     parser.error("one of --out or --verify is required")
