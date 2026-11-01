@@ -283,8 +283,36 @@ def candidate_identity(root: Path) -> tuple[bool, str]:
     extra = sorted(present - listed)
     if extra:
         return False, (f"{root} contains files its manifest does not list ({', '.join(extra[:3])}), so it is "
-                       "not a directory this tool may replace")
+                       "not a directory this tool may replace; delete that file yourself if it is stray, or "
+                       "build into a different --out -- this tool will not delete it for you")
     return True, ""
+
+
+def identity_fingerprint(root: Path) -> str | None:
+    """What `candidate_identity` just looked at, reduced to one value.
+
+    T183: re-checking narrows the window between validation and the retire rename; it does not close it. No
+    portable directory lock exists here (Windows has no `flock`), so the honest claim is "the swap refuses if
+    the target changed while the new candidate was being built", not "the swap is atomic".
+    """
+    ok, _why = candidate_identity(root)
+    if not ok:
+        return None
+    digest = hashlib.sha256()
+    for rel in sorted(all_files(root)):
+        path = root / rel
+        try:
+            digest.update(rel.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(bytes.fromhex(sha256(path)))
+        except OSError:
+            return None
+    manifest = root / MANIFEST
+    try:
+        digest.update(manifest.read_bytes())
+    except OSError:
+        return None
+    return digest.hexdigest()
 
 
 def build(out: Path, source: Path = SOURCE, allow_temp: bool = False) -> int:
@@ -316,6 +344,11 @@ def build(out: Path, source: Path = SOURCE, allow_temp: bool = False) -> int:
             print("FAIL refusing to build")
             print(f"  {why}; refusing to delete a directory this tool cannot account for")
             return 1
+        validated = identity_fingerprint(out)
+        if validated is None:
+            print("FAIL refusing to build")
+            print(f"  {out} could not be fingerprinted; refusing to replace a directory in that state")
+            return 1
         replaced = True
 
     # 4) Build and verify in a temporary sibling, then swap. A failed build therefore cannot leave a
@@ -345,6 +378,13 @@ def build(out: Path, source: Path = SOURCE, allow_temp: bool = False) -> int:
         # removed once the new candidate is in place *and* verified. A failed swap puts it back; if even that
         # fails, it is left exactly where it is so the operator still has the bytes.
         if replaced:
+            # T183: the target was validated before the staged copy was built and verified, which takes
+            # seconds. Re-check it now: if anything moved, refuse instead of retiring an unvalidated set.
+            if identity_fingerprint(out) != validated:
+                print("FAIL refusing to swap")
+                print(f"  {out} changed while the new candidate was being built; it was not touched")
+                print(f"  rebuild with a fresh --out, or inspect {out} and remove it yourself")
+                return 1
             _rename(out, retired)
         try:
             _rename(staged, out)
@@ -365,12 +405,34 @@ def build(out: Path, source: Path = SOURCE, allow_temp: bool = False) -> int:
         shutil.rmtree(staging, ignore_errors=True)
     print(f"built {out} ({len(files)} files, stamp {manifest['stamp']})")
     code = verify(out, check_parse=True, source=source)
-    # Only a landed, verified candidate earns the right to delete the recovery copy.
-    if code == 0 and retired.exists():
-        shutil.rmtree(retired, ignore_errors=True)
-    elif code != 0:
-        print(f"FAIL the candidate did not verify; the previous copy is kept at {retired}")
-    return code
+    if code == 0:
+        # Only a landed, verified candidate earns the right to delete the recovery copy.
+        if retired.exists():
+            shutil.rmtree(retired, ignore_errors=True)
+        return 0
+
+    # T183: the swap already happened, so the healthy copy is parked. Put it back rather than leaving an
+    # unverified directory where the operator expects a candidate: exiting non-zero while `out` is untrusted
+    # is the failure mode this replaces.
+    print("FAIL the candidate did not verify after the swap")
+    rejected = retired.parent / (retired.name + ".rejected")
+    try:
+        _rename(out, rejected)
+    except OSError as exc:
+        print(f"  the rejected candidate could not be moved aside ({exc})")
+        print(f"  the previous candidate is intact at {retired}")
+        return 1
+    if retired.exists():
+        try:
+            _rename(retired, out)
+            print(f"  the previous candidate was restored to {out}")
+            shutil.rmtree(rejected, ignore_errors=True)
+        except OSError as exc:
+            print(f"  the restore failed ({exc})")
+            print(f"  previous candidate intact at {retired}; rejected build parked at {rejected}")
+    else:
+        print(f"  no previous candidate existed; the rejected build is parked at {rejected}")
+    return 1
 
 
 def verify(root: Path, check_parse: bool = False, source: Path = SOURCE) -> int:
