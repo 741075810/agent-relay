@@ -38,6 +38,19 @@ function storageSet(storage, patch) {
   });
 }
 
+// T176: two overlapping events must not end with the older one stored. `noteDelivery` in the worker is
+// fire-and-forget, so two completions can interleave; without ordering the last write to land wins, which
+// may be the older outcome. Writes are therefore serialised through one chain and guarded by timestamp.
+// Best-effort, not a durable guarantee: a service-worker restart between read and write can still lose the
+// newest record, and nothing here survives a storage quota failure.
+let writeChain = Promise.resolve();
+
+function serialised(task) {
+  const next = writeChain.then(task, task);
+  writeChain = next.catch(() => {});
+  return next;
+}
+
 /** Store one outcome and hand back exactly what was stored. */
 export async function recordDelivery(storage, input = {}, now = Date.now()) {
   const record = buildDiagnosticRecord(input);
@@ -60,8 +73,15 @@ export async function recordDelivery(storage, input = {}, now = Date.now()) {
     unknownFields: record.unknownFields.slice(),
     fields,
   };
-  await storageSet(storage, { [LAST_DIAGNOSTIC_KEY]: stored });
-  return stored;
+  return serialised(async () => {
+    const current = (await storageGet(storage, LAST_DIAGNOSTIC_KEY))[LAST_DIAGNOSTIC_KEY];
+    // An older outcome that arrives late must not replace a newer one already on disk.
+    if (current && typeof current === 'object' && Number.isFinite(current.at) && current.at >= now) {
+      return current;
+    }
+    await storageSet(storage, { [LAST_DIAGNOSTIC_KEY]: stored });
+    return stored;
+  });
 }
 
 /** The last stored outcome, or a shape that says plainly that nothing was recorded. */

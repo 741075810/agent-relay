@@ -55,3 +55,4 @@ inbox_*
 *.log
 tmp/
 temp/
+dist/

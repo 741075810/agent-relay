@@ -66,3 +66,12 @@ observation made after the fact rather than a fact the run saw.
 
 Nothing here claims that a hidden or locked tab can be sent from. That question has no evidence in this
 repository, and the code neither asserts nor assumes it.
+
+## Persistence is best-effort (T173-T176)
+
+`lastDeliveryDiagnostic` is a convenience record, not a delivery ledger. It is written after the send
+result is captured, fire-and-forget, and serialised inside one worker instance with a timestamp guard so an
+older outcome cannot replace a newer one. It is **best-effort** and makes no reliable-persistence claim: a
+service-worker restart between read and write, a storage quota failure, or a second browser profile can
+still leave the panel showing an older record or none. Delivery itself is decided by the host ledger's
+`acked` state, never by this record.
