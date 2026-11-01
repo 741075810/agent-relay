@@ -1,3 +1,7 @@
+> **SUPERSEDED by `docs/UPGRADE_RC_T177.md`.** The stamp quoted below (`T112-218c75ca`) is stale:
+> the builder of that round printed the first line of `extension_stamp.py --check` and ignored its
+> exit code, so a stale tree could pass. Use the T177 document and its checked stamp.
+
 # Upgrading to the T176 release candidate (operator-only, reversible)
 
 This document is for one controlled manual upgrade. Nothing here is executed by any automation, and the

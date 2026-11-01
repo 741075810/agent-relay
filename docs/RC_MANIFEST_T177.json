@@ -9,7 +9,7 @@
     "lib/binding_mirror.js": "ffde96d1e6a1d11861ca7fc1ec79101b30f2a6f415ed2f0577dcf935483880d4",
     "lib/bound_dry_run.js": "02cc6bfd0c4f21f87fba03aa5e666e9a4807c0302cd1f8e138e4b66e8e83a9ea",
     "lib/bound_dry_run_controller.js": "ea02da2764a3befc6c50765d0109139086a544d63903581fbb7b57a50f6d735a",
-    "lib/build_stamp.js": "a58fe3a58c319e60153c51545f0d4246f9c50741ccd90af015bf897c15523be6",
+    "lib/build_stamp.js": "9d47912b0c6ef71442f3b890ec6b2b3432e7ad23461559b09783d9aa5ed0521c",
     "lib/chain_evidence.js": "8c231560839911650262069ed92816e0ed9a6c1e3ef399abe348d5db25c5da02",
     "lib/chain_status.js": "10d8226126f03b2bc729188b9cb48b041425519bb247ba99143f31831187f73e",
     "lib/content_reconnect.js": "87b59b4b1d798a0d641650601566384e6214fe237afef01a7eefb3e3df0ba350",
@@ -43,5 +43,5 @@
     "popup.js"
   ],
   "source": "extension/",
-  "stamp": "declared  T112-218c75ca"
+  "stamp": "T112-f6be7696"
 }
