@@ -907,7 +907,7 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
 MIRROR_SOURCE = 'native_host.terminal-mirror'
 
 
-def mirror(state_dir, root=None, bridge_db=None):
+def mirror(state_dir, root=None, bridge_db=None, origin_fixture=None):
     """T203: read-only mirror of the terminal candidates, with the status the host resolved.
 
     `sample` is the *send* path: it records `pendingIds` and is consumed by `terminal-ack`, so
@@ -939,6 +939,10 @@ def mirror(state_dir, root=None, bridge_db=None):
         # No sampler state at all is normal for a read-only observer: nothing has been offered, so nothing is acked.
         state = {'pendingIds': [], 'ackedIds': []}
     origin = run_origin.classify(state_dir, db_path=bridge_db)
+    if origin_fixture is not None:
+        # Same test seam as `terminal-list`: a suite must be able to say which runs count as channel A without
+        # pretending the real Bridge table was read. Production passes nothing here.
+        origin = run_origin.classify_fixture(origin_fixture, [run.get('requestID') for run in runs])
     facts, facts_error = run_origin.read_run_facts(bridge_db)
     acked = set(state.get('ackedIds') or [])
     pending = set(state.get('pendingIds') or [])

@@ -834,7 +834,8 @@ def handle_request(state_dir, doc, ledger_root=None, bridge_db=None,            
             # pending list, no ACK, no state write at all. An AgentRelay sidecar can therefore see
             # which runs finished and with what status without being able to consume a candidate the
             # real send path still needs, and without its own ACK ever being mistaken for delivery.
-            report = terminal_source.mirror(state_dir, ledger_root, bridge_db)
+            report = terminal_source.mirror(state_dir, ledger_root, bridge_db,
+                                            load_origin_fixture(bridge_fixture))
             return P.ok_response(ident, report)
 
         if op == 'terminal-running':

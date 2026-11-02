@@ -53,7 +53,9 @@ const HOST_RUN_STATES = Object.freeze(['pending', 'acked', 'baseline']);
 const HOST_SOURCES = Object.freeze(['native_host.terminal-source', 'native_host.terminal-origin', 'native_host.terminal-arm']);
 const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,79}$/;
 // T203: a terminal candidate must name a status the host can actually resolve, and the account it came from.
-const TERMINAL_RUN_STATES = Object.freeze(['completed', 'failed', 'interrupted']);
+// Exactly the set the host can announce: `resolve_status` maps a ledger `interrupted` to `failed`, so
+// `interrupted` is never a status this service may receive -- accepting it would invent an announcement.
+const TERMINAL_RUN_STATES = Object.freeze(['completed', 'failed', 'cancelled']);
 const TERMINAL_STATUS_SOURCES = Object.freeze(['bridge.run_facts.status', 'bridge_ledger.status']);
 
 function loadState(dir) {
@@ -382,6 +384,40 @@ export function createRelay(config) {
       return { status: 200, body: { accepted, rejected, seq: state0.seq,
         pageDelivery: 'unknown',
         note: 'host terminal candidates only: an ack is not a delivered page, and this service ran nothing' } };
+    },
+
+    // T204: the same records, rendered in the shape the extension's auto-trigger already consumes. This is a
+    // *rendering*, not a second sender: the fields are the ones `terminal-list` offers (`runId`/`status`/`startedAt`/
+    // `origin`), `requiresAck` is false because nothing here may consume the host's pending list, and `deliverable` is
+    // false because this service cannot write to a page. Whether anything is sent is decided by the extension's own
+    // arm/grant/`admit` path over there, which this process does not touch.
+    'GET /extension/terminal-candidates': () => {
+      const candidates = (state0.runs || [])
+        .filter((run) => typeof run.terminalStatus === 'string')
+        .map((run) => ({
+          runId: run.runId,
+          status: run.terminalStatus,
+          startedAt: Number.isFinite(run.startedAt) ? run.startedAt : null,
+          origin: run.origin || 'unknown',
+          postArm: null,
+          source: run.hostSource,
+          statusSource: run.statusSource,
+          hostAck: run.hostAck || 'unseen',
+          pageDelivery: 'unknown',
+        }));
+      return { status: 200, body: {
+        ok: true,
+        source: 'agentrelay.mirror',
+        readOnly: true,
+        deliverable: false,
+        requiresAck: false,
+        confirmed: false,
+        baselineEstablished: candidates.length > 0,
+        pageDelivery: 'unknown',
+        note: 'mirror of the Native Host terminal candidates: nothing here was written to a page, and a host ack '
+          + 'is not delivery',
+        candidates,
+      } };
     },
 
     'GET /runs': () => ({ status: 200, body: { runs: state0.runs, note: 'reported by the Native Host; ' +
