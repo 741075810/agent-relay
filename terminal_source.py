@@ -710,6 +710,7 @@ def acknowledge_relay(state, run_ids):
     list also stops the re-push an ACK would otherwise cause, because `sample` refuses anything already in it.
     """
     journal = list(state.get('relayAckedIds') or [])
+    offered = set(state.get('relayOfferedIds') or [])
     known = set(journal)
     # Only ids the native queue does not own. A native run acknowledged here would otherwise be journalled as if it came
     # from the relay, and the two namespaces would stop being distinguishable.
@@ -722,6 +723,11 @@ def acknowledge_relay(state, run_ids):
         if '|' in item:
             forms.append(item.split('|', 1)[0])
         if all(form in native_owned for form in forms):
+            continue
+        # Refusing what was never handed out is the whole point: journalling an unoffered id would silently cancel the
+        # notice for a run that has not finished yet.
+        if not any(relay_merge.was_offered(offered, form) for form in forms if '|' not in form) \
+                and not any(form in offered for form in forms):
             continue
         for form in forms:
             if form in known:
@@ -882,8 +888,27 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
     # already decided and written at this point, so merging here cannot move the baseline or the native pending list;
     # the relay's ACKs live in their own journal (see `relay_merge` and `acknowledge`).
     relay_candidates, relay_code = relay_merge.fetch(relay_source)
+    relay_absorbed = 0
     if relay_candidates:
-        due = relay_merge.merge(due, relay_candidates, next_state)
+        if info['baselineEstablished']:
+            # The first sample of a fresh state records history and announces nothing -- the same rule the native side
+            # follows. Without this, enabling the relay would replay every run that had already finished before anyone
+            # consented, which is the very notice the one inviolable rule forbids.
+            next_state['relayBaselineIds'] = relay_merge.absorb(relay_candidates, MAX_STATE_IDS)
+            relay_absorbed = len(next_state['relayBaselineIds'])
+            save_state(state_dir, next_state)
+        else:
+            due = relay_merge.merge(due, relay_candidates, next_state)
+            # What was actually offered is what a later ACK may name. Recording an id that was never handed out would
+            # let an ACK swallow a run nobody has seen yet, and its real completion would never be announced.
+            offered = list(next_state.get('relayOfferedIds') or [])
+            for item in due:
+                if item.get('source') == relay_merge.RELAY_SOURCE:
+                    key = item['runId'] + '|' + item['status']
+                    if key not in offered:
+                        offered.append(key)
+            next_state['relayOfferedIds'] = offered[-MAX_STATE_IDS:]
+            save_state(state_dir, next_state)
     return {
         'ok': True,
         'code': None,
@@ -893,6 +918,9 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
         'candidates': due,
         'relayCode': relay_code,
         'relayCandidates': len(relay_candidates),
+        # Counted, not listed: "the relay had history at the moment this was enabled" and "the relay had nothing" must
+        # not look the same, and the ids themselves are already in the state file.
+        'relayAbsorbed': relay_absorbed,
         'confirmed': False,
         'requiresAck': True,
         'redelivered': info['redelivered'],

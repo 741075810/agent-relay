@@ -85,13 +85,49 @@ def ack_forms(run_id, status=None):
     return forms
 
 
+def was_offered(offered, run_id, status=None):
+    """Whether this identity names something the host actually handed out.
+
+    Offers are recorded as `runId|status`; the extension acknowledges with a bare run id. Both name the same run, so
+    either spelling counts -- but only for a run that was really offered.
+    """
+    if not offered:
+        return False
+    if run_id in offered:
+        return True
+    if status is not None and run_id + '|' + status in offered:
+        return True
+    prefix = run_id + '|'
+    return any(isinstance(item, str) and item.startswith(prefix) for item in offered)
+
+
 def is_journalled(journal, run_id, status=None):
     return any(form in journal for form in ack_forms(run_id, status))
 
 
+def history(state):
+    """Every identity that must never be announced: native baseline, absorbed relay history, and what was consumed."""
+    return (set(state.get('baselineIds') or [])
+            | set(state.get('relayBaselineIds') or [])
+            | set(state.get('pendingIds') or [])
+            | set(state.get('ackedIds') or [])
+            | set(state.get('relayAckedIds') or []))
+
+
+def absorb(candidates, limit):
+    """The ids a first sample records as history instead of announcing.
+
+    Turning the relay on for the first time must not replay whatever had already finished: the native side absorbs its
+    existing terminal runs at the first sample, and this is the same rule for the second source. Newest last, bounded so
+    a long history cannot grow the state file without limit.
+    """
+    ids = [item['runId'] for item in candidates if isinstance(item.get('runId'), str)]
+    return list(dict.fromkeys(ids))[-limit:]
+
+
 def merge(due, relay_candidates, state):
     """Append the relay candidates that are new to both the native lists and the relay journal."""
-    known_native = set(state.get('pendingIds') or []) | set(state.get('ackedIds') or [])
+    known_native = history(state)
     journal = set(state.get('relayAckedIds') or [])
     merged = list(due)
     taken = {item.get('runId') for item in merged}
