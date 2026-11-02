@@ -106,9 +106,10 @@ test('T199: replaying a transition with the same eventId does not append a secon
     const taskId = await submit(service);
     const first = await service.post('/tasks/transition', { taskId, status: 'running', eventId: 'e-run' });
     assert.equal(first.body.duplicate, false);
-    // Simulate a caller that lost the response and retried.
+    // Simulate a caller that lost the response and retried. T200 made this idempotent rather than illegal.
     const again = await service.post('/tasks/transition', { taskId, status: 'running', eventId: 'e-run' });
-    assert.equal(again.status, 409, 'from running, running is not a legal move');
+    assert.equal(again.status, 200);
+    assert.equal(again.body.duplicate, true);
     const events = await service.get('/events?since=0');
     assert.equal(events.body.events.filter((e) => e.eventId === 'e-run').length, 1);
   } finally {
@@ -174,7 +175,7 @@ test('T199: a running task whose lease is still live is not recovered', async ()
   }
 });
 
-test('T199: dedupe follows the retained event log, so it cannot disagree with it', async () => {
+test('T199: dedupe outlives the retained event log (superseded by the T200 ledger)', async () => {
   const dir = tempDir();
   const service = await startService(dir);
   try {
@@ -184,6 +185,7 @@ test('T199: dedupe follows the retained event log, so it cannot disagree with it
     const storePath = path.join(dir, 'relay.json');
     const store = JSON.parse(readFileSync(storePath, 'utf8'));
     assert.equal(store.eventIds, undefined, 'the unbounded id list is gone from the format');
+    assert.ok(Array.isArray(store.seen), 'a bounded ledger replaced it');
     store.events = store.events.slice(2);
     writeFileSync(storePath, JSON.stringify(store, null, 2) + '\n', 'utf8');
     await service.stop();
@@ -191,7 +193,7 @@ test('T199: dedupe follows the retained event log, so it cannot disagree with it
     const second = await startService(dir);
     try {
       const dropped = await second.post('/events', { eventId: 'evt-0', type: 'task_completed' });
-      assert.equal(dropped.body.duplicate, false, 'an event whose body is gone may be re-appended');
+      assert.equal(dropped.body.duplicate, true, 'T200: the ledger remembers it even with the body gone');
       const kept = await second.post('/events', { eventId: 'evt-3', type: 'task_completed' });
       assert.equal(kept.body.duplicate, true, 'a retained event is still deduped');
       const read = await second.get('/events?since=0');

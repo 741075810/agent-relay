@@ -1,7 +1,0 @@
-✔ T199: a task moves queued -> running -> completed, and the moves are recorded as events (114.7511ms)
-✔ T199: illegal transitions are refused with the state they came from (87.8814ms)
-✔ T199: replaying a transition with the same eventId does not append a second event (91.0576ms)
-✖ T199: a task left running with no live lease is recovered as interrupted on restart (152.2422ms)
-✔ T199: a running task whose lease is still live is not recovered (154.8518ms)
-✔ T199: dedupe follows the retained event log, so it cannot disagree with it (159.0297ms)
-✔ T199: a transition survives a restart together with its event (158.6803ms)

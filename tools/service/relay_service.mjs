@@ -24,6 +24,10 @@ export const DSH_UNAVAILABLE = Object.freeze({
 });
 const STATE_FILE = 'relay.json';
 const MAX_EVENTS_RETAINED = 5000;
+// T200: dedupe must survive trimming the event bodies. The ledger stores id -> seq for far more events than the log
+// keeps, so a retry of an already-applied event is still refused after its body is gone. The cap is the guarantee
+// horizon and is published on /health, so nobody has to guess where it ends.
+const MAX_SEEN_RETAINED = 20000;
 
 // T199: the legal moves of a task. Anything not listed is refused, so "already finished" and "wrong order" are
 // different answers rather than one silent no-op.
@@ -38,7 +42,7 @@ const TRANSITIONS = Object.freeze({
 });
 
 function emptyState() {
-  return { version: 2, seq: 0, tasks: [], events: [], keys: [], lease: null };
+  return { version: 3, seq: 0, tasks: [], events: [], seen: [], keys: [], lease: null };
 }
 
 function loadState(dir) {
@@ -48,7 +52,13 @@ function loadState(dir) {
     if (!parsed || !Array.isArray(parsed.tasks) || !Array.isArray(parsed.events)) {
       return { state: null, problem: 'state_shape', path };
     }
-    return { state: { ...emptyState(), ...parsed }, problem: null, path };
+    const state = { ...emptyState(), ...parsed };
+    if (!Array.isArray(state.seen) || (state.seen.length === 0 && state.events.length > 0)) {
+      // Migrate a version-2 store: the retained events are the ids we can still vouch for.
+      const fromEvents = state.events.map((event) => ({ id: event.eventId, seq: event.seq }));
+      state.seen = Array.isArray(state.seen) && state.seen.length ? state.seen : fromEvents;
+    }
+    return { state, problem: null, path };
   } catch (err) {
     if (err && err.code === 'ENOENT') return { state: emptyState(), problem: null, path };
     return { state: null, problem: 'state_unreadable', path };
@@ -68,8 +78,10 @@ export function appendEvent(state, event) {
   if (!eventId) return { ok: false, code: 'event_id_required' };
   // T199: dedupe against the events we still hold. The old `eventIds` array grew for ever while the event log was
   // trimmed, so memory kept every id ever seen even though the bodies were gone -- and the two could disagree.
-  if (state.events.some((item) => item.eventId === eventId)) {
-    return { ok: true, duplicate: true, event: null, seq: state.seq };
+  const seen = Array.isArray(state.seen) ? state.seen : [];
+  const known = seen.find((item) => item && item.id === eventId);
+  if (known) {
+    return { ok: true, duplicate: true, event: null, seq: known.seq, appliedSeq: known.seq };
   }
   state.seq += 1;
   const stored = {
@@ -81,6 +93,9 @@ export function appendEvent(state, event) {
     simulated: true,
   };
   state.events.push(stored);
+  seen.push({ id: eventId, seq: stored.seq });
+  if (seen.length > MAX_SEEN_RETAINED) seen.splice(0, seen.length - MAX_SEEN_RETAINED);
+  state.seen = seen;
   if (state.events.length > MAX_EVENTS_RETAINED) {
     const drop = state.events.length - MAX_EVENTS_RETAINED;
     state.events = state.events.slice(drop);
@@ -127,9 +142,11 @@ export function createRelay(config) {
     for (const task of state.tasks) {
       if (task.status !== 'running') continue;
       if (leaseAlive) continue;
+      const applied = appendEvent(state,
+        { eventId: 'recovered:' + task.taskId, type: 'task_interrupted', taskId: task.taskId });
+      if (!applied.ok) continue;
       task.status = 'interrupted';
       task.updatedAt = now();
-      appendEvent(state, { eventId: 'recovered:' + task.taskId, type: 'task_interrupted', taskId: task.taskId });
       recovered += 1;
     }
     if (recovered) saveState(dir, state);
@@ -165,6 +182,9 @@ export function createRelay(config) {
       ok: Boolean(state), version: SERVICE_VERSION, simulated: true, ...DSH_UNAVAILABLE,
       tasks: state ? state.tasks.length : null, events: state ? state.events.length : null,
       seq: state ? state.seq : null, lease: state ? leaseView(state.lease, now()) : null,
+      dedupeWindow: state && state.seen && state.seen.length
+        ? { fromSeq: state.seen[0].seq, toSeq: state.seen[state.seen.length - 1].seq, ids: state.seen.length }
+        : { fromSeq: null, toSeq: null, ids: 0 },
     } }),
 
     'GET /tasks': () => ({ status: 200, body: { tasks: state ? state.tasks : [], ...DSH_UNAVAILABLE } }),
@@ -197,13 +217,24 @@ export function createRelay(config) {
       if (!taskId || !to) return { status: 400, body: { error: 'taskId_and_status_required' } };
       const task = state.tasks.find((item) => item.taskId === taskId);
       if (!task) return { status: 404, body: { error: 'no_such_task', taskId } };
+      const eventIdRequested = typeof body.eventId === 'string' && body.eventId.trim()
+        ? body.eventId.trim() : '';
+      const known = (state.seen || []).find((item) => item && item.id === eventIdRequested);
+      if (known && task.status === to) {
+        // The same request arriving twice answers the same way; it is not a second move.
+        return { status: 200, body: { task, duplicate: true, alreadyAt: to, seq: known.seq,
+          ...DSH_UNAVAILABLE } };
+      }
+      if (task.status === to) {
+        return { status: 200, body: { task, duplicate: true, alreadyAt: to, seq: state.seq,
+          ...DSH_UNAVAILABLE } };
+      }
       const allowed = TRANSITIONS[task.status] || [];
       if (!allowed.includes(to)) {
         return { status: 409, body: { error: 'illegal_transition', from: task.status, to,
           allowed } };
       }
-      const eventId = typeof body.eventId === 'string' && body.eventId.trim()
-        ? body.eventId.trim() : 'status:' + taskId + ':' + to + ':' + state.seq;
+      const eventId = eventIdRequested || 'status:' + taskId + ':' + to + ':' + state.seq;
       const appended = appendEvent(state, { eventId, type: 'task_' + to, taskId });
       if (!appended.ok) return { status: 400, body: { error: appended.code } };
       if (appended.duplicate) {
