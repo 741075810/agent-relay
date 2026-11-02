@@ -32,11 +32,11 @@ node tools/continuation/bridge_loop_acceptance.mjs record.json --json   # 机器
 
 ```json
 {
-  "providerSessionId": "session-644cd4ce-7fe7-432e-b48e-33eef537214b",
+  "providerSessionId": "session-<本轮派单时的真实 id，不写入仓库>",
   "rounds": [
     {
       "round": 190,
-      "providerSessionId": "session-644cd4ce-7fe7-432e-b48e-33eef537214b",
+      "providerSessionId": "session-<本轮派单时的真实 id，不写入仓库>",
       "taskId": "tsk-<bridge task id>",
       "runId": "<run uuid>",
       "startedAt": "2026-11-02T10:00:00Z",
@@ -75,8 +75,7 @@ node tools/continuation/bridge_loop_acceptance.mjs record.json --json   # 机器
 T190、T191、T192 每轮各产出一条上面的记录（一条即可，不要合并成"三轮看起来都对"）。T190→T191→T192
 要判 PASS，需要同时满足：
 
-1. 三条记录的 `providerSessionId` 都等于
-   `session-644cd4ce-7fe7-432e-b48e-33eef537214b`；
+1. 三条记录的 `providerSessionId` 都等于本轮派单时记录的那个 id（**不写入本仓库**，由派单方持有）；
 2. 每轮的 `noticeVisible` 都有**人**确认读过，且时间上晚于 `extensionSubmitted`；
 3. 每轮的 `reviewed` 都是一次独立复核（不是"任务 completed 顺带说明")；
 4. 每轮 `redispatched.taskId` 等于下一轮的 `taskId`，且三者的 `runId` 互不相同；

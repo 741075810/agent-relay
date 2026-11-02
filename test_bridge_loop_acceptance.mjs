@@ -5,7 +5,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { judgeRecord } from './tools/continuation/bridge_loop_acceptance.mjs';
 
-const SESSION = 'session-644cd4ce-7fe7-432e-b48e-33eef537214b';
+// A fabricated session id: the real one belongs to the operator's dispatch record, not to this repository
+// (tools/hygiene_scan.py flags a real `session-<uuid>` as a leak, which is how this constant was caught).
+const SESSION = 'session-11111111-1111-4111-8111-111111111111';
 
 function round(over = {}) {
   const base = {
