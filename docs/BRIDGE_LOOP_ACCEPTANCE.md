@@ -17,11 +17,11 @@ node tools/continuation/bridge_loop_acceptance.mjs record.json --json   # 机器
 
 | 阶段 | 含义 | 唯一合格的证据来源 |
 |---|---|---|
-| `taskCompleted` | Bridge 台账记录 DSH 任务完成 | `bridge_ledger` |
-| `extensionSubmitted` | 适配器接受通知（写入 + 点击 + 提交） | `extension_diagnostic` |
+| `taskCompleted` | Bridge 台账记录 DSH 任务**成功**完成 | `bridge_ledger`，且**必须**带 `status`（须为 `completed`）、`taskId`、`runId` |
+| `extensionSubmitted` | 适配器接受通知（写入 + 点击 + 提交） | `extension_diagnostic`，且 `runId` 与本轮一致 |
 | `noticeVisible` | **通知确实进入了目标 ChatGPT 会话** | `chatgpt_visible_message` / `chatgpt_conversation_message`（人确认 `chatgpt_operator_confirmation` 也算，但不是必需） |
-| `reviewed` | ChatGPT 独立复核该任务结果 | `chatgpt_review` |
-| `redispatched` | 从这次复核里创建了**新**任务 | `bridge_ledger`（带新 `taskId`） |
+| `reviewed` | ChatGPT 独立复核该任务结果 | `chatgpt_review`，且**必须**带 `reviewId`（或 `turnId`）、`taskId`、`runId`/`reviewRunId` 且与本轮一致 |
+| `redispatched` | 从这次复核里创建了**新**任务 | `bridge_ledger`，`taskId` **必需**、不得等于本轮 `taskId`，且必须等于下一轮实际的 `taskId` |
 
 **目标状态是无人值守，所以 `noticeVisible` 不要求有人在场。** 可接受的到达证据是"该消息出现在目标会话里"：
 `chatgpt_visible_message`（会话视图里可观察到）或 `chatgpt_conversation_message`（能读到这条消息本身，
@@ -32,6 +32,10 @@ node tools/continuation/bridge_loop_acceptance.mjs record.json --json   # 机器
 `extension_diagnostic` 的 `submitted`（适配器接受了消息）、`dsh_summary` / `dsh_completion_report`
 （工人自述）。这些来源出现在 `noticeVisible` 上时判 FAIL，并写入
 `noticeVisible:wrong_source(<来源>):sending_side_is_not_arrival`。
+
+到达证据还必须**点名**：`messageId`、`conversationId`，以及与本次运行绑定的 `runId`（或发送方分配的
+`eventId`/`bindingId`）。只有"消息出现在某个会话"而不指向这条 run 的记录判 `UNKNOWN`（`noticeVisible:run_binding_absent`）；
+指向了别的 run 判 FAIL（`noticeVisible:run_mismatch(...)`）。
 
 消息进入会话之后，**该会话里 ChatGPT 那一 turn 的复核与再派单动作**才是"消息被真正消费"的证据；
 `reviewed` 仍只接受 `chatgpt_review`，`redispatched` 仍只接受 `bridge_ledger` 且必须指向下一轮 `taskId`。
@@ -65,8 +69,20 @@ node tools/continuation/bridge_loop_acceptance.mjs record.json --json   # 机器
 禁止入内：消息正文、草稿、会话内容、URL、cookie、token、凭据、扩展 id。`runId` 与 `taskId` 是标识符，
 不是内容。
 
+## 本检查器能做什么、不能做什么
+
+它只核对**你提供的记录**自身的字段是否互相咬合：每个阶段是否点明了它作为证据所关于的那个对象，时间是否
+成链，身份是否一致，是否重复或并发。
+
+它**没有**连接器签名校验能力，也不访问 Bridge、Chrome、ChatGPT 或 Host：一份格式自洽的**离线 fixture**
+拿到 PASS，只证明判定算法按规则工作，**不证明实机闭环跑通过**。要证明实机，需要真实记录的字段来自真实
+事件，而这必须由派单方与观测方各自保证——本工具无法替他们担保。
+
 ## 判定规则（全部为 FAIL，除注明外）
 
+- `taskCompleted.status` 不是 `completed`（`failed`/`timeout`/`cancelled`…）→ FAIL
+  （`taskCompleted:status_not_completed(...)` 且 `round:not_a_successful_completion`）：**失败轮可以收到真实通知，
+  但永远不算成功的开发回合**，即便 `reviewed` 与 `redispatched` 都写了 `observed: true`。
 - 任一阶段 `observed: false` → FAIL（`<stage>:reported_false`）。
 - 来源不在该阶段的允许集合 → FAIL（`<stage>:wrong_source(...)`）。
 - 阶段时间戳倒序 → FAIL（`chain:out_of_order`）。
@@ -76,6 +92,10 @@ node tools/continuation/bridge_loop_acceptance.mjs record.json --json   # 机器
 - 两轮时间窗重叠 → FAIL（`overlap:190/191`）：闭环一次只应有一条在跑。
 - `redispatched.taskId` 不指向下一轮的实际 `taskId` → FAIL（`redispatch:does_not_lead_to_round_N`）。
 - 任一阶段 `observed` 缺失/`null` → `UNKNOWN`（`<stage>:not_observed`）。
+- 阶段缺"点名"字段 → `UNKNOWN`，绝不填默认值：`taskCompleted:status_absent` / `task_id_absent` /
+  `run_id_absent`、`extensionSubmitted:run_id_absent`、`noticeVisible:message_id_absent` /
+  `conversation_id_absent` / `run_binding_absent`、`reviewed:review_id_absent` / `task_id_absent` /
+  `run_id_absent`。**T190 及更早格式的记录因此只能判 `UNKNOWN`**，不会被默认值凑成 PASS。
 - 来源是 `fixture` / `mock` / `test` / `synthetic` / `replay` → **`UNKNOWN`**，不是 PASS：
   模拟数据永远不能充当实机证据。
 
@@ -115,5 +135,16 @@ node tools/continuation/bridge_loop_acceptance.mjs record.json --json   # 机器
 | 掉线恢复 | 重启后从持久队列续投，未 ack 的重投 | 杀进程重启，消息不丢不重 |
 | 安全边界 | 仅本机 loopback、token 鉴权、审计日志 | 无 token 请求 401，日志有记录 |
 | 迁移回滚 | 双跑期两套并存，开关一键切回 Bridge | 切换与回切各一次，闭环不断 |
+
+### 迁移前必须独立验收的事件来源条件（不开展新服务部署）
+
+自主 MCP+Service 要取代 Bridge，必须先满足这些**与本检查器无关**的条件，否则记录再漂亮也只是自证：
+
+1. **事件签名**：终态事件带服务端签名（HMAC 或 ed25519），检查器可离线验签；无签名的事件不得作为到达证据。
+2. **消息可回读**：到达证据的 `messageId`/`conversationId` 能从目标会话侧独立回读，而不是由发送方写入记录。
+3. **审核可归属**：`reviewId`/`turnId` 能由 ChatGPT 侧独立确认，且与其后续 `submit` 调用同源。
+4. **幂等可证**：同一 `eventId` 重复投递只产生一条消息、一次审核、一次派单，且可重放验证。
+5. **租约可观测**：会话控制权租约的持有者、TTL 过期事件可查询，第二持有者的拒绝有日志。
+6. **掉线恢复**：杀进程重启后未 ack 的事件重投且不重复，恢复过程可通过事件日志逐条核对。
 
 验收判据与本文档一致：**页面可见性与独立复核只能由人/对方给出**，Service 自身的 ACK 不得被计为送达。

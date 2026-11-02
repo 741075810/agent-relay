@@ -62,6 +62,77 @@ function timeOf(stage) {
 }
 
 /** One round, judged stage by stage. `problems` are FAIL reasons; `unknowns` are missing evidence. */
+function text(value) {
+  return typeof value === 'string' && value.trim() ? value : null;
+}
+
+/**
+ * Per-stage credential checks. A stage is only evidence when it names the thing it is evidence *about*:
+ *   - the completion names its task and run, and says `completed`;
+ *   - the arrival names a message, its conversation, and the run that message was about;
+ *   - the review names itself and the task/run it reviewed;
+ *   - the re-dispatch names a *new* task.
+ * A missing name is UNKNOWN, never a default. This tool cannot verify a signature on any of them -- it can only
+ * refuse a record whose own fields do not join up.
+ */
+function checkStage(stage, value, round) {
+  const problems = [];
+  const unknowns = [];
+  const roundRun = text(round && round.runId);
+  const roundTask = text(round && round.taskId);
+
+  if (stage === 'taskCompleted') {
+    const status = text(value.status);
+    if (!status) unknowns.push('taskCompleted:status_absent');
+    else if (status !== 'completed') problems.push(`taskCompleted:status_not_completed(${status})`);
+    const taskId = text(value.taskId);
+    if (!taskId) unknowns.push('taskCompleted:task_id_absent');
+    else if (roundTask && taskId !== roundTask) problems.push(`taskCompleted:task_mismatch(${taskId})`);
+    const runId = text(value.runId);
+    if (!runId) unknowns.push('taskCompleted:run_id_absent');
+    else if (roundRun && runId !== roundRun) problems.push(`taskCompleted:run_mismatch(${runId})`);
+  }
+
+  if (stage === 'extensionSubmitted') {
+    const runId = text(value.runId);
+    if (!runId) unknowns.push('extensionSubmitted:run_id_absent');
+    else if (roundRun && runId !== roundRun) problems.push(`extensionSubmitted:run_mismatch(${runId})`);
+  }
+
+  if (stage === 'noticeVisible') {
+    const messageId = text(value.messageId);
+    if (!messageId) unknowns.push('noticeVisible:message_id_absent');
+    const conversationId = text(value.conversationId);
+    if (!conversationId) unknowns.push('noticeVisible:conversation_id_absent');
+    // The message must be tied to *this* run, by run id or by a binding id the sender assigned.
+    const boundRun = text(value.runId);
+    const bindingId = text(value.eventId) || text(value.bindingId);
+    if (!boundRun && !bindingId) unknowns.push('noticeVisible:run_binding_absent');
+    else if (boundRun && roundRun && boundRun !== roundRun) {
+      problems.push(`noticeVisible:run_mismatch(${boundRun})`);
+    }
+  }
+
+  if (stage === 'reviewed') {
+    const reviewId = text(value.reviewId) || text(value.turnId);
+    if (!reviewId) unknowns.push('reviewed:review_id_absent');
+    const reviewedTask = text(value.taskId);
+    if (!reviewedTask) unknowns.push('reviewed:task_id_absent');
+    else if (roundTask && reviewedTask !== roundTask) problems.push(`reviewed:task_mismatch(${reviewedTask})`);
+    const reviewedRun = text(value.runId) || text(value.reviewRunId);
+    if (!reviewedRun) unknowns.push('reviewed:run_id_absent');
+    else if (roundRun && reviewedRun !== roundRun) problems.push(`reviewed:run_mismatch(${reviewedRun})`);
+  }
+
+  if (stage === 'redispatched') {
+    const taskId = text(value.taskId);
+    if (!taskId) problems.push('redispatched:task_id_absent');
+    else if (roundTask && taskId === roundTask) problems.push(`redispatched:same_task_id(${taskId})`);
+  }
+
+  return { problems, unknowns };
+}
+
 export function judgeRound(round, expected) {
   const problems = [];
   const unknowns = [];
@@ -89,6 +160,15 @@ export function judgeRound(round, expected) {
       continue;
     }
     if (timeOf(value) === null) unknowns.push(`${stage}:no_timestamp`);
+    const credential = checkStage(stage, value, round);
+    problems.push(...credential.problems);
+    unknowns.push(...credential.unknowns);
+  }
+
+  // A failed run may be notified, but it is never a passed round, whatever else the record says.
+  const completed = states.taskCompleted;
+  if (completed && text(completed.status) && text(completed.status) !== 'completed') {
+    problems.push('round:not_a_successful_completion');
   }
 
   // Ordering: each link must be observed no earlier than the one it depends on.
