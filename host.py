@@ -829,6 +829,14 @@ def handle_request(state_dir, doc, ledger_root=None, bridge_db=None,            
                                             native_root)
             return P.ok_response(ident, report)
 
+        if op == 'terminal-mirror':
+            # T203: the observer's door. Same reader as `terminal-list`, minus the bookkeeping: no
+            # pending list, no ACK, no state write at all. An AgentRelay sidecar can therefore see
+            # which runs finished and with what status without being able to consume a candidate the
+            # real send path still needs, and without its own ACK ever being mistaken for delivery.
+            report = terminal_source.mirror(state_dir, ledger_root, bridge_db)
+            return P.ok_response(ident, report)
+
         if op == 'terminal-running':
             # T068: what is running *now*, so the operator can decide before the
             # task ends instead of after. Strictly read-only: no state write, no

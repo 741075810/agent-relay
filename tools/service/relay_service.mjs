@@ -52,6 +52,9 @@ function emptyState() {
 const HOST_RUN_STATES = Object.freeze(['pending', 'acked', 'baseline']);
 const HOST_SOURCES = Object.freeze(['native_host.terminal-source', 'native_host.terminal-origin', 'native_host.terminal-arm']);
 const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,79}$/;
+// T203: a terminal candidate must name a status the host can actually resolve, and the account it came from.
+const TERMINAL_RUN_STATES = Object.freeze(['completed', 'failed', 'interrupted']);
+const TERMINAL_STATUS_SOURCES = Object.freeze(['bridge.run_facts.status', 'bridge_ledger.status']);
 
 function loadState(dir) {
   const path = join(dir, STATE_FILE);
@@ -327,6 +330,58 @@ export function createRelay(config) {
       if (accepted.some((item) => !item.duplicate)) persist();
       return { status: 200, body: { accepted, rejected, seq: state0.seq,
         note: 'host-observed only: a host ack is not page delivery and not proof of a DSH run' } };
+    },
+
+    // T203: real terminal candidates from the host's own `terminal-mirror` sample. A record without a terminal status
+    // and a named source is refused, because "the host offered it" and "the task finished successfully" are two
+    // different facts and collapsing them is how a wrong notice gets sent.
+    'POST /host/terminal-candidates': (body) => {
+      const items = Array.isArray(body.candidates) ? body.candidates : null;
+      if (!items) return { status: 400, body: { error: 'candidates_required' } };
+      const accepted = [];
+      const rejected = [];
+      for (let index = 0; index < items.length; index += 1) {
+        const item = items[index] || {};
+        const runId = typeof item.runId === 'string' ? item.runId.trim() : '';
+        const terminalStatus = typeof item.terminalStatus === 'string' ? item.terminalStatus.trim() : '';
+        const statusSource = typeof item.statusSource === 'string' ? item.statusSource.trim() : '';
+        const hostSource = typeof item.hostSource === 'string' ? item.hostSource.trim() : '';
+        if (!RUN_ID.test(runId)) { rejected.push({ index, error: 'run_id_invalid', runId }); continue; }
+        if (!TERMINAL_RUN_STATES.includes(terminalStatus)) {
+          rejected.push({ index, error: 'terminal_status_missing', terminalStatus }); continue;
+        }
+        if (!TERMINAL_STATUS_SOURCES.includes(statusSource)) {
+          rejected.push({ index, error: 'status_source_missing', statusSource }); continue;
+        }
+        if (hostSource !== 'native_host.terminal-mirror') {
+          rejected.push({ index, error: 'host_source_unknown', hostSource }); continue;
+        }
+        const existing = state0.runs.find((run) => run.runId === runId);
+        if (existing) {
+          if (existing.terminalStatus !== terminalStatus) {
+            existing.terminalStatus = terminalStatus;
+            existing.statusSource = statusSource;
+            existing.updatedAt = now();
+            accepted.push({ runId, terminalStatus, duplicate: true, updated: true, seq: existing.seq });
+          } else {
+            accepted.push({ runId, terminalStatus, duplicate: true, updated: false, seq: existing.seq });
+          }
+          persist();
+          continue;
+        }
+        state0.seq += 1;
+        state0.runs.push({ seq: state0.seq, runId, terminalStatus, statusSource, hostSource,
+          hostAck: typeof item.hostAck === 'string' ? item.hostAck : 'unseen',
+          origin: typeof item.origin === 'string' ? item.origin : 'unknown',
+          startedAt: Number.isFinite(item.startedAt) ? item.startedAt : null,
+          reportedBy: 'native_host', origin_kind: 'terminal_candidate',
+          pageDelivery: 'unknown', simulated: false, ingestedAt: now() });
+        accepted.push({ runId, terminalStatus, duplicate: false, seq: state0.seq });
+      }
+      if (accepted.some((entry) => !entry.duplicate)) persist();
+      return { status: 200, body: { accepted, rejected, seq: state0.seq,
+        pageDelivery: 'unknown',
+        note: 'host terminal candidates only: an ack is not a delivered page, and this service ran nothing' } };
     },
 
     'GET /runs': () => ({ status: 200, body: { runs: state0.runs, note: 'reported by the Native Host; ' +

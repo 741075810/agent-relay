@@ -35,7 +35,7 @@ MAX_TO_HOST_BYTES = 1 * 1024 * 1024
 
 # Every operation the host will answer. Anything else is refused by name, so a
 # future extension version cannot accidentally reach unimplemented behaviour.
-OPS = ('hello', 'poll', 'ack', 'status', 'simulate', 'terminal-list',
+OPS = ('hello', 'poll', 'ack', 'status', 'simulate', 'terminal-list', 'terminal-mirror',
        'terminal-ack', 'terminal-arm-snapshot', 'terminal-running')
 
 # The prototype's hard gate. `deliver` is what a hypothetical real-send path

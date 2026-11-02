@@ -903,3 +903,75 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
         'provenance': 'unverified',
         'deliverable': False,
     }
+
+MIRROR_SOURCE = 'native_host.terminal-mirror'
+
+
+def mirror(state_dir, root=None, bridge_db=None):
+    """T203: read-only mirror of the terminal candidates, with the status the host resolved.
+
+    `sample` is the *send* path: it records `pendingIds` and is consumed by `terminal-ack`, so
+    calling it from an observer would move bookkeeping the real chain depends on. This function
+    writes nothing at all -- no state, no pending list, no ACK -- which is the only way a mirror
+    can be attached without changing what gets sent.
+
+    The status here is the one the host announced: `resolve_status` of the ledger's own record and
+    the Bridge's account of the same run (`completed`/`failed`/`interrupted`). An entry also carries
+    whether the host has ACKed it, and that flag is explicitly *not* delivery: `pageDelivery` is
+    always `unknown`, because an ACK means the host stored a candidate, not that a page received it.
+    """
+    report = {'ok': False, 'code': None, 'error': None, 'readOnly': True,
+              'source': MIRROR_SOURCE, 'candidates': [], 'counts': {}, 'pageDelivery': 'unknown'}
+    try:
+        runs = read_runs(ledger_path(root))
+    except SourceError as exc:
+        report['code'] = 'source_unavailable'
+        report['error'] = str(exc)
+        return report
+    try:
+        state = load_state(state_dir)
+    except SourceError as exc:
+        # Same rule as `sample`: a damaged sampler state is not "nothing finished".
+        report['code'] = 'state_unreadable'
+        report['error'] = str(exc)
+        return report
+    if not isinstance(state, dict):
+        # No sampler state at all is normal for a read-only observer: nothing has been offered, so nothing is acked.
+        state = {'pendingIds': [], 'ackedIds': []}
+    origin = run_origin.classify(state_dir, db_path=bridge_db)
+    facts, facts_error = run_origin.read_run_facts(bridge_db)
+    acked = set(state.get('ackedIds') or [])
+    pending = set(state.get('pendingIds') or [])
+    chosen = {}
+    for run in runs:
+        run_id = run.get('requestID')
+        if not run_id:
+            continue
+        kept = chosen.get(run_id)
+        if kept is None or int(run.get('createdAt') or 0) >= int(kept.get('createdAt') or 0):
+            chosen[run_id] = run
+    for run_id, run in chosen.items():
+        fact = (facts or {}).get(run_id)
+        status = resolve_status(run.get('status'), fact)
+        if not status:
+            continue  # not terminal yet; the mirror reports finished runs only
+        report['candidates'].append({
+            'runId': run_id,
+            'status': status,
+            'startedAt': int(run.get('createdAt') or 0) // 1000,
+            'origin': run_origin.origin_for(run_id, origin),
+            'hostAck': 'acked' if run_id in acked else ('pending' if run_id in pending else 'unseen'),
+            'statusSource': 'bridge.run_facts.status' if fact else 'bridge_ledger.status',
+            'pageDelivery': 'unknown',
+        })
+    report['ok'] = True
+    report['counts'] = {
+        'runs': len(runs),
+        'candidates': len(report['candidates']),
+        'completed': sum(1 for c in report['candidates'] if c['status'] == 'completed'),
+        'failed': sum(1 for c in report['candidates'] if c['status'] == 'failed'),
+        'interrupted': sum(1 for c in report['candidates'] if c['status'] == 'interrupted'),
+        'acked': sum(1 for c in report['candidates'] if c['hostAck'] == 'acked'),
+    }
+    report['factsError'] = facts_error
+    return report
