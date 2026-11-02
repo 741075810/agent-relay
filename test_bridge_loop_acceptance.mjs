@@ -130,3 +130,66 @@ test('T190: the report never claims the program observed the loop itself', () =>
   const report = judgeRecord({ providerSessionId: SESSION, rounds: [round()] });
   assert.match(report.note, /not that the loop was observed by this program/);
 });
+
+test('T190R: an unattended round passes -- no human in the loop is required', () => {
+  for (const source of ['chatgpt_visible_message', 'chatgpt_conversation_message']) {
+    const report = judgeRecord({
+      providerSessionId: SESSION,
+      rounds: [round({ states: {
+        noticeVisible: { observed: true, source, at: '2026-11-02T10:30:30Z',
+          messageId: 'msg-1', conversationId: 'conv-1' },
+      } })],
+    });
+    assert.equal(report.verdict, 'PASS', source + ' is arrival evidence');
+    assert.equal(report.unattended, true);
+  }
+});
+
+test('T190R: the worker describing itself is not arrival evidence', () => {
+  const report = judgeRecord({
+    providerSessionId: SESSION,
+    rounds: [round({ states: {
+      noticeVisible: { observed: true, source: 'dsh_summary', at: '2026-11-02T10:30:30Z' },
+    } })],
+  });
+  assert.equal(report.verdict, 'FAIL');
+  assert.match(report.rounds[0].problems.join(','),
+    /noticeVisible:wrong_source\(dsh_summary\):sending_side_is_not_arrival/);
+});
+
+test('T190R: three rounds are a stability sample, not a cap -- four rounds can pass', () => {
+  const rounds = [190, 191, 192, 193].map((n, i) => round({
+    round: n,
+    runId: 'run-' + n,
+    taskId: 'tsk-' + n,
+    startedAt: `2026-11-02T1${i}:00:00Z`,
+    completedAt: `2026-11-02T1${i}:30:00Z`,
+    states: {
+      taskCompleted: { observed: true, source: 'bridge_ledger', at: `2026-11-02T1${i}:30:00Z` },
+      extensionSubmitted: { observed: true, source: 'extension_diagnostic', at: `2026-11-02T1${i}:30:05Z` },
+      noticeVisible: { observed: true, source: 'chatgpt_visible_message', at: `2026-11-02T1${i}:30:30Z` },
+      reviewed: { observed: true, source: 'chatgpt_review', at: `2026-11-02T1${i}:35:00Z` },
+      redispatched: { observed: true, source: 'bridge_ledger', at: `2026-11-02T1${i}:36:00Z`,
+        taskId: 'tsk-' + (n + 1) },
+    },
+  }));
+  rounds[3].states.redispatched.taskId = 'tsk-194';
+  const report = judgeRecord({ providerSessionId: SESSION, rounds });
+  assert.equal(report.verdict, 'PASS', JSON.stringify(report.rounds.filter((r) => r.verdict !== 'PASS')));
+  assert.equal(report.rounds.length, 4);
+});
+
+test('T190R: a failed round may be notified, but it is not a completed development result', () => {
+  const failedButNotified = round({
+    outcome: 'failed',
+    states: {
+      taskCompleted: { observed: true, source: 'bridge_ledger', at: '2026-11-02T10:30:00Z',
+        status: 'failed' },
+      noticeVisible: { observed: true, source: 'chatgpt_visible_message', at: '2026-11-02T10:30:30Z' },
+      reviewed: { observed: false, source: 'chatgpt_review' },
+    },
+  });
+  const report = judgeRecord({ providerSessionId: SESSION, rounds: [failedButNotified] });
+  assert.equal(report.verdict, 'FAIL', 'a failure round cannot be counted as a passed round');
+  assert.match(report.rounds[0].problems.join(','), /reviewed:reported_false/);
+});

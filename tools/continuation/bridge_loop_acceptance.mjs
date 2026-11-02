@@ -25,16 +25,30 @@ import { fileURLToPath } from 'node:url';
 export const STAGES = Object.freeze(['taskCompleted', 'extensionSubmitted', 'noticeVisible', 'reviewed',
   'redispatched']);
 
-//: Where a stage's fact is allowed to come from. `chatgpt_operator_confirmation` is the only source that can
-//: establish `noticeVisible`: everything machine-side proves the notice left, nothing machine-side proves it
-//: arrived in a conversation a person was reading.
+//: Where a stage's fact is allowed to come from.
+//:
+//: T190R: the goal is *unattended* operation, so requiring a human to eyeball each notice would make a correct
+//: loop unpassable. `noticeVisible` therefore accepts observation of the message inside the target ChatGPT
+//: conversation -- `chatgpt_conversation_message` (a message the bridge can see in that conversation) or
+//: `chatgpt_visible_message` (visible in the conversation view) -- and the ChatGPT turn's own review/dispatch
+//: is what proves the message was actually consumed. A human confirmation is still accepted, as one of several
+//: valid observations, not as a requirement.
+//:
+//: What stays forbidden is unchanged: a host ACK, a Chrome persistence event and an adapter `submitted` prove
+//: the notice left, never that it arrived; a DSH summary is the worker describing itself; fixtures are not
+//: evidence at all.
 export const SOURCES = Object.freeze({
   taskCompleted: ['bridge_ledger'],
   extensionSubmitted: ['extension_diagnostic'],
-  noticeVisible: ['chatgpt_operator_confirmation'],
+  noticeVisible: ['chatgpt_conversation_message', 'chatgpt_visible_message', 'chatgpt_operator_confirmation'],
   reviewed: ['chatgpt_review'],
   redispatched: ['bridge_ledger'],
 });
+
+//: Sources that look like notice evidence but are not: they observe the sending side, or the worker's own
+//: description of itself.
+export const NOT_ARRIVAL = Object.freeze(['host_ack', 'chrome_persisted', 'extension_diagnostic',
+  'adapter_submitted', 'dsh_summary', 'dsh_completion_report', 'task_completed']);
 
 export const MACHINE_SOURCE_HINTS = Object.freeze(['host_ack', 'host_state', 'chrome_persisted',
   'extension_diagnostic', 'bridge_ledger']);
@@ -69,7 +83,9 @@ export function judgeRound(round, expected) {
       continue;
     }
     if (!SOURCES[stage].includes(source)) {
-      problems.push(`${stage}:wrong_source(${source || 'none'})`);
+      const hint = NOT_ARRIVAL.includes(source) && stage === 'noticeVisible'
+        ? ':sending_side_is_not_arrival' : '';
+      problems.push(`${stage}:wrong_source(${source || 'none'})${hint}`);
       continue;
     }
     if (timeOf(value) === null) unknowns.push(`${stage}:no_timestamp`);
@@ -144,6 +160,8 @@ export function judgeRecord(record) {
     if (dispatched.taskId !== next.taskId) problems.push(`redispatch:does_not_lead_to_round_${next.round}`);
   }
 
+  // T190R: nothing in this judgement requires a person. A round whose notice was observed inside the target
+  // conversation, and whose review and re-dispatch are on record, passes with no human involvement at all.
   const verdicts = results.map((r) => r.verdict);
   let verdict = 'PASS';
   if (problems.length || verdicts.includes('FAIL')) verdict = 'FAIL';
@@ -152,8 +170,11 @@ export function judgeRecord(record) {
     verdict,
     rounds: results,
     problems,
+    unattended: verdict === 'PASS' ? true : null,
     note: 'This tool judges a supplied record. A PASS means the record is complete and self-consistent, not that '
-      + 'the loop was observed by this program. Machine-side sources cannot establish that a person saw a notice.',
+      + 'the loop was observed by this program. A PASS needs no human in the loop: an arrival observed inside the '
+      + 'target conversation plus the ChatGPT turn\'s own review and re-dispatch is enough. Sending-side facts '
+      + '(host ack, Chrome persistence, adapter submitted, DSH summary) and fixtures are never arrival evidence.',
   };
 }
 

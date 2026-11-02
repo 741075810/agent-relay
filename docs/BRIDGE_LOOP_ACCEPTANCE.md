@@ -19,14 +19,23 @@ node tools/continuation/bridge_loop_acceptance.mjs record.json --json   # 机器
 |---|---|---|
 | `taskCompleted` | Bridge 台账记录 DSH 任务完成 | `bridge_ledger` |
 | `extensionSubmitted` | 适配器接受通知（写入 + 点击 + 提交） | `extension_diagnostic` |
-| `noticeVisible` | **人在 ChatGPT 会话里读到了这条通知** | `chatgpt_operator_confirmation` |
+| `noticeVisible` | **通知确实进入了目标 ChatGPT 会话** | `chatgpt_visible_message` / `chatgpt_conversation_message`（人确认 `chatgpt_operator_confirmation` 也算，但不是必需） |
 | `reviewed` | ChatGPT 独立复核该任务结果 | `chatgpt_review` |
 | `redispatched` | 从这次复核里创建了**新**任务 | `bridge_ledger`（带新 `taskId`） |
 
-**`noticeVisible` 只接受 `chatgpt_operator_confirmation`。** Host ACK（`host_ack`）只表示 Chrome 报告
-"已持久化"；`extension_diagnostic` 的 `submitted` 只表示页面适配器接受了消息。两者都不能把
-`noticeVisible` 置真，检查器遇到这种来源直接判 FAIL，并在 `problems` 里写明
-`noticeVisible:wrong_source(host_ack)`。
+**目标状态是无人值守，所以 `noticeVisible` 不要求有人在场。** 可接受的到达证据是"该消息出现在目标会话里"：
+`chatgpt_visible_message`（会话视图里可观察到）或 `chatgpt_conversation_message`（能读到这条消息本身，
+带 `messageId`/`conversationId`）；`chatgpt_operator_confirmation` 依然接受，但它只是若干有效观测之一，
+不是通过条件。
+
+仍然禁止的是"发送侧冒充到达"：`host_ack`（Chrome 报"已持久化"）、`chrome_persisted`、
+`extension_diagnostic` 的 `submitted`（适配器接受了消息）、`dsh_summary` / `dsh_completion_report`
+（工人自述）。这些来源出现在 `noticeVisible` 上时判 FAIL，并写入
+`noticeVisible:wrong_source(<来源>):sending_side_is_not_arrival`。
+
+消息进入会话之后，**该会话里 ChatGPT 那一 turn 的复核与再派单动作**才是"消息被真正消费"的证据；
+`reviewed` 仍只接受 `chatgpt_review`，`redispatched` 仍只接受 `bridge_ledger` 且必须指向下一轮 `taskId`。
+以上三者都不需要人：一轮完整记录的 PASS 可以完全无人参与，报告里以 `unattended: true` 标注。
 
 ## 记录格式（脱敏，无正文）
 
@@ -72,14 +81,18 @@ node tools/continuation/bridge_loop_acceptance.mjs record.json --json   # 机器
 
 ## 三轮验收需要什么
 
-T190、T191、T192 每轮各产出一条上面的记录（一条即可，不要合并成"三轮看起来都对"）。T190→T191→T192
-要判 PASS，需要同时满足：
+**三轮不是自动开发的次数上限，只是稳定性采样。** 开发目标持续到项目完成、或需要真实人工授权为止；
+第 4 轮、第 5 轮同样按本文判定，检查器对轮数没有上限。
 
-1. 三条记录的 `providerSessionId` 都等于本轮派单时记录的那个 id（**不写入本仓库**，由派单方持有）；
-2. 每轮的 `noticeVisible` 都有**人**确认读过，且时间上晚于 `extensionSubmitted`；
+每一轮各产出一条上面的记录（一条即可，不要合并成"三轮看起来都对"）。一轮要判 PASS，需要同时满足：
+
+1. 记录的 `providerSessionId` 等于本轮派单时记录的那个 id（**不写入本仓库**，由派单方持有）；
+0. 该轮 `taskCompleted.status` 若为 `failed`，这一轮只能作为"失败轮被真实通知"的证据，**不能计为开发成果**；
+2. 每轮的 `noticeVisible` 由会话到达证据支撑（`chatgpt_visible_message` / `chatgpt_conversation_message`，
+   或人确认），且时间上晚于 `extensionSubmitted`；
 3. 每轮的 `reviewed` 都是一次独立复核（不是"任务 completed 顺带说明")；
-4. 每轮 `redispatched.taskId` 等于下一轮的 `taskId`，且三者的 `runId` 互不相同；
-5. 三条时间窗互不重叠。
+4. 每轮 `redispatched.taskId` 等于下一轮的 `taskId`，且各轮 `runId` 互不相同；
+5. 各轮时间窗互不重叠（同一时刻只允许一条在跑）。
 
 **本仓库里的单测（`test_bridge_loop_acceptance.mjs`）证明的是检查器会拒绝坏记录，不是循环已经跑通。**
 实机锁屏、睡眠、后台节流仍需独立实测——那些都在本工具的可观测范围之外。
