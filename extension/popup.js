@@ -1438,6 +1438,22 @@ if (chainEls.run) {
     } catch (err) {
       chainEls.detail.textContent += '\nlast notice: diagnostic unreadable (' + (err && err.message) + ')';
     }
+    // T193: one aggregated read-only block -- host ack / trigger mode / permit / binding / adapter / delivery.
+    try {
+      const runtime = await ask({ type: 't193-notice-runtime' });
+      if (runtime && runtime.ok && runtime.result && typeof window.noticeRuntimeLines === 'function') {
+        const diag = await ask({ type: 't166-diagnostic' });
+        chainEls.detail.textContent += '\n' + window.noticeRuntimeLines({
+          autosend: runtime.result.autosend,
+          trigger: runtime.result.trigger,
+          binding: runtime.result.binding,
+          diagnostic: diag && diag.ok ? diag.result : null,
+          readiness: { ackedIds: null },
+        }).join('\n');
+      }
+    } catch (err) {
+      chainEls.detail.textContent += '\nnotice runtime: unreadable (' + (err && err.message) + ')';
+    }
     // T188: the recent runs, by full runId, so a notice that never arrived can be traced to the run that owed
     // it. Read-only: one message, one render, no polling, no send, no navigation.
     try {

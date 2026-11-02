@@ -808,6 +808,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         } else {
           sendResponse({ ok: true, result: await readLatestDiagnostic(chrome.storage.local) });
         }
+      } else if (msg && msg.type === 't193-notice-runtime') {
+        // T193: aggregate what is already stored -- autosend permit, terminal trigger, binding, candidates.
+        // Read-only, popup-only, no poll, no send, no ACK, no write.
+        if (sender.id !== chrome.runtime.id ||
+            sender.url !== chrome.runtime.getURL('popup.html') || sender.tab) {
+          sendResponse({ ok: false, error: 'extension_popup_required' });
+        } else {
+          const got = await chrome.storage.local.get({
+            autosend: null, terminalTrigger: null, terminalCandidates: [], binding: null,
+          });
+          sendResponse({
+            ok: true,
+            result: {
+              autosend: got.autosend || null,
+              trigger: got.terminalTrigger || null,
+              candidateCount: Array.isArray(got.terminalCandidates) ? got.terminalCandidates.length : null,
+              binding: got.binding || null,
+            },
+          });
+        }
       } else if (msg && msg.type === 't188-run-history') {
         // T188: popup-only and read-only. No poll, no send, no ACK, no navigation -- and no page access.
         if (sender.id !== chrome.runtime.id ||
