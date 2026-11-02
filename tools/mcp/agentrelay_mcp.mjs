@@ -22,7 +22,7 @@ import { fileURLToPath } from 'node:url';
 
 export const PROTOCOL_VERSION = '2024-11-05';
 export const SERVER_NAME = 'agentrelay-mcp';
-export const SERVER_VERSION = '0.4.0';
+export const SERVER_VERSION = '0.5.0';
 const STATE_FILE = 'tasks.json';
 const LOCK_FILE = 'writer.lock';
 const MAX_TASKS_RETAINED = 200;
@@ -104,6 +104,12 @@ export const TOOLS = Object.freeze([
       required: ['taskId'], additionalProperties: false },
   },
   {
+    name: 'relay_host_runs',
+    description: 'Runs the Native Host reported (pending/acked/baseline), as forwarded by the sidecar. '
+      + 'Host-observed only: an ack is not page delivery and not proof of a DSH run.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  {
     name: 'relay_events',
     description: 'Incremental read of the service event log after a sequence number.',
     inputSchema: { type: 'object', properties: {
@@ -142,7 +148,7 @@ function prune(state) {
   return true;
 }
 
-const RELAY_TOOLS = ['relay_status', 'relay_task_get', 'relay_events'];
+const RELAY_TOOLS = ['relay_status', 'relay_task_get', 'relay_events', 'relay_host_runs'];
 
 /**
  * Call the local service. Any failure is said out loud -- the tool never falls back to the local store. The bearer
@@ -151,7 +157,8 @@ const RELAY_TOOLS = ['relay_status', 'relay_task_get', 'relay_events'];
 async function callRelay(serviceUrl, tokenFile, name, args) {
   if (!serviceUrl) return fail('service_unavailable', { reason: 'start the service and pass --service-url' });
   const base = serviceUrl.replace(/\/+$/, '');
-  const target = name === 'relay_status' ? base + '/health'
+  const target = name === 'relay_host_runs' ? base + '/runs'
+    : name === 'relay_status' ? base + '/health'
     : name === 'relay_task_get' ? base + '/tasks/get?taskId=' + encodeURIComponent(String(args.taskId || ''))
       : base + '/events' + (Number.isFinite(args.timeoutMs)
         ? '/wait?timeoutMs=' + args.timeoutMs + '&since=' : '?since=') + Number(args.since || 0)
@@ -170,8 +177,13 @@ async function callRelay(serviceUrl, tokenFile, name, args) {
       headers: { authorization: 'Bearer ' + token } });
     if (response.status === 401) return fail('service_unauthorized', { url: target });
     const payload = await response.json();
+    // T202: host-reported runs are *not* simulated records. Saying `simulated: true` about them would be the same
+    // mistake in the other direction, so the envelope only marks what this service actually did: nothing.
+    const envelope = name === 'relay_host_runs'
+      ? { reportedBy: 'native_host', executionObserved: false }
+      : { simulated: true, dsh: 'unavailable' };
     return { content: [{ type: 'text', text: JSON.stringify({ status: response.status, ...payload,
-      simulated: true, dsh: 'unavailable' }, null, 2) }], isError: response.status >= 400 };
+      ...envelope }, null, 2) }], isError: response.status >= 400 };
   } catch (err) {
     return fail('service_unreachable', { url: target, detail: String(err && err.message ? err.message : err) });
   }

@@ -44,8 +44,14 @@ const TRANSITIONS = Object.freeze({
 });
 
 function emptyState() {
-  return { version: 3, seq: 0, tasks: [], events: [], seen: [], keys: [], lease: null };
+  return { version: 4, seq: 0, tasks: [], events: [], seen: [], keys: [], lease: null, runs: [] };
 }
+
+// T202: a run is what the Native Host reported, not what this service believes. Only these two states exist, and the
+// host source must be named, so a record can be traced back to the artifact it came from.
+const HOST_RUN_STATES = Object.freeze(['pending', 'acked', 'baseline']);
+const HOST_SOURCES = Object.freeze(['native_host.terminal-source', 'native_host.terminal-origin', 'native_host.terminal-arm']);
+const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,79}$/;
 
 function loadState(dir) {
   const path = join(dir, STATE_FILE);
@@ -149,6 +155,9 @@ export function createRelay(config) {
   const loaded = lock.ok ? loadState(dir) : { state: null, problem: 'lock_denied', path: join(dir, STATE_FILE) };
   const state = loaded.state;
   const seenCap = Number.isFinite(config.seenCap) && config.seenCap > 0 ? config.seenCap : MAX_SEEN_RETAINED;
+  // `state0`/`seen0` are the same objects the routes mutate; named apart so the host route reads clearly.
+  const state0 = state;
+  const seen0 = state && Array.isArray(state.seen) ? state.seen : [];
   const waiters = new Set();
   const now = () => Date.now();
   // T199: recovery. A `running` task whose controlling lease is gone cannot be running -- the process that owned it
@@ -277,6 +286,51 @@ export function createRelay(config) {
       notify();
       return { status: 200, body: { task, duplicate: false, seq: appended.seq, ...DSH_UNAVAILABLE } };
     },
+
+    // T202: the only write path for real host traffic. Every item must name a run id, a state the host itself uses,
+    // and the artifact it came from; anything else is refused with the item index so a client can fix it.
+    'POST /host/candidates': (body) => {
+      const items = Array.isArray(body.candidates) ? body.candidates : null;
+      if (!items) return { status: 400, body: { error: 'candidates_required' } };
+      const accepted = [];
+      const rejected = [];
+      for (let index = 0; index < items.length; index += 1) {
+        const item = items[index] || {};
+        const runId = typeof item.runId === 'string' ? item.runId.trim() : '';
+        const state = typeof item.state === 'string' ? item.state.trim() : '';
+        const hostSource = typeof item.hostSource === 'string' ? item.hostSource.trim() : '';
+        if (!RUN_ID.test(runId)) { rejected.push({ index, error: 'run_id_invalid', runId }); continue; }
+        if (!HOST_RUN_STATES.includes(state)) { rejected.push({ index, error: 'state_unknown', state }); continue; }
+        if (!HOST_SOURCES.includes(hostSource)) {
+          rejected.push({ index, error: 'host_source_unknown', hostSource }); continue;
+        }
+        const existing = state0.runs.find((run) => run.runId === runId);
+        if (existing) {
+          if (existing.state !== state) {
+            existing.state = state;
+            existing.updatedAt = now();
+            accepted.push({ runId, state, duplicate: true, updated: true, seq: existing.seq });
+            persist();
+          } else {
+            accepted.push({ runId, state, duplicate: true, updated: false, seq: existing.seq });
+          }
+          continue;
+        }
+        state0.seq += 1;
+        const record = { seq: state0.seq, runId, state, hostSource, ingestedAt: now(),
+          origin: 'native_host', simulated: false };
+        state0.runs.push(record);
+        seen0.push({ id: 'host:' + runId + ':' + state, seq: record.seq, taskId: runId,
+          type: 'host_candidate' });
+        accepted.push({ runId, state, duplicate: false, seq: record.seq });
+      }
+      if (accepted.some((item) => !item.duplicate)) persist();
+      return { status: 200, body: { accepted, rejected, seq: state0.seq,
+        note: 'host-observed only: a host ack is not page delivery and not proof of a DSH run' } };
+    },
+
+    'GET /runs': () => ({ status: 200, body: { runs: state0.runs, note: 'reported by the Native Host; ' +
+      'this service did not observe the page and did not run anything' } }),
 
     'POST /events': (body) => {
       const result = appendEvent(state, { ...body, expectNew: body.expectNew === true }, { cap: seenCap });
