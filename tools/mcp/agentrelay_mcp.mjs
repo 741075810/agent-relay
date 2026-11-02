@@ -15,13 +15,14 @@
 // response says so. The Bridge still carries the live loop.
 
 import { createInterface } from 'node:readline';
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { acquireLock, releaseLock } from '../service/lock.mjs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const PROTOCOL_VERSION = '2024-11-05';
 export const SERVER_NAME = 'agentrelay-mcp';
-export const SERVER_VERSION = '0.2.0';
+export const SERVER_VERSION = '0.3.0';
 const STATE_FILE = 'tasks.json';
 const LOCK_FILE = 'writer.lock';
 const MAX_TASKS_RETAINED = 200;
@@ -59,31 +60,6 @@ function writeState(dir, state) {
   renameSync(tmp, path);
 }
 
-/**
- * One writer per state dir. A second process is told to go away rather than both writing the same JSON and losing
- * tasks silently. A lock whose pid is gone is stale and may be taken over.
- */
-export function acquireLock(dir) {
-  const path = join(dir, LOCK_FILE);
-  if (existsSync(path)) {
-    let owner = null;
-    try { owner = JSON.parse(readFileSync(path, 'utf8')); } catch { owner = null; }
-    const pid = owner && Number.isFinite(owner.pid) ? owner.pid : null;
-    let alive = false;
-    if (pid) {
-      try { process.kill(pid, 0); alive = true; } catch { alive = false; }
-    }
-    if (alive) return { ok: false, code: 'state_dir_busy', owner };
-    try { unlinkSync(path); } catch { /* the stale lock is best-effort */ }
-  }
-  writeFileSync(path, JSON.stringify({ pid: process.pid, at: Date.now() }) + '\n', 'utf8');
-  return { ok: true, code: null, path };
-}
-
-export function releaseLock(path) {
-  try { unlinkSync(path); } catch { /* already gone */ }
-}
-
 export let ID_SEQ = 0;
 function nextId() {
   ID_SEQ += 1;
@@ -93,7 +69,7 @@ function nextId() {
 export const TOOLS = Object.freeze([
   {
     name: 'agentrelay_status',
-    description: 'Read-only summary of the local task store. Does not contact DSH, the Bridge or any page.',
+    description: 'Read-only summary of the local store. Does not contact DSH, the Bridge or any page.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   {
@@ -113,12 +89,26 @@ export const TOOLS = Object.freeze([
   {
     name: 'agentrelay_task_get',
     description: 'Read one task by id. Returns found:false rather than inventing one.',
-    inputSchema: {
-      type: 'object',
-      properties: { taskId: { type: 'string' } },
-      required: ['taskId'],
-      additionalProperties: false,
-    },
+    inputSchema: { type: 'object', properties: { taskId: { type: 'string' } },
+      required: ['taskId'], additionalProperties: false },
+  },
+  {
+    name: 'relay_status',
+    description: 'Health and counters from the running local AgentRelay service. Read-only, simulated.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  {
+    name: 'relay_task_get',
+    description: 'Read one task from the running local service. Returns found:false rather than inventing one.',
+    inputSchema: { type: 'object', properties: { taskId: { type: 'string' } },
+      required: ['taskId'], additionalProperties: false },
+  },
+  {
+    name: 'relay_events',
+    description: 'Incremental read of the service event log after a sequence number.',
+    inputSchema: { type: 'object', properties: {
+      since: { type: 'number' }, timeoutMs: { type: 'number' }, limit: { type: 'number' } },
+      additionalProperties: false },
   },
 ]);
 
@@ -150,6 +140,27 @@ function prune(state) {
   if (excess > 0) return false; // nothing finished to drop: refuse rather than forget a queued task
   state.tasks = keep;
   return true;
+}
+
+const RELAY_TOOLS = ['relay_status', 'relay_task_get', 'relay_events'];
+
+/** Call the local service. Any failure is said out loud -- the tool never falls back to the local store. */
+async function callRelay(serviceUrl, name, args) {
+  if (!serviceUrl) return fail('service_unavailable', { reason: 'start the service and pass --service-url' });
+  const base = serviceUrl.replace(/\/+$/, '');
+  const target = name === 'relay_status' ? base + '/health'
+    : name === 'relay_task_get' ? base + '/tasks/get?taskId=' + encodeURIComponent(String(args.taskId || ''))
+      : base + '/events' + (Number.isFinite(args.timeoutMs)
+        ? '/wait?timeoutMs=' + args.timeoutMs + '&since=' : '?since=') + Number(args.since || 0)
+        + (Number.isFinite(args.limit) ? '&limit=' + args.limit : '');
+  try {
+    const response = await fetch(target, { method: 'GET', signal: AbortSignal.timeout(15000) });
+    const payload = await response.json();
+    return { content: [{ type: 'text', text: JSON.stringify({ status: response.status, ...payload,
+      simulated: true, dsh: 'unavailable' }, null, 2) }], isError: response.status >= 400 };
+  } catch (err) {
+    return fail('service_unreachable', { url: target, detail: String(err && err.message ? err.message : err) });
+  }
 }
 
 function callTool(dir, state, name, args) {
@@ -205,9 +216,10 @@ function callTool(dir, state, name, args) {
 }
 
 export function createServer(stateDir, options = {}) {
+  const serviceUrl = options.serviceUrl || process.env.AGENTRELAY_SERVICE_URL || '';
   const dir = resolve(stateDir);
   mkdirSync(dir, { recursive: true });
-  const lock = options.lock === false ? { ok: true, code: null, path: null } : acquireLock(dir);
+  const lock = options.lock === false ? { ok: true, code: null, token: null, path: null } : acquireLock(dir);
   const read = readState(dir);
   return {
     dir,
@@ -232,8 +244,9 @@ export function createServer(stateDir, options = {}) {
           protocolVersion: PROTOCOL_VERSION,
           capabilities: { tools: { listChanged: false } },
           serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
-          instructions: 'Local AgentRelay store only: agentrelay_submit queues a task locally and never executes it. '
-            + 'The Bridge still carries the live loop.',
+          instructions: 'agentrelay_submit queues a task in this server\'s local store; the relay_* tools read the '
+            + 'separate local service. Nothing here starts a DSH run: no verified external DSH control API exists, so '
+            + 'the relay service records are marked simulated. The Bridge still carries the live loop.',
         } };
       }
       if (method === 'tools/list') return { jsonrpc: '2.0', id, result: { tools: TOOLS } };
@@ -257,6 +270,10 @@ export function createServer(stateDir, options = {}) {
         return { jsonrpc: '2.0', id, result: fail('state_' + read.problem,
           { path: read.path, note: 'the file was left untouched; repair or remove it deliberately' }) };
       }
+      if (RELAY_TOOLS.includes(name)) {
+        return Promise.resolve(callRelay(serviceUrl, name, args))
+          .then((result) => ({ jsonrpc: '2.0', id, result }));
+      }
       return { jsonrpc: '2.0', id, result: callTool(dir, read.state, name, args) };
     },
   };
@@ -271,13 +288,16 @@ function main() {
     process.exitCode = 2;
     return;
   }
-  const server = createServer(stateDir);
+  const serviceAt = argv.indexOf('--service-url');
+  const serviceUrl = (serviceAt >= 0 ? argv[serviceAt + 1] : undefined)
+    || process.env.AGENTRELAY_SERVICE_URL || '';
+  const server = createServer(stateDir, { serviceUrl });
   if (!server.lock.ok) {
     process.stderr.write(`refusing to start: ${server.lock.code}\n`);
     process.exitCode = 3;
     return;
   }
-  process.on('exit', () => { if (server.lock.path) releaseLock(server.lock.path); });
+  process.on('exit', () => { releaseLock(server.lock); });
   const reader = createInterface({ input: process.stdin });
   reader.on('line', (line) => {
     const raw = line.trim();
@@ -290,11 +310,15 @@ function main() {
         error: { code: -32700, message: 'parse error' } }) + '\n');
       return;
     }
-    const response = server.handle(message);
-    if (response) process.stdout.write(JSON.stringify(response) + '\n');
+    Promise.resolve(server.handle(message)).then((response) => {
+      if (response) process.stdout.write(JSON.stringify(response) + '\n');
+    }).catch((err) => {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message && message.id,
+        error: { code: -32603, message: 'internal error: ' + String(err && err.message) } }) + '\n');
+    });
   });
   reader.on('close', () => {
-    if (server.lock.path) releaseLock(server.lock.path);
+    releaseLock(server.lock);
     process.exit(0);
   });
   process.stderr.write(`agentrelay-mcp ${SERVER_VERSION} ready (state ${server.dir})\n`);

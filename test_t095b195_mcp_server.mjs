@@ -88,8 +88,10 @@ async function session(fn, dir) {
 test('T196: standard tools/call `arguments` reaches the tool', async () => {
   await session(async (client) => {
     const list = await client.ask('tools/list', {});
+    // T197 added the three relay_* tools that read the separate local service.
     assert.deepEqual(list.result.tools.map((t) => t.name).sort(),
-      ['agentrelay_status', 'agentrelay_submit', 'agentrelay_task_get']);
+      ['agentrelay_status', 'agentrelay_submit', 'agentrelay_task_get',
+        'relay_events', 'relay_status', 'relay_task_get']);
 
     const submitted = await client.call('agentrelay_submit',
       { goal: 'standard field', idempotencyKey: 'k-std', providerSessionId: 'session-test' });
@@ -318,7 +320,7 @@ test('T196: protocol errors are reported and the process keeps serving', async (
     const parseError = client.waitFor((m) => m.error && m.error.code === -32700);
     client.raw('{not json');
     assert.equal((await parseError).error.code, -32700);
-    assert.equal((await client.ask('tools/list', {})).result.tools.length, 3);
+    assert.equal((await client.ask('tools/list', {})).result.tools.length, 6);
     assert.equal(existsSync(path.join(process.cwd(), 'tasks.json')), false, 'nothing written outside the state dir');
   });
 });
