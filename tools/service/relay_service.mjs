@@ -28,6 +28,8 @@ const MAX_EVENTS_RETAINED = 5000;
 // keeps, so a retry of an already-applied event is still refused after its body is gone. The cap is the guarantee
 // horizon and is published on /health, so nobody has to guess where it ends.
 const MAX_SEEN_RETAINED = 20000;
+// The ledger is finite, so beyond its horizon "this id is new" stops being provable. That case is refused unless the
+// caller states `expectNew: true`; internal ids (deterministic per task and attempt) always may pass.
 
 // T199: the legal moves of a task. Anything not listed is refused, so "already finished" and "wrong order" are
 // different answers rather than one silent no-op.
@@ -55,7 +57,8 @@ function loadState(dir) {
     const state = { ...emptyState(), ...parsed };
     if (!Array.isArray(state.seen) || (state.seen.length === 0 && state.events.length > 0)) {
       // Migrate a version-2 store: the retained events are the ids we can still vouch for.
-      const fromEvents = state.events.map((event) => ({ id: event.eventId, seq: event.seq }));
+      const fromEvents = state.events.map((event) => ({ id: event.eventId, seq: event.seq,
+        taskId: event.taskId || null, type: event.type || null }));
       state.seen = Array.isArray(state.seen) && state.seen.length ? state.seen : fromEvents;
     }
     return { state, problem: null, path };
@@ -73,32 +76,45 @@ function saveState(dir, state) {
 }
 
 /** Append one event. A repeated eventId is a no-op that reports `duplicate`, so a restarted client cannot double-post. */
-export function appendEvent(state, event) {
+export function appendEvent(state, event, options = {}) {
   const eventId = typeof event.eventId === 'string' ? event.eventId.trim() : '';
   if (!eventId) return { ok: false, code: 'event_id_required' };
-  // T199: dedupe against the events we still hold. The old `eventIds` array grew for ever while the event log was
-  // trimmed, so memory kept every id ever seen even though the bodies were gone -- and the two could disagree.
+  const taskId = typeof event.taskId === 'string' ? event.taskId : null;
+  const type = typeof event.type === 'string' ? event.type : 'task_event';
   const seen = Array.isArray(state.seen) ? state.seen : [];
   const known = seen.find((item) => item && item.id === eventId);
+
   if (known) {
+    // T201: an id is bound to the task and the kind of event it was first used for. Reusing it for anything else is a
+    // conflict, not a retry -- otherwise one event could "confirm" a transition on an unrelated task.
+    if ((known.taskId || null) !== taskId || (known.type || null) !== type) {
+      return { ok: false, code: 'event_id_conflict',
+        detail: { knownTaskId: known.taskId || null, knownType: known.type || null,
+          taskId, type, seq: known.seq } };
+    }
     return { ok: true, duplicate: true, event: null, seq: known.seq, appliedSeq: known.seq };
   }
+
+  // T201: past the ledger horizon, a brand new id cannot be distinguished from an evicted one. Say so and refuse,
+  // rather than silently processing an event that may already have been applied.
+  const evicted = Number.isFinite(state.seenEvicted) ? state.seenEvicted : 0;
+  if (evicted > 0 && options.allowBeyondWindow !== true && event.expectNew !== true) {
+    return { ok: false, code: 'dedupe_unverifiable',
+      detail: { evicted, window: seen.length ? { fromSeq: seen[0].seq, toSeq: seen[seen.length - 1].seq } : null } };
+  }
+
   state.seq += 1;
-  const stored = {
-    seq: state.seq,
-    eventId,
-    type: typeof event.type === 'string' ? event.type : 'task_event',
-    taskId: typeof event.taskId === 'string' ? event.taskId : null,
-    at: Date.now(),
-    simulated: true,
-  };
+  const stored = { seq: state.seq, eventId, type, taskId, at: Date.now(), simulated: true };
   state.events.push(stored);
-  seen.push({ id: eventId, seq: stored.seq });
-  if (seen.length > MAX_SEEN_RETAINED) seen.splice(0, seen.length - MAX_SEEN_RETAINED);
+  seen.push({ id: eventId, seq: stored.seq, taskId, type });
+  if (seen.length > (options.cap || MAX_SEEN_RETAINED)) {
+    const drop = seen.length - (options.cap || MAX_SEEN_RETAINED);
+    seen.splice(0, drop);
+    state.seenEvicted = evicted + drop;
+  }
   state.seen = seen;
   if (state.events.length > MAX_EVENTS_RETAINED) {
-    const drop = state.events.length - MAX_EVENTS_RETAINED;
-    state.events = state.events.slice(drop);
+    state.events = state.events.slice(state.events.length - MAX_EVENTS_RETAINED);
   }
   return { ok: true, duplicate: false, event: stored, seq: state.seq };
 }
@@ -132,6 +148,7 @@ export function createRelay(config) {
   }
   const loaded = lock.ok ? loadState(dir) : { state: null, problem: 'lock_denied', path: join(dir, STATE_FILE) };
   const state = loaded.state;
+  const seenCap = Number.isFinite(config.seenCap) && config.seenCap > 0 ? config.seenCap : MAX_SEEN_RETAINED;
   const waiters = new Set();
   const now = () => Date.now();
   // T199: recovery. A `running` task whose controlling lease is gone cannot be running -- the process that owned it
@@ -142,8 +159,13 @@ export function createRelay(config) {
     for (const task of state.tasks) {
       if (task.status !== 'running') continue;
       if (leaseAlive) continue;
+      // T201: an interrupted task may be requeued and interrupted again; each recovery needs its own identity, or the
+      // second one would be swallowed as a duplicate of the first and the task would look alive for ever.
+      const attempt = (Number.isFinite(task.recoveries) ? task.recoveries : 0) + 1;
       const applied = appendEvent(state,
-        { eventId: 'recovered:' + task.taskId, type: 'task_interrupted', taskId: task.taskId });
+        { eventId: 'recovered:' + task.taskId + ':' + attempt, type: 'task_interrupted', taskId: task.taskId },
+        { cap: seenCap, allowBeyondWindow: true });
+      if (applied.ok && !applied.duplicate) task.recoveries = attempt;
       if (!applied.ok) continue;
       task.status = 'interrupted';
       task.updatedAt = now();
@@ -183,8 +205,9 @@ export function createRelay(config) {
       tasks: state ? state.tasks.length : null, events: state ? state.events.length : null,
       seq: state ? state.seq : null, lease: state ? leaseView(state.lease, now()) : null,
       dedupeWindow: state && state.seen && state.seen.length
-        ? { fromSeq: state.seen[0].seq, toSeq: state.seen[state.seen.length - 1].seq, ids: state.seen.length }
-        : { fromSeq: null, toSeq: null, ids: 0 },
+        ? { fromSeq: state.seen[0].seq, toSeq: state.seen[state.seen.length - 1].seq, ids: state.seen.length,
+          evicted: state.seenEvicted || 0 }
+        : { fromSeq: null, toSeq: null, ids: 0, evicted: state.seenEvicted || 0 },
     } }),
 
     'GET /tasks': () => ({ status: 200, body: { tasks: state ? state.tasks : [], ...DSH_UNAVAILABLE } }),
@@ -203,7 +226,8 @@ export function createRelay(config) {
         sessionId, status: 'queued', simulated: true, createdAt: now() };
       state.tasks.push(task);
       state.keys.push({ key, taskId: task.taskId });
-      appendEvent(state, { eventId: 'queued:' + task.taskId, type: 'task_queued', taskId: task.taskId });
+      appendEvent(state, { eventId: 'queued:' + task.taskId, type: 'task_queued', taskId: task.taskId },
+        { cap: seenCap, allowBeyondWindow: true });
       persist();
       notify();
       return { status: 201, body: { task, duplicate: false, ...DSH_UNAVAILABLE } };
@@ -220,6 +244,12 @@ export function createRelay(config) {
       const eventIdRequested = typeof body.eventId === 'string' && body.eventId.trim()
         ? body.eventId.trim() : '';
       const known = (state.seen || []).find((item) => item && item.id === eventIdRequested);
+      if (known && ((known.taskId || null) !== taskId || (known.type || null) !== 'task_' + to)) {
+        // T201: the id belongs to another task or another kind of move. That is not this request's retry.
+        return { status: 409, body: { error: 'event_id_conflict',
+          detail: { knownTaskId: known.taskId || null, knownType: known.type || null, taskId, type: 'task_' + to,
+            seq: known.seq } } };
+      }
       if (known && task.status === to) {
         // The same request arriving twice answers the same way; it is not a second move.
         return { status: 200, body: { task, duplicate: true, alreadyAt: to, seq: known.seq,
@@ -235,7 +265,8 @@ export function createRelay(config) {
           allowed } };
       }
       const eventId = eventIdRequested || 'status:' + taskId + ':' + to + ':' + state.seq;
-      const appended = appendEvent(state, { eventId, type: 'task_' + to, taskId });
+      const appended = appendEvent(state, { eventId, type: 'task_' + to, taskId },
+        { cap: seenCap, allowBeyondWindow: true });
       if (!appended.ok) return { status: 400, body: { error: appended.code } };
       if (appended.duplicate) {
         return { status: 200, body: { task, duplicate: true, seq: appended.seq, ...DSH_UNAVAILABLE } };
@@ -248,8 +279,11 @@ export function createRelay(config) {
     },
 
     'POST /events': (body) => {
-      const result = appendEvent(state, body);
-      if (!result.ok) return { status: 400, body: { error: result.code } };
+      const result = appendEvent(state, { ...body, expectNew: body.expectNew === true }, { cap: seenCap });
+      if (!result.ok) {
+        const status = result.code === 'event_id_conflict' || result.code === 'dedupe_unverifiable' ? 409 : 400;
+        return { status, body: { error: result.code, detail: result.detail || null } };
+      }
       persist();
       notify();
       return { status: result.duplicate ? 200 : 201,
@@ -381,7 +415,9 @@ async function main() {
     process.exitCode = 2;
     return;
   }
-  const relay = createRelay({ stateDir });
+  const seenCapAt = argv.indexOf('--seen-cap');
+  const relay = createRelay({ stateDir,
+    seenCap: seenCapAt >= 0 ? Number(argv[seenCapAt + 1]) : undefined });
   if (!relay.lock.ok) {
     process.stderr.write('refusing to start: ' + relay.lock.code + '\n');
     process.exitCode = 3;

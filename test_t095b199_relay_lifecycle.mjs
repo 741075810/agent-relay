@@ -138,7 +138,8 @@ test('T199: a task left running with no live lease is recovered as interrupted o
     const events = await second.get('/events?since=0');
     const last = events.body.events[events.body.events.length - 1];
     assert.equal(last.type, 'task_interrupted');
-    assert.equal(last.eventId, 'recovered:' + taskId, 'the recovery event is itself idempotent');
+    assert.equal(last.eventId, 'recovered:' + taskId + ':1',
+      'T201: the recovery id carries its attempt number, so a later interruption is not swallowed');
 
     // And a second restart does not append it twice.
     await second.stop();

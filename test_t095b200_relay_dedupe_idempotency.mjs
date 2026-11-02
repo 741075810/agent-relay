@@ -78,11 +78,11 @@ test('T200: the dedupe window is published, so the guarantee horizon is not a se
   const service = await startService(dir);
   try {
     const empty = await service.get('/health');
-    assert.deepEqual(empty.body.dedupeWindow, { fromSeq: null, toSeq: null, ids: 0 });
+    assert.deepEqual(empty.body.dedupeWindow, { fromSeq: null, toSeq: null, ids: 0, evicted: 0 });
     await service.post('/events', { eventId: 'a', type: 'task_completed' });
     await service.post('/events', { eventId: 'b', type: 'task_completed' });
     const filled = await service.get('/health');
-    assert.deepEqual(filled.body.dedupeWindow, { fromSeq: 1, toSeq: 2, ids: 2 });
+    assert.deepEqual(filled.body.dedupeWindow, { fromSeq: 1, toSeq: 2, ids: 2, evicted: 0 });
   } finally {
     await service.stop();
     rmSync(dir, { recursive: true, force: true });
@@ -185,7 +185,8 @@ test('T200: many restarts recover a task exactly once, and trimming does not res
     // The body was deliberately removed, so the honest outcome is "no body, and it is not re-applied": the ledger
     // still knows `recovered:<taskId>` was applied, so a second record never appears.
     assert.ok(interrupted.length <= 1, 'the recovery event is never duplicated');
-    if (interrupted.length === 1) assert.equal(interrupted[0].eventId, 'recovered:' + taskId);
+    assert.equal(interrupted[0].eventId, 'recovered:' + taskId + ':2',
+      'the second interruption gets its own id; the first does not reappear');
     const task = await last.get('/tasks/get?taskId=' + taskId);
     assert.equal(task.body.task.status, 'interrupted');
   } finally {
@@ -207,12 +208,12 @@ test('T200: a version-2 store is migrated, keeping the ids it can still vouch fo
 
   const service = await startService(dir);
   try {
-    assert.equal((await service.post('/events', { eventId: 'legacy-1', type: 'task_completed' })).body.duplicate,
+    assert.equal((await service.post('/events', { eventId: 'legacy-1', type: 'task_queued', taskId: 'task-1' })).body.duplicate,
       true, 'the migrated ledger refuses an old id');
     const fresh = await service.post('/events', { eventId: 'new-1', type: 'task_completed' });
     assert.equal(fresh.body.duplicate, false);
     const health = await service.get('/health');
-    assert.deepEqual(health.body.dedupeWindow, { fromSeq: 1, toSeq: 3, ids: 3 });
+    assert.deepEqual(health.body.dedupeWindow, { fromSeq: 1, toSeq: 3, ids: 3, evicted: 0 });
   } finally {
     await service.stop();
     rmSync(dir, { recursive: true, force: true });
