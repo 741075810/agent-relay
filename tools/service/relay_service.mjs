@@ -25,8 +25,20 @@ export const DSH_UNAVAILABLE = Object.freeze({
 const STATE_FILE = 'relay.json';
 const MAX_EVENTS_RETAINED = 5000;
 
+// T199: the legal moves of a task. Anything not listed is refused, so "already finished" and "wrong order" are
+// different answers rather than one silent no-op.
+export const TERMINAL_STATUSES = Object.freeze(['completed', 'failed', 'cancelled', 'interrupted']);
+const TRANSITIONS = Object.freeze({
+  queued: ['running', 'completed', 'failed', 'cancelled', 'interrupted'],
+  running: ['completed', 'failed', 'cancelled', 'interrupted'],
+  completed: [],
+  failed: [],
+  cancelled: [],
+  interrupted: ['queued'],
+});
+
 function emptyState() {
-  return { version: 1, seq: 0, tasks: [], events: [], eventIds: [], keys: [], lease: null };
+  return { version: 2, seq: 0, tasks: [], events: [], keys: [], lease: null };
 }
 
 function loadState(dir) {
@@ -54,7 +66,11 @@ function saveState(dir, state) {
 export function appendEvent(state, event) {
   const eventId = typeof event.eventId === 'string' ? event.eventId.trim() : '';
   if (!eventId) return { ok: false, code: 'event_id_required' };
-  if (state.eventIds.includes(eventId)) return { ok: true, duplicate: true, event: null, seq: state.seq };
+  // T199: dedupe against the events we still hold. The old `eventIds` array grew for ever while the event log was
+  // trimmed, so memory kept every id ever seen even though the bodies were gone -- and the two could disagree.
+  if (state.events.some((item) => item.eventId === eventId)) {
+    return { ok: true, duplicate: true, event: null, seq: state.seq };
+  }
   state.seq += 1;
   const stored = {
     seq: state.seq,
@@ -65,7 +81,6 @@ export function appendEvent(state, event) {
     simulated: true,
   };
   state.events.push(stored);
-  state.eventIds.push(eventId);
   if (state.events.length > MAX_EVENTS_RETAINED) {
     const drop = state.events.length - MAX_EVENTS_RETAINED;
     state.events = state.events.slice(drop);
@@ -104,6 +119,22 @@ export function createRelay(config) {
   const state = loaded.state;
   const waiters = new Set();
   const now = () => Date.now();
+  // T199: recovery. A `running` task whose controlling lease is gone cannot be running -- the process that owned it
+  // died. Record that as an event instead of leaving it looking alive for ever.
+  if (state) {
+    const leaseAlive = state.lease && state.lease.expiresAt > now();
+    let recovered = 0;
+    for (const task of state.tasks) {
+      if (task.status !== 'running') continue;
+      if (leaseAlive) continue;
+      task.status = 'interrupted';
+      task.updatedAt = now();
+      appendEvent(state, { eventId: 'recovered:' + task.taskId, type: 'task_interrupted', taskId: task.taskId });
+      recovered += 1;
+    }
+    if (recovered) saveState(dir, state);
+    void recovered;
+  }
 
   function persist() {
     if (state) saveState(dir, state);
@@ -156,6 +187,33 @@ export function createRelay(config) {
       persist();
       notify();
       return { status: 201, body: { task, duplicate: false, ...DSH_UNAVAILABLE } };
+    },
+
+    // T199: a task has a lifecycle, and only some moves are legal. Anything else is refused with its own code, so a
+    // caller can tell "wrong order" from "already there" from "no such task".
+    'POST /tasks/transition': (body) => {
+      const taskId = typeof body.taskId === 'string' ? body.taskId.trim() : '';
+      const to = typeof body.status === 'string' ? body.status.trim() : '';
+      if (!taskId || !to) return { status: 400, body: { error: 'taskId_and_status_required' } };
+      const task = state.tasks.find((item) => item.taskId === taskId);
+      if (!task) return { status: 404, body: { error: 'no_such_task', taskId } };
+      const allowed = TRANSITIONS[task.status] || [];
+      if (!allowed.includes(to)) {
+        return { status: 409, body: { error: 'illegal_transition', from: task.status, to,
+          allowed } };
+      }
+      const eventId = typeof body.eventId === 'string' && body.eventId.trim()
+        ? body.eventId.trim() : 'status:' + taskId + ':' + to + ':' + state.seq;
+      const appended = appendEvent(state, { eventId, type: 'task_' + to, taskId });
+      if (!appended.ok) return { status: 400, body: { error: appended.code } };
+      if (appended.duplicate) {
+        return { status: 200, body: { task, duplicate: true, seq: appended.seq, ...DSH_UNAVAILABLE } };
+      }
+      task.status = to;
+      task.updatedAt = now();
+      persist();
+      notify();
+      return { status: 200, body: { task, duplicate: false, seq: appended.seq, ...DSH_UNAVAILABLE } };
     },
 
     'POST /events': (body) => {
