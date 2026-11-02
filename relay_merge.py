@@ -72,6 +72,23 @@ def fetch(relay_source, timeout=10):
     return candidates, None
 
 
+def ack_forms(run_id, status=None):
+    """The identities an ACK for this candidate may be written as.
+
+    The extension acknowledges with a bare run id; the trigger journal inside it keys on `runId|status`. Both spellings
+    name the same candidate, so both have to suppress it -- checking only one of them is what made an acknowledged relay
+    candidate come back on the next sample.
+    """
+    forms = [run_id]
+    if status is not None:
+        forms.append(run_id + '|' + status)
+    return forms
+
+
+def is_journalled(journal, run_id, status=None):
+    return any(form in journal for form in ack_forms(run_id, status))
+
+
 def merge(due, relay_candidates, state):
     """Append the relay candidates that are new to both the native lists and the relay journal."""
     known_native = set(state.get('pendingIds') or []) | set(state.get('ackedIds') or [])
@@ -79,11 +96,12 @@ def merge(due, relay_candidates, state):
     merged = list(due)
     taken = {item.get('runId') for item in merged}
     for candidate in relay_candidates:
-        key = candidate['runId'] + '|' + candidate['status']
-        if candidate['runId'] in known_native or candidate['runId'] in taken:
+        run_id = candidate['runId']
+        if run_id in known_native or run_id in taken:
             continue
-        if key in journal:
+        # One notice per run: a run acknowledged as `completed` is not announced again as `failed` either.
+        if is_journalled(journal, run_id, candidate['status']):
             continue
-        taken.add(candidate['runId'])
+        taken.add(run_id)
         merged.append(candidate)
     return merged
