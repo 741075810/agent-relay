@@ -89,7 +89,9 @@ export function createChromeAutoSend(chromeApi, deps) {
     void noteStage('send_attempted', {
       status: 'attempted',
       deliveryMode: deliveryMode === 'background' ? 'background' : 'foreground',
-      conversationMatched: Boolean(binding && binding.conversationId),
+      // T189: no `conversationMatched` here. The worker holds the *expected* conversation id; it does not
+      // observe the page's actual one, so claiming a match would be evidence it never had. The adapter's own
+      // reply carries the real comparison, and that is where it is recorded.
     }, candidate);
     try {
       reply = await chromeApi.tabs.sendMessage(binding.tabId, {

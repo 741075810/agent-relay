@@ -247,8 +247,10 @@ test('T188: the renderer shows five runs at most, marks absent stages unknown, a
   const text = lines.join('\n');
   assert.equal(lines.filter((l) => l.trim().startsWith('run-')).length, 5, 'at most five runs');
   assert.match(text, /adapter_result: unknown/);
-  assert.match(text, /not acknowledged/);
+  assert.match(text, /no host ack/);
+  assert.match(text, /adapter not submitted/);
   assert.match(text, /submitted is not ChatGPT consumption/);
   assert.match(window.runHistoryLines([])[0], /none recorded/);
-  assert.match(window.runHistoryLines([entry('r', true)]).join('\n'), /acknowledged/);
+  const acked = Object.assign(entry('r', false), { hostAcked: true });
+  assert.match(window.runHistoryLines([acked]).join('\n'), /host ack; adapter not submitted/);
 });

@@ -24,7 +24,10 @@
     }
     const lines = ['recent runs (' + entries.length + '):'];
     for (const entry of entries.slice(0, 5)) {
-      const state = entry.delivered ? 'acknowledged' : 'not acknowledged';
+      // T189: `delivered` is always false here -- nothing in this record observes page display. What can be
+      // said is whether the host acknowledged, and whether the adapter itself accepted the message.
+      const state = (entry.hostAcked ? 'host ack' : 'no host ack')
+        + (entry.pageSubmitted ? '; adapter submitted' : '; adapter not submitted');
       const attempted = stageOf(entry, 'send_attempted');
       lines.push('  ' + entry.runId + ' -- ' + state);
       lines.push('    send_attempted: ' + (attempted && attempted.known
