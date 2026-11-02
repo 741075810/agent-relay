@@ -13,8 +13,8 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
-import { createChromeAutoSend } from '../agent-relay/extension/lib/autosend_chrome_wiring.js';
-import { CANDIDATES_KEY, intakeOnce, mergeIntoStore } from '../agent-relay/tools/service/relay_candidate_intake.mjs';
+import { createChromeAutoSend } from './extension/lib/autosend_chrome_wiring.js';
+import { CANDIDATES_KEY, intakeOnce, mergeIntoStore } from './tools/service/relay_candidate_intake.mjs';
 
 const PY = process.env.PYTHON || 'python';
 const SERVICE = path.join(process.cwd(), 'tools', 'service', 'relay_service.mjs');
