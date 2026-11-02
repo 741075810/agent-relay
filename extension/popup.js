@@ -1448,7 +1448,7 @@ if (chainEls.run) {
           trigger: runtime.result.trigger,
           binding: runtime.result.binding,
           diagnostic: diag && diag.ok ? diag.result : null,
-          readiness: { ackedIds: null },
+          lastPoll: runtime.result.lastPoll,
         }).join('\n');
       }
     } catch (err) {

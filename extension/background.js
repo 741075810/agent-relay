@@ -809,22 +809,40 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: true, result: await readLatestDiagnostic(chrome.storage.local) });
         }
       } else if (msg && msg.type === 't193-notice-runtime') {
-        // T193: aggregate what is already stored -- autosend permit, terminal trigger, binding, candidates.
-        // Read-only, popup-only, no poll, no send, no ACK, no write.
+        // T194: read the real stores. The binding lives in `session` (mirrored to `local`), the trigger record has
+        // no `mode`, and the only honest ACK number is the last poll's, from `terminalChainStatus`.
         if (sender.id !== chrome.runtime.id ||
             sender.url !== chrome.runtime.getURL('popup.html') || sender.tab) {
           sendResponse({ ok: false, error: 'extension_popup_required' });
         } else {
-          const got = await chrome.storage.local.get({
-            autosend: null, terminalTrigger: null, terminalCandidates: [], binding: null,
+          const local = await chrome.storage.local.get({
+            autosend: null, terminalTrigger: null, terminalCandidates: [], terminalChainStatus: null,
+            t053BindingMirror: null,
           });
+          let sessionBinding = null;
+          try {
+            const session = await chrome.storage.session.get({ t053TargetBindingState: null });
+            sessionBinding = session.t053TargetBindingState || null;
+          } catch (_err) {
+            sessionBinding = null; // session storage unavailable: the mirror below is the fallback
+          }
+          const binding = sessionBinding || local.t053BindingMirror || null;
+          const lastPoll = local.terminalChainStatus && local.terminalChainStatus.lastPoll
+            ? local.terminalChainStatus.lastPoll : null;
           sendResponse({
             ok: true,
             result: {
-              autosend: got.autosend || null,
-              trigger: got.terminalTrigger || null,
-              candidateCount: Array.isArray(got.terminalCandidates) ? got.terminalCandidates.length : null,
-              binding: got.binding || null,
+              autosend: local.autosend || null,
+              trigger: local.terminalTrigger || null,
+              candidateCount: Array.isArray(local.terminalCandidates) ? local.terminalCandidates.length : null,
+              lastPoll,
+              binding: binding ? {
+                bound: Boolean(binding.conversationId || binding.tabId),
+                source: sessionBinding ? 'session' : 'local',
+                // A stored record is not a live probe: `validated` stays null unless the record says otherwise.
+                validated: typeof binding.validated === 'boolean' ? binding.validated : null,
+                invalidatedReason: binding.invalidatedReason || null,
+              } : { bound: false },
             },
           });
         }
