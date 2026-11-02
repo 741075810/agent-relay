@@ -29,6 +29,7 @@ import os
 import time
 
 import native_turns
+import relay_merge
 import run_origin
 
 # The status a candidate may carry. T067R: `interrupted` used to map to
@@ -682,7 +683,9 @@ def candidates_from(runs, state, arm_ids=None, origin=None, facts=None,
     handed_out = due + fresh
     pending_out = list(dict.fromkeys(
         [item['runId'] for item in handed_out] + pending))[-MAX_STATE_IDS:]
-    return handed_out, {
+    carried = {key: value for key, value in state.items()
+               if key not in ('pendingIds', 'ackedIds', 'baselineIds', 'baselineDropped', 'baselineCount', 'version')}
+    return handed_out, dict(carried, **{
         'version': STATE_VERSION,
         # The baseline is fixed at the first sample and must never be recomputed.
         # This used to return the freshly calculated `baseline`, which is the id set
@@ -696,8 +699,38 @@ def candidates_from(runs, state, arm_ids=None, origin=None, facts=None,
         'ackedIds': list(state['ackedIds'])[-MAX_STATE_IDS:],
         'baselineDropped': dropped,
         'baselineCount': state.get('baselineCount'),
-    }, {'baselineEstablished': False, 'existingTerminalRuns': len(terminal),
+    }), {'baselineEstablished': False, 'existingTerminalRuns': len(terminal),
          'droppedFromBaseline': dropped, 'redelivered': redelivered}
+
+
+def acknowledge_relay(state, run_ids):
+    """Record ACKs for relay-only candidates in their own journal, and return what was newly journalled.
+
+    These runs were never in `pendingIds`, so an ACK for one must not be able to move a native candidate; the separate
+    list also stops the re-push an ACK would otherwise cause, because `sample` refuses anything already in it.
+    """
+    journal = list(state.get('relayAckedIds') or [])
+    known = set(journal)
+    # Only ids the native queue does not own. A native run acknowledged here would otherwise be journalled as if it came
+    # from the relay, and the two namespaces would stop being distinguishable.
+    native_owned = set(state.get('pendingIds') or []) | set(state.get('ackedIds') or [])
+    added = []
+    for item in run_ids or []:
+        if not isinstance(item, str) or not item:
+            continue
+        forms = [item]
+        if '|' in item:
+            forms.append(item.split('|', 1)[0])
+        if all(form in native_owned for form in forms):
+            continue
+        for form in forms:
+            if form in known:
+                continue
+            known.add(form)
+            journal.append(form)
+            added.append(form)
+    state['relayAckedIds'] = journal
+    return added
 
 
 def acknowledge(state_dir, run_ids):
@@ -730,20 +763,21 @@ def acknowledge(state_dir, run_ids):
         known.add(run_id)
         acked.append(run_id)
         moved += 1
-    next_state = {
+    next_state = dict(state)
+    next_state.update({
         'version': STATE_VERSION,
         'baselineIds': state['baselineIds'],
         'pendingIds': [r for r in pending if r not in known],
         'ackedIds': acked[-MAX_STATE_IDS:],
         'baselineDropped': state.get('baselineDropped', 0),
         'baselineCount': state.get('baselineCount'),
-    }
+    })
     save_state(state_dir, next_state)
     return {'acked': moved, 'pending': len(next_state['pendingIds'])}
 
 
 def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
-           native_root=None, now=None):
+           native_root=None, now=None, relay_source=None):
     """One read-only sample. Returns candidates plus a small, honest report.
 
     Never raises for a missing ledger: a missing source is reported as a gap with
@@ -844,6 +878,12 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
         ledger_mtime = int(os.path.getmtime(path))
     except OSError:
         ledger_mtime = None
+    # T206: the relay's verified terminal candidates, in the same answer and format. The native bookkeeping above is
+    # already decided and written at this point, so merging here cannot move the baseline or the native pending list;
+    # the relay's ACKs live in their own journal (see `relay_merge` and `acknowledge`).
+    relay_candidates, relay_code = relay_merge.fetch(relay_source)
+    if relay_candidates:
+        due = relay_merge.merge(due, relay_candidates, next_state)
     return {
         'ok': True,
         'code': None,
@@ -851,6 +891,8 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
         # until `acknowledge()` names them. `confirmed: false` says so out loud
         # so no caller can mistake this list for "already handed over safely".
         'candidates': due,
+        'relayCode': relay_code,
+        'relayCandidates': len(relay_candidates),
         'confirmed': False,
         'requiresAck': True,
         'redelivered': info['redelivered'],

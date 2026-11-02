@@ -33,7 +33,14 @@ export function takeFrame(buffer) {
 
 /** Ask the Relay-backed host for its `terminal-list` answer, over the real wire format. */
 export function askTerminalList(host, { timeoutMs = 15000 } = {}) {
-  const args = [host.script, '--service-url', host.serviceUrl, '--service-token-file', host.tokenFile];
+  const extra = Array.isArray(host.args) ? host.args : [];
+  // The stand-in host takes the relay endpoint as flags. The real host does not: it takes its own manifest / ledger /
+  // native roots, and the relay is configured there too. So explicit host arguments mean the caller knows its host,
+  // and nothing is appended behind its back.
+  const relayFlags = extra.length === 0
+    ? ['--service-url', host.serviceUrl, '--service-token-file', host.tokenFile]
+    : [];
+  const args = [host.script, ...extra, ...relayFlags];
   return new Promise((resolve) => {
     const child = spawn(host.python, args, { stdio: ['pipe', 'pipe', 'pipe'] });
     let buffer = Buffer.alloc(0);
@@ -135,11 +142,17 @@ export async function intakeOnce({ host, now = Date.now(), triggerState = null }
 async function main() {
   const argv = process.argv.slice(2);
   const value = (flag) => { const at = argv.indexOf(flag); return at >= 0 ? argv[at + 1] : undefined; };
+  const argvHostArgs = [];
+  for (let i = 0; i < argv.length; i += 1) {
+    if (argv[i] === '--host-arg') argvHostArgs.push(argv[i + 1]);
+  }
   const host = {
     python: value('--python') || process.env.PYTHON || 'python',
     script: value('--host-script'),
     serviceUrl: value('--service-url'),
     tokenFile: value('--service-token-file'),
+    // For the real host: origin first, then --state-dir/--ledger-root/--manifest/... before the relay flags.
+    args: argvHostArgs.filter((item) => typeof item === 'string'),
   };
   const storePath = value('--store');
   if (!host.script || !host.serviceUrl || !host.tokenFile || !storePath) {

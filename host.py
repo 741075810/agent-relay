@@ -742,7 +742,7 @@ def _error_frame(ident, exc):
     return reply
 
 
-def handle_request(state_dir, doc, ledger_root=None, bridge_db=None,                   bridge_fixture=None, native_root=None):
+def handle_request(state_dir, doc, ledger_root=None, bridge_db=None,                   bridge_fixture=None, native_root=None, relay_source=None):
     try:
         op, args = P.validate_request(doc)
     except P.ProtocolError as exc:
@@ -826,7 +826,7 @@ def handle_request(state_dir, doc, ledger_root=None, bridge_db=None,            
             # see terminal_source for why the identifier set is that small.
             report = terminal_source.sample(state_dir, ledger_root, bridge_db,
                                             load_origin_fixture(bridge_fixture),
-                                            native_root)
+                                            native_root, relay_source=relay_source)
             return P.ok_response(ident, report)
 
         if op == 'terminal-mirror':
@@ -866,6 +866,14 @@ def handle_request(state_dir, doc, ledger_root=None, bridge_db=None,            
             # Still nothing to do with the notification queue.
             try:
                 acked = terminal_source.acknowledge(state_dir, args.get('acked'))
+                # T206: an ACK that names a relay candidate records it in the relay journal. The native call above only
+                # ever moves ids that were in `pendingIds`, so a relay id cannot consume a native candidate here.
+                if relay_source:
+                    state_doc = terminal_source.load_state(state_dir) or {}
+                    added = terminal_source.acknowledge_relay(state_doc, args.get('acked'))
+                    if added:
+                        terminal_source.save_state(state_dir, state_doc)
+                    acked = dict(acked, relayAcked=added)
             except terminal_source.SourceError as exc:
                 # A malformed ACK is a bad request, not a crash. The host has to
                 # keep answering: a thrown error here would take down the whole
@@ -989,7 +997,7 @@ def load_origin_fixture(path):
 
 
 def serve(state_dir, manifest_path, stdin, stdout, ledger_root=None,
-          bridge_db=None, bridge_fixture=None, native_root=None):
+          bridge_db=None, bridge_fixture=None, native_root=None, relay_source=None):
     """Answer requests until the pipe closes."""
     while True:
         try:
@@ -1009,7 +1017,7 @@ def serve(state_dir, manifest_path, stdin, stdout, ledger_root=None,
             return 0
         try:
             response = handle_request(state_dir, doc, ledger_root, bridge_db,
-                                      bridge_fixture, native_root)
+                                      bridge_fixture, native_root, relay_source)
         except Exception as exc:                   # noqa: BLE001
             # A write that fails -- a full disk, a killed process, a permission that
             # changed under us -- must not take the request with it. Raising here left the
@@ -1053,6 +1061,10 @@ def main(argv=None):
                          'dispatch bindings ({"version":1,"bridge":"*"}), so an '
                          'end-to-end suite can exercise channel A or B without a '
                          'real bridge. Never passed by the production launcher.')
+    ap.add_argument('--relay-url', default=None,
+                    help='T206: relay service URL to fuse into terminal-list; off unless given')
+    ap.add_argument('--relay-token-file', default=None,
+                    help='T206: bearer token file for --relay-url')
     ap.add_argument('--native-root', default=None,
                     help='DSH session-log root used to discover tasks a person '
                          'started directly in DSH Desktop; defaults to the '
@@ -1098,9 +1110,14 @@ def main(argv=None):
     except HostError as exc:
         print('%s: %s' % (exc.code, exc.message), file=sys.stderr)
         return 3
+    # T206: default off. Without both flags the relay is not consulted at all and `terminal-list` is byte-for-byte the
+    # answer it gave before this change.
+    relay_source = None
+    if args.relay_url and args.relay_token_file:
+        relay_source = {'url': args.relay_url, 'token_file': args.relay_token_file}
     return serve(args.state_dir, args.manifest, sys.stdin.buffer,
                  sys.stdout.buffer, args.ledger_root, args.bridge_db,
-                 args.bridge_db_fixture, args.native_root)
+                 args.bridge_db_fixture, args.native_root, relay_source)
 
 
 if __name__ == '__main__':
