@@ -1,42 +1,57 @@
 #!/usr/bin/env node
-// T195: a prototype MCP server for AgentRelay -- stdio JSON-RPC, no network, no DSH, no Bridge.
+// T195/T196: a prototype MCP server for AgentRelay -- stdio JSON-RPC, local state, no DSH, no Bridge.
 //
-// This is the first piece of the eventual replacement for the Bridge, and it is deliberately the smallest piece
-// that can be tested end to end: initialize, tool discovery, and a read-only status query over a local task store
-// that survives a process restart. It does not talk to DSH, does not send notices, and cannot affect the running
-// Bridge. Everything it knows lives in `--state-dir`.
+// T196 fixed five interoperability and durability defects found in review:
+//   1. tool arguments arrive in `params.arguments` (the MCP field), not `params.args`;
+//   2. a corrupt store is **fail-closed**: the server refuses to write rather than overwrite what it cannot read;
+//   3. the per-request-id response cache is gone -- a JSON-RPC id is a correlation id, not a business key, and
+//      reusing it for a different call must reach the tool; deduplication is only the persisted `idempotencyKey`;
+//   4. idempotency keys are held in a `Map`, so inherited property names (`__proto__`, `constructor`) are ordinary
+//      data, and a key reused with a different goal/session is a conflict rather than a silent alias;
+//   5. retention never forgets unfinished work: only terminal tasks are pruned; at capacity with nothing prunable
+//      the store refuses with `store_full` instead of silently dropping a queued task.
 //
-// Framing: newline-delimited JSON, per MCP's stdio transport. Each request is answered on stdout; diagnostics go
-// to stderr so a client never has to parse around them.
+// What this server is not: it does not execute anything. `agentrelay_submit` records a queued task locally and the
+// response says so. The Bridge still carries the live loop.
 
 import { createInterface } from 'node:readline';
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 export const PROTOCOL_VERSION = '2024-11-05';
 export const SERVER_NAME = 'agentrelay-mcp';
-export const SERVER_VERSION = '0.1.0';
+export const SERVER_VERSION = '0.2.0';
 const STATE_FILE = 'tasks.json';
+const LOCK_FILE = 'writer.lock';
+const MAX_TASKS_RETAINED = 200;
+const TERMINAL = Object.freeze(['completed', 'failed', 'cancelled']);
 
 function emptyState() {
-  return { version: 1, tasks: [], requests: {}, seq: 0 };
+  return { version: 2, tasks: [], requests: [], seq: 0 };
 }
 
-/** Read the store, or an empty one. A malformed file is reported, never silently replaced. */
-function readState(dir) {
+/** `requests` is a list of {key, taskId, goal, providerSessionId} so no key can collide with Object.prototype. */
+function normaliseState(parsed) {
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.tasks)) return null;
+  const requests = Array.isArray(parsed.requests) ? parsed.requests.filter((item) => item
+    && typeof item.key === 'string' && typeof item.taskId === 'string') : [];
+  return { version: 2, tasks: parsed.tasks, requests, seq: Number.isFinite(parsed.seq) ? parsed.seq : 0 };
+}
+
+/** Read the store. A problem is reported and never turned into an empty store that a later write would replace. */
+export function readState(dir) {
   const path = join(dir, STATE_FILE);
+  if (!existsSync(path)) return { state: emptyState(), problem: null, path };
   try {
-    const raw = readFileSync(path, 'utf8');
-    const parsed = JSON.parse(raw);
-    if (!parsed || !Array.isArray(parsed.tasks)) return { state: emptyState(), problem: 'state_shape' };
-    return { state: parsed, problem: null };
+    const state = normaliseState(JSON.parse(readFileSync(path, 'utf8')));
+    if (!state) return { state: null, problem: 'state_shape', path };
+    return { state, problem: null, path };
   } catch (err) {
-    if (err && err.code === 'ENOENT') return { state: emptyState(), problem: null };
-    return { state: emptyState(), problem: 'state_unreadable' };
+    return { state: null, problem: 'state_unreadable', path };
   }
 }
 
-/** Write atomically: a crash mid-write must not leave a half document behind. */
 function writeState(dir, state) {
   const path = join(dir, STATE_FILE);
   const tmp = path + '.tmp-' + process.pid;
@@ -44,16 +59,37 @@ function writeState(dir, state) {
   renameSync(tmp, path);
 }
 
-export let UUID_SEQ = 0;
-function nextId() {
-  UUID_SEQ += 1;
-  return `task-${process.pid}-${Date.now().toString(36)}-${UUID_SEQ}`;
+/**
+ * One writer per state dir. A second process is told to go away rather than both writing the same JSON and losing
+ * tasks silently. A lock whose pid is gone is stale and may be taken over.
+ */
+export function acquireLock(dir) {
+  const path = join(dir, LOCK_FILE);
+  if (existsSync(path)) {
+    let owner = null;
+    try { owner = JSON.parse(readFileSync(path, 'utf8')); } catch { owner = null; }
+    const pid = owner && Number.isFinite(owner.pid) ? owner.pid : null;
+    let alive = false;
+    if (pid) {
+      try { process.kill(pid, 0); alive = true; } catch { alive = false; }
+    }
+    if (alive) return { ok: false, code: 'state_dir_busy', owner };
+    try { unlinkSync(path); } catch { /* the stale lock is best-effort */ }
+  }
+  writeFileSync(path, JSON.stringify({ pid: process.pid, at: Date.now() }) + '\n', 'utf8');
+  return { ok: true, code: null, path };
 }
 
-/**
- * The tools. `agentrelay_status` is read-only; `agentrelay_submit` records a task locally and is idempotent on its
- * `idempotencyKey`; `agentrelay_task_get` reads one task back. None of them touch anything outside the state dir.
- */
+export function releaseLock(path) {
+  try { unlinkSync(path); } catch { /* already gone */ }
+}
+
+export let ID_SEQ = 0;
+function nextId() {
+  ID_SEQ += 1;
+  return `task-${process.pid}-${Date.now().toString(36)}-${ID_SEQ}`;
+}
+
 export const TOOLS = Object.freeze([
   {
     name: 'agentrelay_status',
@@ -62,12 +98,12 @@ export const TOOLS = Object.freeze([
   },
   {
     name: 'agentrelay_submit',
-    description: 'Record a task locally. Repeating the same idempotencyKey returns the same task id.',
+    description: 'Record a task as queued in the local store only. Nothing is executed and no DSH run is started.',
     inputSchema: {
       type: 'object',
       properties: {
-        goal: { type: 'string', description: 'what the task should achieve' },
-        idempotencyKey: { type: 'string', description: 'stable key; repeating it never creates a second task' },
+        goal: { type: 'string' },
+        idempotencyKey: { type: 'string' },
         providerSessionId: { type: 'string' },
       },
       required: ['goal', 'idempotencyKey'],
@@ -86,103 +122,144 @@ export const TOOLS = Object.freeze([
   },
 ]);
 
-const MAX_TASKS_RETAINED = 200;
+const LOCAL_ONLY = Object.freeze({
+  durable: true,
+  localOnly: true,
+  executes: false,
+  note: 'recorded in this server\'s local store only; no DSH run was started and no notice was sent',
+});
 
-function callTool(state, name, args) {
+function text(payload) {
+  return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
+}
+
+function fail(code, detail) {
+  return { content: [{ type: 'text', text: JSON.stringify({ error: code, detail: detail || null }) }],
+    isError: true };
+}
+
+/** Retention may only remove work that is already finished; anything else must survive. */
+function prune(state) {
+  if (state.tasks.length <= MAX_TASKS_RETAINED) return true;
+  const keep = [];
+  let excess = state.tasks.length - MAX_TASKS_RETAINED;
+  for (const task of state.tasks) {
+    if (excess > 0 && TERMINAL.includes(task.status)) { excess -= 1; continue; }
+    keep.push(task);
+  }
+  if (excess > 0) return false; // nothing finished to drop: refuse rather than forget a queued task
+  state.tasks = keep;
+  return true;
+}
+
+function callTool(dir, state, name, args) {
   if (name === 'agentrelay_status') {
-    const counts = { queued: 0, running: 0, completed: 0, failed: 0 };
+    const counts = { queued: 0, running: 0, completed: 0, failed: 0, cancelled: 0 };
     for (const task of state.tasks) {
       if (Object.prototype.hasOwnProperty.call(counts, task.status)) counts[task.status] += 1;
     }
-    return {
-      content: [{ type: 'text', text: JSON.stringify({ tasks: state.tasks.length, counts,
-        lastTaskId: state.tasks.length ? state.tasks[state.tasks.length - 1].taskId : null,
-        note: 'local store only; nothing here proves a DSH run or a delivered notice' }, null, 2) }],
-      isError: false,
-    };
-  }
-
-  if (name === 'agentrelay_submit') {
-    const goal = typeof args.goal === 'string' ? args.goal.trim() : '';
-    const key = typeof args.idempotencyKey === 'string' ? args.idempotencyKey.trim() : '';
-    if (!goal || !key) {
-      return { content: [{ type: 'text', text: JSON.stringify({ error: 'goal and idempotencyKey are required' }) }],
-        isError: true };
-    }
-    const existing = state.requests[key];
-    if (existing) {
-      const task = state.tasks.find((item) => item.taskId === existing);
-      return { content: [{ type: 'text', text: JSON.stringify({ taskId: existing, duplicate: true,
-        status: task ? task.status : null }) }], isError: false };
-    }
-    const task = {
-      taskId: nextId(),
-      goal,
-      idempotencyKey: key,
-      providerSessionId: typeof args.providerSessionId === 'string' ? args.providerSessionId : null,
-      status: 'queued',
-      createdAt: Date.now(),
-    };
-    state.seq += 1;
-    state.tasks.push(task);
-    state.requests[key] = task.taskId;
-    if (state.tasks.length > MAX_TASKS_RETAINED) state.tasks = state.tasks.slice(-MAX_TASKS_RETAINED);
-    return { content: [{ type: 'text', text: JSON.stringify({ taskId: task.taskId, duplicate: false,
-      status: task.status }) }], isError: false };
+    return text({ tasks: state.tasks.length, counts, keys: state.requests.length,
+      lastTaskId: state.tasks.length ? state.tasks[state.tasks.length - 1].taskId : null, ...LOCAL_ONLY });
   }
 
   if (name === 'agentrelay_task_get') {
     const taskId = typeof args.taskId === 'string' ? args.taskId : '';
     const task = state.tasks.find((item) => item.taskId === taskId) || null;
-    return { content: [{ type: 'text', text: JSON.stringify({ found: Boolean(task), task }) }],
-      isError: false };
+    return text({ found: Boolean(task), task, ...LOCAL_ONLY });
   }
 
-  return { content: [{ type: 'text', text: JSON.stringify({ error: 'unknown_tool:' + name }) }], isError: true };
+  if (name === 'agentrelay_submit') {
+    const goal = typeof args.goal === 'string' ? args.goal.trim() : '';
+    const key = typeof args.idempotencyKey === 'string' ? args.idempotencyKey.trim() : '';
+    if (!goal || !key) return fail('goal_and_idempotencyKey_required');
+    if (key.length > 200) return fail('idempotencyKey_too_long');
+    const providerSessionId = typeof args.providerSessionId === 'string' ? args.providerSessionId : null;
+
+    const seen = state.requests.find((item) => item.key === key);
+    if (seen) {
+      const sameIntent = seen.goal === goal && (seen.providerSessionId || null) === providerSessionId;
+      const task = state.tasks.find((item) => item.taskId === seen.taskId) || null;
+      if (!sameIntent) return fail('idempotency_conflict',
+        { existingTaskId: seen.taskId, reason: 'the same key was used for a different goal or session' });
+      if (!task) return fail('task_pruned_for_key', { taskId: seen.taskId });
+      return text({ taskId: task.taskId, duplicate: true, status: task.status, ...LOCAL_ONLY });
+    }
+
+    const task = { taskId: nextId(), goal, idempotencyKey: key, providerSessionId,
+      status: 'queued', createdAt: Date.now() };
+    state.seq += 1;
+    state.tasks.push(task);
+    state.requests.push({ key, taskId: task.taskId, goal, providerSessionId });
+    if (!prune(state)) {
+      // Undo the insert: refusing is correct, half-applying is not.
+      state.tasks.pop();
+      state.requests.pop();
+      return fail('store_full', { retained: state.tasks.length,
+        reason: 'no finished task may be dropped; finish or clear tasks before submitting more' });
+    }
+    writeState(dir, state);
+    return text({ taskId: task.taskId, duplicate: false, status: task.status, ...LOCAL_ONLY });
+  }
+
+  return fail('unknown_tool', { name });
 }
 
-export function createServer(stateDir) {
+export function createServer(stateDir, options = {}) {
   const dir = resolve(stateDir);
   mkdirSync(dir, { recursive: true });
-  let { state } = readState(dir);
-  // Responses already produced for a request id, so a replayed id is answered identically instead of re-run.
-  const answered = new Map();
-
-  function handle(message) {
-    if (!message || typeof message !== 'object' || message.jsonrpc !== '2.0' || typeof message.method !== 'string') {
-      return { jsonrpc: '2.0', id: message && message.id !== undefined ? message.id : null,
-        error: { code: -32600, message: 'invalid request' } };
-    }
-    const { id, method, params } = message;
-    if (id !== undefined && answered.has(id)) return answered.get(id);
-
-    let response;
-    if (method === 'initialize') {
-      response = { jsonrpc: '2.0', id,
-        result: {
+  const lock = options.lock === false ? { ok: true, code: null, path: null } : acquireLock(dir);
+  const read = readState(dir);
+  return {
+    dir,
+    lock,
+    problem: read.problem,
+    state: () => read.state,
+    handle(message) {
+      if (!message || typeof message !== 'object' || message.jsonrpc !== '2.0'
+          || typeof message.method !== 'string') {
+        return { jsonrpc: '2.0', id: message && message.id !== undefined ? message.id : null,
+          error: { code: -32600, message: 'invalid request' } };
+      }
+      const { id, method, params } = message;
+      if (!lock.ok) {
+        return { jsonrpc: '2.0', id: id === undefined ? null : id,
+          error: { code: -32000, message: 'state dir is held by another writer (pid '
+            + (lock.owner && lock.owner.pid ? lock.owner.pid : '?') + ')' } };
+      }
+      if (method === 'notifications/initialized') return null;
+      if (method === 'initialize') {
+        return { jsonrpc: '2.0', id, result: {
           protocolVersion: PROTOCOL_VERSION,
           capabilities: { tools: { listChanged: false } },
           serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
-          instructions: 'Local AgentRelay state only. The Bridge still carries the live loop.',
+          instructions: 'Local AgentRelay store only: agentrelay_submit queues a task locally and never executes it. '
+            + 'The Bridge still carries the live loop.',
         } };
-    } else if (method === 'notifications/initialized') {
-      return null; // a notification: no response
-    } else if (method === 'tools/list') {
-      response = { jsonrpc: '2.0', id, result: { tools: TOOLS } };
-    } else if (method === 'tools/call') {
-      const name = params && params.name;
-      const args = (params && params.args) || {};
-      const result = callTool(state, name, args);
-      if (name === 'agentrelay_submit' && result.isError === false) writeState(dir, state);
-      response = { jsonrpc: '2.0', id, result };
-    } else {
-      response = { jsonrpc: '2.0', id, error: { code: -32601, message: 'method not found: ' + method } };
-    }
-    if (id !== undefined) answered.set(id, response);
-    return response;
-  }
+      }
+      if (method === 'tools/list') return { jsonrpc: '2.0', id, result: { tools: TOOLS } };
+      if (method !== 'tools/call') {
+        return { jsonrpc: '2.0', id, error: { code: -32601, message: 'method not found: ' + method } };
+      }
 
-  return { handle, dir, state: () => state };
+      const name = params && params.name;
+      // MCP passes tool arguments in `arguments`. `args` is not the field, and accepting it silently is how a
+      // prototype ends up passing its own tests and failing every real client.
+      const args = (params && params.arguments) || {};
+      if (typeof args !== 'object' || Array.isArray(args)) {
+        return { jsonrpc: '2.0', id, result: fail('arguments_must_be_object') };
+      }
+      if (params && params.args !== undefined) {
+        return { jsonrpc: '2.0', id, result: fail('unknown_parameter_args',
+          { hint: 'MCP sends tool arguments in `arguments`, not `args`' }) };
+      }
+      if (read.problem) {
+        // Fail closed: the store cannot be read, so it must not be replaced by a fresh one.
+        return { jsonrpc: '2.0', id, result: fail('state_' + read.problem,
+          { path: read.path, note: 'the file was left untouched; repair or remove it deliberately' }) };
+      }
+      return { jsonrpc: '2.0', id, result: callTool(dir, read.state, name, args) };
+    },
+  };
 }
 
 function main() {
@@ -195,14 +272,20 @@ function main() {
     return;
   }
   const server = createServer(stateDir);
+  if (!server.lock.ok) {
+    process.stderr.write(`refusing to start: ${server.lock.code}\n`);
+    process.exitCode = 3;
+    return;
+  }
+  process.on('exit', () => { if (server.lock.path) releaseLock(server.lock.path); });
   const reader = createInterface({ input: process.stdin });
   reader.on('line', (line) => {
-    const text = line.trim();
-    if (!text) return;
+    const raw = line.trim();
+    if (!raw) return;
     let message;
     try {
-      message = JSON.parse(text);
-    } catch (err) {
+      message = JSON.parse(raw);
+    } catch {
       process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: null,
         error: { code: -32700, message: 'parse error' } }) + '\n');
       return;
@@ -210,9 +293,13 @@ function main() {
     const response = server.handle(message);
     if (response) process.stdout.write(JSON.stringify(response) + '\n');
   });
-  process.stderr.write(`agentrelay-mcp ready (state ${server.dir})\n`);
+  reader.on('close', () => {
+    if (server.lock.path) releaseLock(server.lock.path);
+    process.exit(0);
+  });
+  process.stderr.write(`agentrelay-mcp ${SERVER_VERSION} ready (state ${server.dir})\n`);
 }
 
 const invokedDirectly = process.argv[1]
-  && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
+  && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (invokedDirectly) main();
