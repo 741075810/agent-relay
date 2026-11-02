@@ -10,7 +10,8 @@
 //     host, the page or the production queue.
 
 import { createServer } from 'node:http';
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { acquireLock, releaseLock } from './lock.mjs';
 
@@ -74,14 +75,31 @@ export function appendEvent(state, event) {
 
 function leaseView(lease, now) {
   if (!lease) return null;
-  return { sessionId: lease.sessionId, acquiredAt: lease.acquiredAt,
-    expiresAt: lease.expiresAt, expired: lease.expiresAt <= now };
+  return { leaseId: lease.leaseId || null, sessionId: lease.sessionId, controllerId: lease.controllerId || null,
+    acquiredAt: lease.acquiredAt, expiresAt: lease.expiresAt, expired: lease.expiresAt <= now };
+}
+
+/** Explicit evidence that a requested `since` predates what is still stored. */
+function gapFor(state, since) {
+  const firstSeq = state.events.length ? state.events[0].seq : state.seq + 1;
+  if (since >= firstSeq - 1) return null;
+  return { fromSeq: since + 1, toSeq: firstSeq - 1, dropped: firstSeq - 1 - since };
 }
 
 export function createRelay(config) {
   const dir = resolve(config.stateDir);
   mkdirSync(dir, { recursive: true });
   const lock = acquireLock(dir);
+  // T198: an unforgeable bearer token, created once per state dir and shared with the MCP client through a file the
+  // operator passes explicitly. The value never reaches stdout, stderr, an error body or a log line.
+  const tokenPath = join(dir, 'service.token');
+  let token = typeof config.token === 'string' && config.token ? config.token : null;
+  if (!token && existsSync(tokenPath)) token = readFileSync(tokenPath, 'utf8').trim() || null;
+  if (!token) {
+    token = randomBytes(24).toString('hex');
+    writeFileSync(tokenPath, token + '\n', 'utf8');
+    try { chmodSync(tokenPath, 0o600); } catch { /* best effort on platforms without POSIX modes */ }
+  }
   const loaded = lock.ok ? loadState(dir) : { state: null, problem: 'lock_denied', path: join(dir, STATE_FILE) };
   const state = loaded.state;
   const waiters = new Set();
@@ -151,21 +169,37 @@ export function createRelay(config) {
 
     'POST /lease': (body) => {
       const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
+      const controllerId = typeof body.controllerId === 'string' ? body.controllerId.trim() : '';
       const ttlMs = Number.isFinite(body.ttlMs) ? Math.min(Math.max(body.ttlMs, 1000), 600000) : 60000;
       if (!sessionId) return { status: 400, body: { error: 'sessionId_required' } };
+      // T198: a session id is a name two controllers can both type. The lease is held by a controller, identified
+      // separately, and handed back as a handle that renewal and release must present.
+      if (!controllerId) return { status: 400, body: { error: 'controllerId_required' } };
       const current = state.lease;
-      if (current && current.sessionId !== sessionId && current.expiresAt > now()) {
-        return { status: 409, body: { error: 'lease_held', holder: current.sessionId,
-          expiresAt: current.expiresAt } };
+      if (current && current.expiresAt > now()) {
+        const sameController = current.controllerId === controllerId
+          && current.sessionId === sessionId
+          && (!body.leaseId || body.leaseId === current.leaseId);
+        if (!sameController) {
+          return { status: 409, body: { error: 'lease_held', holder: current.controllerId,
+            sessionId: current.sessionId, expiresAt: current.expiresAt } };
+        }
+        state.lease = { ...current, expiresAt: now() + ttlMs };
+        persist();
+        return { status: 200, body: { lease: leaseView(state.lease, now()), renewed: true } };
       }
-      state.lease = { sessionId, acquiredAt: now(), expiresAt: now() + ttlMs };
+      state.lease = { leaseId: 'lease-' + randomBytes(8).toString('hex'), sessionId, controllerId,
+        acquiredAt: now(), expiresAt: now() + ttlMs };
       persist();
-      return { status: 200, body: { lease: leaseView(state.lease, now()) } };
+      return { status: 200, body: { lease: leaseView(state.lease, now()), renewed: false } };
     },
 
     'POST /lease/release': (body) => {
       const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
-      if (!state.lease || state.lease.sessionId !== sessionId) {
+      const controllerId = typeof body.controllerId === 'string' ? body.controllerId.trim() : '';
+      const current = state.lease;
+      if (!current || current.sessionId !== sessionId || current.controllerId !== controllerId
+          || (body.leaseId && body.leaseId !== current.leaseId)) {
         return { status: 409, body: { error: 'not_lease_holder' } };
       }
       state.lease = null;
@@ -180,6 +214,10 @@ export function createRelay(config) {
       res.writeHead(status, { 'content-type': 'application/json' });
       res.end(JSON.stringify(body));
     };
+    if (!authorised(req)) {
+      // No body detail and no hint about the token: an unknown caller learns only that it is unknown.
+      return send(401, { error: 'unauthorized' });
+    }
     if (!state) return send(503, { error: 'state_' + loaded.problem, path: loaded.path,
       note: 'the file was left untouched' });
 
@@ -187,15 +225,16 @@ export function createRelay(config) {
       const since = Number(url.searchParams.get('since') || 0);
       const limit = Math.min(Math.max(Number(url.searchParams.get('limit') || 100), 1), 500);
       const events = state.events.filter((event) => event.seq > since).slice(0, limit);
-      return send(200, { events, more: events.length === limit, seq: state.seq, simulated: true, ...DSH_UNAVAILABLE });
+      return send(200, { events, more: events.length === limit, seq: state.seq, gap: gapFor(state, since),
+        simulated: true, ...DSH_UNAVAILABLE });
     }
     if (req.method === 'GET' && url.pathname === '/events/wait') {
       const since = Number(url.searchParams.get('since') || 0);
       const limit = Math.min(Math.max(Number(url.searchParams.get('limit') || 50), 1), 200);
       const timeoutMs = Math.min(Math.max(Number(url.searchParams.get('timeoutMs') || 1000), 0), 10000);
       const waited = await waitForEvents(since, timeoutMs, limit);
-      return send(200, { events: waited.events, more: waited.more, seq: state.seq, simulated: true,
-        ...DSH_UNAVAILABLE });
+      return send(200, { events: waited.events, more: waited.more, seq: state.seq, gap: gapFor(state, since),
+        simulated: true, ...DSH_UNAVAILABLE });
     }
     if (req.method === 'GET' && url.pathname === '/tasks/get') {
       const taskId = url.searchParams.get('taskId') || '';
@@ -219,8 +258,14 @@ export function createRelay(config) {
     return send(result.status, result.body);
   });
 
+  const authorised = (req) => {
+    const header = req.headers.authorization || '';
+    if (!header.startsWith('Bearer ')) return false;
+    return header.slice(7) === token;
+  };
+
   return {
-    server, dir, lock, state: () => state,
+    server, dir, lock, tokenPath, state: () => state,
     async listen(port) {
       await new Promise((resolveListen, rejectListen) => {
         server.once('error', rejectListen);
@@ -259,7 +304,9 @@ async function main() {
     return;
   }
   const port = await relay.listen(Number(value('--port') || 0));
-  process.stdout.write(JSON.stringify({ ready: true, port, base: 'http://127.0.0.1:' + port }) + '\n');
+  // The token file path only: the secret itself is never written to a stream.
+  process.stdout.write(JSON.stringify({ ready: true, port, base: 'http://127.0.0.1:' + port,
+    tokenFile: relay.tokenPath }) + '\n');
   const stop = () => relay.close().then(() => process.exit(0));
   process.on('SIGINT', stop);
   process.on('SIGTERM', stop);

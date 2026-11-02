@@ -11,6 +11,14 @@ import { createInterface } from 'node:readline';
 const SERVICE = path.join(process.cwd(), 'tools', 'service', 'relay_service.mjs');
 const MCP = path.join(process.cwd(), 'tools', 'mcp', 'agentrelay_mcp.mjs');
 const tempDir = () => mkdtempSync(path.join(tmpdir(), 'agentrelay-svc-'));
+// T198: every request must carry the bearer token the service wrote into its state dir.
+const TOKENS = new Map();
+async function afetch(url, opts = {}) {
+  const base = new URL(url).origin;
+  const token = TOKENS.get(base);
+  return fetch(url, { ...opts, headers: { ...(opts.headers || {}),
+    ...(token ? { authorization: 'Bearer ' + token } : {}) } });
+}
 
 /** Start the service and wait for its ready line, which carries the chosen port. */
 async function startService(stateDir) {
@@ -25,8 +33,9 @@ async function startService(stateDir) {
     });
     child.once('exit', (code) => { clearTimeout(timer); reject(new Error('service exited ' + code + ': ' + stderr)); });
   });
+  TOKENS.set(ready.base, readFileSync(ready.tokenFile, 'utf8').trim());
   return {
-    child, base: ready.base, port: ready.port,
+    child, base: ready.base, port: ready.port, tokenFile: ready.tokenFile,
     get stderr() { return stderr; },
     async stop() {
       await new Promise((resolve) => {
@@ -38,9 +47,10 @@ async function startService(stateDir) {
   };
 }
 
-async function mcp(stateDir, serviceUrl) {
+async function mcp(stateDir, serviceUrl, tokenFile) {
   const args = [MCP, '--state-dir', stateDir];
   if (serviceUrl) args.push('--service-url', serviceUrl);
+  if (tokenFile) args.push('--service-token-file', tokenFile);
   const child = spawn(process.execPath, args, { stdio: ['pipe', 'pipe', 'pipe'] });
   const pending = new Map();
   let nextId = 1;
@@ -75,7 +85,7 @@ async function mcp(stateDir, serviceUrl) {
 
 const body = (response) => JSON.parse(response.result.content[0].text);
 const get = async (url) => {
-  const response = await fetch(url);
+  const response = await afetch(url);
   return { status: response.status, body: await response.json() };
 };
 
@@ -102,7 +112,7 @@ test('T197: tasks and events persist, and survive a service restart', async () =
   let taskId;
   let seqAfter;
   try {
-    const created = await fetch(first.base + '/tasks', { method: 'POST',
+    const created = await afetch(first.base + '/tasks', { method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ goal: 'persist me', clientKey: 'k-1', sessionId: 'session-test' }) });
     const payload = await created.json();
@@ -137,7 +147,7 @@ test('T197: a repeated eventId is stored once, across restarts', async () => {
   const dir = tempDir();
   const first = await startService(dir);
   try {
-    const post = (eventId) => fetch(first.base + '/events', { method: 'POST',
+    const post = (eventId) => afetch(first.base + '/events', { method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ eventId, type: 'task_completed' }) }).then((r) => r.json());
     const a = await post('evt-1');
@@ -150,7 +160,7 @@ test('T197: a repeated eventId is stored once, across restarts', async () => {
   }
   const second = await startService(dir);
   try {
-    const again = await fetch(second.base + '/events', { method: 'POST',
+    const again = await afetch(second.base + '/events', { method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ eventId: 'evt-1', type: 'task_completed' }) }).then((r) => r.json());
     assert.equal(again.duplicate, true, 'a restarted writer does not re-append');
@@ -171,7 +181,7 @@ test('T197: a bounded wait returns promptly on a new event, and times out empty'
 
     const waiting = get(service.base + '/events/wait?since=0&timeoutMs=5000');
     await new Promise((r) => setTimeout(r, 100));
-    await fetch(service.base + '/events', { method: 'POST', headers: { 'content-type': 'application/json' },
+    await afetch(service.base + '/events', { method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ eventId: 'evt-live', type: 'task_completed' }) });
     const woke = await waiting;
     assert.equal(woke.body.events.length, 1, 'the waiter was woken by the append');
@@ -185,29 +195,31 @@ test('T197: a bounded wait returns promptly on a new event, and times out empty'
 test('T197: one control lease per session, with contention and handover', async () => {
   const dir = tempDir();
   const service = await startService(dir);
-  const lease = (sessionId, ttlMs = 60000) => fetch(service.base + '/lease', { method: 'POST',
+  const lease = (sessionId, controllerId, ttlMs = 60000) => afetch(service.base + '/lease', { method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ sessionId, ttlMs }) }).then(async (r) => ({ status: r.status, body: await r.json() }));
+    body: JSON.stringify({ sessionId, controllerId, ttlMs }) }).then(async (r) => ({ status: r.status, body: await r.json() }));
   try {
-    const a = await lease('session-a');
+    const a = await lease('session-a', 'ctl-a');
     assert.equal(a.status, 200);
     assert.equal(a.body.lease.sessionId, 'session-a');
 
-    const b = await lease('session-b');
+    const b = await lease('session-b', 'ctl-b');
     assert.equal(b.status, 409);
     assert.equal(b.body.error, 'lease_held');
-    assert.equal(b.body.holder, 'session-a');
+    assert.equal(b.body.holder, 'ctl-a', 'the holder is a controller, not just a session name');
 
-    const renew = await lease('session-a');
+    const renew = await lease('session-a', 'ctl-a');
     assert.equal(renew.status, 200, 'the holder may renew');
 
-    const wrongRelease = await fetch(service.base + '/lease/release', { method: 'POST',
-      headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId: 'session-b' }) });
+    const wrongRelease = await afetch(service.base + '/lease/release', { method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: 'session-b', controllerId: 'ctl-b' }) });
     assert.equal(wrongRelease.status, 409, 'a non-holder cannot release');
 
-    await fetch(service.base + '/lease/release', { method: 'POST',
-      headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId: 'session-a' }) });
-    const taken = await lease('session-b');
+    await afetch(service.base + '/lease/release', { method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: 'session-a', controllerId: 'ctl-a' }) });
+    const taken = await lease('session-b', 'ctl-b');
     assert.equal(taken.status, 200, 'after release the lease can change hands');
   } finally {
     await service.stop();
@@ -219,8 +231,8 @@ test('T197: an expired lease can be taken by another session', async () => {
   const dir = tempDir();
   const service = await startService(dir);
   try {
-    await fetch(service.base + '/lease', { method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ sessionId: 'session-a', ttlMs: 1000 }) });
+    await afetch(service.base + '/lease', { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: 'session-a', controllerId: 'ctl-a', ttlMs: 1000 }) });
     const storePath = path.join(dir, 'relay.json');
     const store = JSON.parse(readFileSync(storePath, 'utf8'));
     store.lease.expiresAt = Date.now() - 1;
@@ -229,9 +241,9 @@ test('T197: an expired lease can be taken by another session', async () => {
     await service.stop();
     const second = await startService(dir);
     try {
-      const taken = await fetch(second.base + '/lease', { method: 'POST',
+      const taken = await afetch(second.base + '/lease', { method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ sessionId: 'session-b' }) }).then((r) => r.json());
+        body: JSON.stringify({ sessionId: 'session-b', controllerId: 'ctl-b' }) }).then((r) => r.json());
       assert.equal(taken.lease.sessionId, 'session-b');
     } finally {
       await second.stop();
@@ -244,7 +256,7 @@ test('T197: an expired lease can be taken by another session', async () => {
 test('T197: the MCP server reads the running service through relay_* tools', async () => {
   const dir = tempDir();
   const service = await startService(dir);
-  const client = await mcp(tempDir(), service.base);
+  const client = await mcp(tempDir(), service.base, service.tokenFile);
   try {
     const tools = (await client.ask('tools/list', {})).result.tools.map((t) => t.name);
     for (const name of ['relay_status', 'relay_task_get', 'relay_events']) {
@@ -256,7 +268,7 @@ test('T197: the MCP server reads the running service through relay_* tools', asy
     assert.equal(status.simulated, true);
     assert.equal(status.dsh, 'unavailable');
 
-    await fetch(service.base + '/tasks', { method: 'POST', headers: { 'content-type': 'application/json' },
+    await afetch(service.base + '/tasks', { method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ goal: 'via mcp', clientKey: 'k-mcp', sessionId: 'session-test' }) });
 
     const events = body(await client.call('relay_events', { since: 0 }));
@@ -285,11 +297,12 @@ test('T197: without a service the relay tools say service_unavailable, never a g
 });
 
 test('T197: an unreachable service URL is reported, not swallowed', async () => {
-  const client = await mcp(tempDir(), 'http://127.0.0.1:1');
+  const client = await mcp(tempDir(), 'http://127.0.0.1:1', path.join(tempDir(), 'missing.token'));
   try {
     const response = await client.call('relay_events', { since: 0 });
     assert.equal(response.result.isError, true);
-    assert.equal(body(response).error, 'service_unreachable');
+    // T198: without a readable token file the client refuses before it dials anything.
+    assert.equal(body(response).error, 'service_token_unreadable');
   } finally {
     await client.stop();
   }

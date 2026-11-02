@@ -22,7 +22,7 @@ import { fileURLToPath } from 'node:url';
 
 export const PROTOCOL_VERSION = '2024-11-05';
 export const SERVER_NAME = 'agentrelay-mcp';
-export const SERVER_VERSION = '0.3.0';
+export const SERVER_VERSION = '0.4.0';
 const STATE_FILE = 'tasks.json';
 const LOCK_FILE = 'writer.lock';
 const MAX_TASKS_RETAINED = 200;
@@ -144,8 +144,11 @@ function prune(state) {
 
 const RELAY_TOOLS = ['relay_status', 'relay_task_get', 'relay_events'];
 
-/** Call the local service. Any failure is said out loud -- the tool never falls back to the local store. */
-async function callRelay(serviceUrl, name, args) {
+/**
+ * Call the local service. Any failure is said out loud -- the tool never falls back to the local store. The bearer
+ * token comes from a file the operator names, is read per call, and is never echoed in a result or an error.
+ */
+async function callRelay(serviceUrl, tokenFile, name, args) {
   if (!serviceUrl) return fail('service_unavailable', { reason: 'start the service and pass --service-url' });
   const base = serviceUrl.replace(/\/+$/, '');
   const target = name === 'relay_status' ? base + '/health'
@@ -153,8 +156,19 @@ async function callRelay(serviceUrl, name, args) {
       : base + '/events' + (Number.isFinite(args.timeoutMs)
         ? '/wait?timeoutMs=' + args.timeoutMs + '&since=' : '?since=') + Number(args.since || 0)
         + (Number.isFinite(args.limit) ? '&limit=' + args.limit : '');
+  let token = '';
+  if (tokenFile) {
+    try {
+      token = readFileSync(tokenFile, 'utf8').trim();
+    } catch (err) {
+      return fail('service_token_unreadable', { tokenFile });
+    }
+  }
+  if (!token) return fail('service_token_missing', { tokenFile: tokenFile || null });
   try {
-    const response = await fetch(target, { method: 'GET', signal: AbortSignal.timeout(15000) });
+    const response = await fetch(target, { method: 'GET', signal: AbortSignal.timeout(15000),
+      headers: { authorization: 'Bearer ' + token } });
+    if (response.status === 401) return fail('service_unauthorized', { url: target });
     const payload = await response.json();
     return { content: [{ type: 'text', text: JSON.stringify({ status: response.status, ...payload,
       simulated: true, dsh: 'unavailable' }, null, 2) }], isError: response.status >= 400 };
@@ -217,6 +231,7 @@ function callTool(dir, state, name, args) {
 
 export function createServer(stateDir, options = {}) {
   const serviceUrl = options.serviceUrl || process.env.AGENTRELAY_SERVICE_URL || '';
+  const tokenFile = options.serviceTokenFile || process.env.AGENTRELAY_SERVICE_TOKEN_FILE || '';
   const dir = resolve(stateDir);
   mkdirSync(dir, { recursive: true });
   const lock = options.lock === false ? { ok: true, code: null, token: null, path: null } : acquireLock(dir);
@@ -271,7 +286,7 @@ export function createServer(stateDir, options = {}) {
           { path: read.path, note: 'the file was left untouched; repair or remove it deliberately' }) };
       }
       if (RELAY_TOOLS.includes(name)) {
-        return Promise.resolve(callRelay(serviceUrl, name, args))
+        return Promise.resolve(callRelay(serviceUrl, tokenFile, name, args))
           .then((result) => ({ jsonrpc: '2.0', id, result }));
       }
       return { jsonrpc: '2.0', id, result: callTool(dir, read.state, name, args) };
@@ -291,7 +306,10 @@ function main() {
   const serviceAt = argv.indexOf('--service-url');
   const serviceUrl = (serviceAt >= 0 ? argv[serviceAt + 1] : undefined)
     || process.env.AGENTRELAY_SERVICE_URL || '';
-  const server = createServer(stateDir, { serviceUrl });
+  const tokenAt = argv.indexOf('--service-token-file');
+  const serviceTokenFile = (tokenAt >= 0 ? argv[tokenAt + 1] : undefined)
+    || process.env.AGENTRELAY_SERVICE_TOKEN_FILE || '';
+  const server = createServer(stateDir, { serviceUrl, serviceTokenFile });
   if (!server.lock.ok) {
     process.stderr.write(`refusing to start: ${server.lock.code}\n`);
     process.exitCode = 3;
