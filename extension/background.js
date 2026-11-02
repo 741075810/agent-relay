@@ -16,7 +16,8 @@
 // "instant" would be false.
 
 import { NativeClient } from './lib/native_client.js';
-import { readLatest as readLatestDiagnostic, recordDelivery } from './lib/diagnostic_store.js';
+import { readLatest as readLatestDiagnostic, readRunHistory, recordDelivery, recordStage }
+  from './lib/diagnostic_store.js';
 import { QueueDelivery } from './lib/queue_delivery.js';
 import {
   classifyTab,
@@ -807,13 +808,41 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         } else {
           sendResponse({ ok: true, result: await readLatestDiagnostic(chrome.storage.local) });
         }
+      } else if (msg && msg.type === 't188-run-history') {
+        // T188: popup-only and read-only. No poll, no send, no ACK, no navigation -- and no page access.
+        if (sender.id !== chrome.runtime.id ||
+            sender.url !== chrome.runtime.getURL('popup.html') || sender.tab) {
+          sendResponse({ ok: false, error: 'extension_popup_required' });
+        } else {
+          sendResponse({
+            ok: true,
+            result: await readRunHistory(chrome.storage.local, { runId: msg.runId }),
+          });
+        }
       } else if (msg && msg.type === 't173-record-delivery') {
         // The runtime entry for the store: a send path holding a `deliverInto`-shaped result posts it
         // here and nothing else. Content scripts are refused -- the outcome names page facts.
         if (sender.id !== chrome.runtime.id || sender.tab) {
           sendResponse({ ok: false, error: 'extension_worker_required' });
         } else {
-          sendResponse({ ok: true, result: await recordDelivery(chrome.storage.local, msg.input || {}) });
+          const stored = await recordDelivery(chrome.storage.local, msg.input || {});
+          // T188: the same facts per run, so a later "which run owed this notice?" has an answer. The
+          // acknowledgement is recorded where it is actually known -- here -- and nowhere else.
+          const runId = msg.input && msg.input.request && msg.input.request.runId;
+          if (typeof runId === 'string' && runId) {
+            void recordStage(chrome.storage.local, {
+              runId, stage: 'adapter_result', status: stored && stored.fields && stored.fields.status,
+              reason: stored && stored.fields && stored.fields.reason,
+              classification: stored && stored.classification,
+              clickPerformed: stored && stored.fields && stored.fields.clickPerformed,
+              composerWritten: stored && stored.fields && stored.fields.composerWritten,
+              visibilityState: stored && stored.fields && stored.fields.visibilityState,
+              hasFocus: stored && stored.fields && stored.fields.hasFocus,
+              receiptPath: stored && stored.fields && stored.fields.receiptPath,
+              acked: msg.input && msg.input.acked === true,
+            });
+          }
+          sendResponse({ ok: true, result: stored });
         }
       } else if (msg && msg.type === 't074-chain-evidence') {
         // Same boundary again: this reports where a specific completion got to,

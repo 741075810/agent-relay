@@ -84,6 +84,13 @@ export function createChromeAutoSend(chromeApi, deps) {
     // (`autosend_controller.js`: `status: 'unconfirmed'`, `reason: 'adapter_error:' + message`), so
     // settle / ambiguous / single-shot semantics do not move, and no second message is ever sent.
     let reply;
+    // T188: the attempt is recorded before the message leaves the worker, so a run whose tab closes mid-flight
+    // still leaves a row ("attempted, no result") instead of vanishing. Unawaited, like every other diagnostic.
+    void noteStage('send_attempted', {
+      status: 'attempted',
+      deliveryMode: deliveryMode === 'background' ? 'background' : 'foreground',
+      conversationMatched: Boolean(binding && binding.conversationId),
+    }, candidate);
     try {
       reply = await chromeApi.tabs.sendMessage(binding.tabId, {
         type: 't058-write-notice', runId: candidate.runId, status: candidate.status,
@@ -138,6 +145,22 @@ export function createChromeAutoSend(chromeApi, deps) {
     return diagnosticStore || null;
   }
 
+  /**
+   * Record one stage for one run. Best-effort and unawaited: it runs after the value the caller needs has
+   * already been produced, so no diagnostic problem can delay, retry or duplicate a send.
+   */
+  async function noteStage(stage, fields, candidate) {
+    try {
+      const store = await loadDiagnosticStore();
+      if (!store || typeof store.recordStage !== 'function') return;
+      const runId = candidate && typeof candidate.runId === 'string' ? candidate.runId : null;
+      if (!runId) return;
+      await store.recordStage(chromeApi.storage.local, Object.assign({ runId, stage }, fields || {}));
+    } catch (err) {
+      // Deliberately silent: the history says "unknown" when nothing was recorded.
+    }
+  }
+
   /** Store the outcome for the popup. Never throws, never changes what was returned to the caller. */
   async function noteDelivery(result, candidate, deliveryMode) {
     try {
@@ -152,6 +175,23 @@ export function createChromeAutoSend(chromeApi, deps) {
         },
         observation: {},
       });
+      // T188: the same normalised facts, filed under the run. Only values the adapter actually returned are
+      // copied; anything it did not return stays absent, which the reader reports as unknown.
+      const seen = result && result.evidence ? result.evidence : {};
+      if (typeof store.recordStage === 'function') {
+        await store.recordStage(chromeApi.storage.local, {
+          runId: candidate && candidate.runId ? candidate.runId : null,
+          stage: 'adapter_result',
+          status: result && result.status,
+          reason: result && result.reason,
+          clickPerformed: result && result.clickPerformed,
+          composerWritten: result && result.composerWritten,
+          deliveryMode: deliveryMode === 'background' ? 'background' : 'foreground',
+          visibilityState: seen.visibilityState,
+          hasFocus: seen.hasFocus,
+          receiptPath: result && result.receiptPath,
+        });
+      }
     } catch (err) {
       // A diagnostic that cannot be written must cost nothing else. Deliberately silent: the popup
       // already shows `no_diagnostic_recorded` when there is nothing to read.

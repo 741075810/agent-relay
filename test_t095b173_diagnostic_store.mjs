@@ -116,7 +116,12 @@ test('T173: a stored record cannot smuggle text or receipt bodies', async () => 
 
 test('T173: the worker exposes the store on real messages, popup-only for reading', () => {
   const bg = readFileSync(path.join(EXT, 'background.js'), 'utf8');
-  assert.match(bg, /import \{ readLatest as readLatestDiagnostic, recordDelivery \} from '\.\/lib\/diagnostic_store\.js'/);
+  // T188 widened this import with the per-run history helpers; the binding is what matters, not the
+  // exact list, so the assertion checks every name it needs is imported from that module.
+  for (const name of ['readLatest as readLatestDiagnostic', 'recordDelivery']) {
+    assert.ok(bg.includes(name), name + ' is imported');
+  }
+  assert.match(bg, /from '\.\/lib\/diagnostic_store\.js'/);
   const readIdx = bg.indexOf("msg.type === 't166-diagnostic'");
   assert.ok(readIdx > 0);
   const readBlock = bg.slice(readIdx, bg.indexOf("msg.type === 't173-record-delivery'"));

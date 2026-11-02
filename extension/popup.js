@@ -1438,6 +1438,16 @@ if (chainEls.run) {
     } catch (err) {
       chainEls.detail.textContent += '\nlast notice: diagnostic unreadable (' + (err && err.message) + ')';
     }
+    // T188: the recent runs, by full runId, so a notice that never arrived can be traced to the run that owed
+    // it. Read-only: one message, one render, no polling, no send, no navigation.
+    try {
+      const hist = await ask({ type: 't188-run-history' });
+      if (hist && hist.ok && hist.result && typeof window.runHistoryLines === 'function') {
+        chainEls.detail.textContent += '\n' + window.runHistoryLines(hist.result).join('\n');
+      }
+    } catch (err) {
+      chainEls.detail.textContent += '\nrecent runs: unreadable (' + (err && err.message) + ')';
+    }
     // Added to the same panel: one extra line, no new button, no new interaction.
     try {
       const ready = await ask({ type: 't069-canary-readiness' });
