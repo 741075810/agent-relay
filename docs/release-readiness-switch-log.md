@@ -106,8 +106,11 @@ work the operator never agreed to be interrupted about. The two things left are 
 
 1. **Reload once more** at `chrome://extensions` — puts the new launcher into the live path (and is harmless if the port
    has already been released).
-2. **Press Arm in the popup** — writes the snapshot with `armTakenAtMs` and `relayCovered: true`, which is the only thing
-   that makes a relay-only completion eligible to be announced.
+2. **Press Arm in the popup** — writes the snapshot with `armTakenAtMs` and `relayCovered: true`. Arming is necessary
+   but it is *not* sufficient, which this file said wrongly until T224: a relay candidate is announced only if it also
+   carries a trustworthy post-arm completion instant (`relay_merge.completion_source_ok`), is not already in the host's
+   journals (`relay_merge.history`), and is not already in the native answer for the same sample
+   (`relay_merge.merge`, whose `taken` set drops a run the native path is offering).
 
 ## 9. Acceptance items
 
@@ -134,3 +137,32 @@ work the operator never agreed to be interrupted about. The two things left are 
 
 Backups: `217-backup-20261103-153213` (43 entries, pre-upgrade) and `219-backup-20261103-191632` (48 entries, post-reload,
 restore rehearsed: 0 problems).
+
+## 11. T224: what the relay has actually delivered (read-only, 2026-11-04 00:52)
+
+Four sources, no writes, no test message:
+
+| source | observation |
+|---|---|
+| relay service record | 79 runs, every `completedAtSource` a `bridge.task_events.*` row; `hostAck` acked 4 / unseen 4 in the last eight; `pageDelivery` `unknown` on all 79 |
+| host sample state | `relayActivatedAt` 1793705573054, `relayActivation: active`, `relayBaselineIds` 75, **`relayOfferedIds` 0**, `relayDeferredIds` 0, `ackedIds` 513 |
+| extension journal | `"origin":"bridge"` 4 953 times, **`"origin":"relay"` 0**, `relayOffered` 0 |
+| Bridge | terminal events 22:08:38 (T220), 23:08:56 (T221), 00:00:29 (T222), 00:48:54 (T223) — all native |
+
+Conclusion: **no relay-only candidate has ever been consumed.** Every notice so far came down the native ledger path,
+including the four natural completions after the relay went live. The relay has functioned as a mirror and a redundancy
+check, not as a second delivery channel.
+
+Why: both sides read the same Bridge ledger. The host computes the native answer first from it, and `merge()` drops a
+relay candidate whose run id the native answer already carries, so the native path wins the race by construction. A
+relay-only notice needs the relay to see a run the host's native sample did not — same database, sub-second window, or a
+native read failure — and in the latter case the host reports the ledger as unreadable instead of falling back.
+
+What a single human acceptance step can establish, and what it cannot:
+
+* **Can**: leave the existing arm and auto-send opt-in as they are (valid until 2026-11-10 21:57:10) and let one more
+  natural task finish; afterwards the extension journal answers the question directly — a `"source":"relay"` entry with
+  `postArmEvidence: relay_completed_at` and the operator having seen the notice.
+* **Cannot**: force the race from outside. Making the native sample miss a run means editing the Bridge database or
+  injecting an event, both prohibited (synthetic completion), and racing two samplers is not deterministic. So the
+  attribution stays `unknown` until it happens on its own.
