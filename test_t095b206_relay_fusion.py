@@ -77,6 +77,9 @@ class RelayScene(unittest.TestCase):
         self.token_file = ready['tokenFile']
 
     def seed_relay(self, candidates):
+        # A relay candidate with no start time cannot be proven newer than the activation instant, so the host absorbs
+        # it rather than announcing it. These fixtures describe runs that finished after activation, and say so.
+        candidates = [dict(item, startedAt=item.get('startedAt', 4000000000000)) for item in candidates]
         token = open(self.token_file, encoding='utf-8').read().strip()
         import urllib.request
         body = json.dumps({'candidates': candidates}).encode('utf-8')

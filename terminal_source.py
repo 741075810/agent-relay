@@ -889,26 +889,71 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
     # the relay's ACKs live in their own journal (see `relay_merge` and `acknowledge`).
     relay_candidates, relay_code = relay_merge.fetch(relay_source)
     relay_absorbed = 0
-    if relay_candidates:
-        if info['baselineEstablished']:
-            # The first sample of a fresh state records history and announces nothing -- the same rule the native side
-            # follows. Without this, enabling the relay would replay every run that had already finished before anyone
-            # consented, which is the very notice the one inviolable rule forbids.
-            next_state['relayBaselineIds'] = relay_merge.absorb(relay_candidates, MAX_STATE_IDS)
-            relay_absorbed = len(next_state['relayBaselineIds'])
-            save_state(state_dir, next_state)
+    relay_unverified = 0
+    relay_activation = next_state.get('relayActivation')
+    if relay_source:
+        # The relay is an optional source that can arrive long after the native one, so it keeps an activation of its
+        # own: an instant, recorded once, plus the ids proven to be older than it. Borrowing the native
+        # `baselineEstablished` moment meant a relay enabled months later announced everything it could see.
+        if relay_code is not None:
+            # A failure says nothing about the relay's contents. Leave the activation untouched, so a later successful
+            # read still gets to absorb history rather than finding an "initialised" empty one.
+            relay_activation = relay_activation or 'unknown'
+        elif relay_activation == 'stalled':
+            relay_code = 'relay_history_overflow'
         else:
-            due = relay_merge.merge(due, relay_candidates, next_state)
-            # What was actually offered is what a later ACK may name. Recording an id that was never handed out would
-            # let an ACK swallow a run nobody has seen yet, and its real completion would never be announced.
-            offered = list(next_state.get('relayOfferedIds') or [])
-            for item in due:
-                if item.get('source') == relay_merge.RELAY_SOURCE:
-                    key = item['runId'] + '|' + item['status']
-                    if key not in offered:
-                        offered.append(key)
-            next_state['relayOfferedIds'] = offered[-MAX_STATE_IDS:]
-            save_state(state_dir, next_state)
+            activated_at = next_state.get('relayActivatedAt')
+            if activated_at is None:
+                activated_at = int(time.time() * 1000)
+            arm_ids_now = set(arm['ids']) if arm is not None else None
+            existing = list(next_state.get('relayBaselineIds') or [])
+            history_ids = []
+            for item in relay_candidates:
+                if arm_ids_now is not None:
+                    # The arm snapshot is the consent proof: what it already contained is history, what it did not
+                    # finished afterwards and must not be swallowed.
+                    if item['runId'] in arm_ids_now:
+                        history_ids.append(item['runId'])
+                    continue
+                stamp = relay_merge.started_ms(item.get('startedAt'))
+                if stamp is None:
+                    # No start time means no way to prove this is new. Refusing to announce is the safe half; the count
+                    # is reported so the refusal is not silent.
+                    history_ids.append(item['runId'])
+                    relay_unverified += 1
+                elif stamp < activated_at:
+                    history_ids.append(item['runId'])
+            merged_history = list(dict.fromkeys(existing + history_ids))
+            if len(merged_history) > MAX_STATE_IDS:
+                # Never keep a truncated baseline: the remainder would be offered on a later sample, which is exactly
+                # the false notice this is here to prevent. Named, and it stays refused.
+                relay_activation = 'stalled'
+                relay_code = 'relay_history_overflow'
+            else:
+                relay_activation = 'active'
+                relay_absorbed = len([run_id for run_id in history_ids if run_id not in existing])
+                next_state['relayBaselineIds'] = merged_history
+                next_state['relayActivatedAt'] = activated_at
+                due = relay_merge.merge(due, relay_candidates, next_state)
+                # The consent fact travels with the candidate, or the extension cannot tell a run that finished after
+                # the arm from one that was already terminal when the operator consented.
+                for item in due:
+                    if item.get('source') != relay_merge.RELAY_SOURCE or 'postArm' in item:
+                        continue
+                    item['postArm'] = None if arm_ids_now is None else item['runId'] not in arm_ids_now
+                # What was actually offered is what a later ACK may name: journalling an unoffered id would let an ACK
+                # swallow a run nobody has seen yet, and its real completion would never be announced.
+                offered = list(next_state.get('relayOfferedIds') or [])
+                for item in due:
+                    if item.get('source') == relay_merge.RELAY_SOURCE:
+                        key = item['runId'] + '|' + item['status']
+                        if key not in offered:
+                            offered.append(key)
+                next_state['relayOfferedIds'] = offered[-MAX_STATE_IDS:]
+        if relay_activation != next_state.get('relayActivation'):
+            next_state['relayActivation'] = relay_activation
+        save_state(state_dir, next_state)
+
     return {
         'ok': True,
         'code': None,
@@ -921,6 +966,13 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
         # Counted, not listed: "the relay had history at the moment this was enabled" and "the relay had nothing" must
         # not look the same, and the ids themselves are already in the state file.
         'relayAbsorbed': relay_absorbed,
+        # `unknown` -- never successfully read; `active` -- history absorbed once, new runs announceable;
+        # `stalled` -- too much history to absorb safely, so nothing from this source is announced and the reason is
+        # `relayCode`. A caller must not read `stalled` as "nothing finished".
+        'relayActivation': relay_activation,
+        # Candidates the relay reported without a usable start time and no arm snapshot to compare against. They are
+        # absorbed rather than announced, and counted here so the refusal has a reason attached to it.
+        'relayUnverified': relay_unverified,
         'confirmed': False,
         'requiresAck': True,
         'redelivered': info['redelivered'],

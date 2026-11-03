@@ -70,7 +70,7 @@ async function relayThink(world, service) {
   const response = await fetch(service.base + '/host/terminal-candidates', {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: 'Bearer ' + token },
-    body: JSON.stringify({ candidates: [{ runId: RELAY_RUN, terminalStatus: 'completed',
+    body: JSON.stringify({ candidates: [{ runId: RELAY_RUN, terminalStatus: 'completed', startedAt: 4000000000000,
       hostSource: 'native_host.terminal-mirror', statusSource: 'bridge_ledger.status', origin: 'bridge' }] }),
   });
   return response.json();

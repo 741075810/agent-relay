@@ -22,7 +22,9 @@ LATE_RUN = 'ffffffff-1111-4222-8333-444455556666'
 class HistoryIsNotNews(RelayScene):
 
     def relay_candidate(self, run_id, status='completed', origin='bridge'):
-        return {'runId': run_id, 'terminalStatus': status,
+        # Old runs carry a start time before any activation; LATE_RUN one far after it. The boundary is in the data.
+        stamp = 4000000000000 if run_id == LATE_RUN else 1700000000000
+        return {'runId': run_id, 'terminalStatus': status, 'startedAt': stamp,
                 'hostSource': 'native_host.terminal-mirror',
                 'statusSource': 'bridge_ledger.status', 'origin': origin}
 
@@ -85,7 +87,8 @@ class HistoryIsNotNews(RelayScene):
 class AckCannotSwallowAnUnannouncedRun(RelayScene):
 
     def relay_candidate(self, run_id, status='completed'):
-        return {'runId': run_id, 'terminalStatus': status,
+        # Everything in this scene is a post-activation completion; the act of finishing is what makes it announceable.
+        return {'runId': run_id, 'terminalStatus': status, 'startedAt': 4000000000000,
                 'hostSource': 'native_host.terminal-mirror',
                 'statusSource': 'bridge_ledger.status', 'origin': 'bridge'}
 

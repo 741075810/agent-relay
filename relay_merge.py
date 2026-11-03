@@ -85,6 +85,19 @@ def ack_forms(run_id, status=None):
     return forms
 
 
+def started_ms(value):
+    """A start time in epoch milliseconds, or None when the source did not say.
+
+    The relay forwards whatever the host recorded; a second-resolution stamp is converted rather than mistaken for a
+    1970 millisecond value, and anything unreadable stays None so the caller can fail closed on it.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value <= 0:
+        return None
+    return int(value * 1000) if value < 100000000000 else int(value)
+
+
 def was_offered(offered, run_id, status=None):
     """Whether this identity names something the host actually handed out.
 
