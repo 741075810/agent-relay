@@ -1,0 +1,286 @@
+"""T221: the relay supervisor, exercised against real processes in a temporary install.
+
+The supervisor's job is to keep two processes alive without becoming a second notification path. So the properties worth
+testing are the refusals and the absences:
+
+  * nothing starts when the relay is unconfigured, when the token disappeared under a live service, or when the manifest
+    names no origin -- a supervisor that starts a sidecar which cannot authenticate turns one failure into two;
+  * a second invocation does not start a second pair (`already_running` via a kernel mutex, and adoption of processes that
+    are already there);
+  * a killed process comes back;
+  * the host's `state/` directory -- which holds the arm snapshot, i.e. the operator's consent -- is byte-identical after
+    every run, because "restarted the relay" must never be mistakable for "re-armed a task";
+  * the token value appears in no file the supervisor writes.
+
+Real components throughout: the real `relay_service.mjs`, the real `host_mirror.mjs` and the real `host.py`, all pointed at
+a temporary install and an empty `--native-root`. Node is required; the suite skips without it.
+"""
+
+import hashlib
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SUPERVISOR = os.path.join(HERE, 'tools', 'service', 'relay_supervisor.py')
+HOST_FILES = ('host.py', 'protocol.py', 'terminal_source.py', 'relay_merge.py', 'run_origin.py', 'native_turns.py')
+
+
+def node_available():
+    return shutil.which('node') is not None
+
+
+def free_port():
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1', 0))
+        return sock.getsockname()[1]
+
+
+def digest(path):
+    if not os.path.exists(path):
+        return None
+    if os.path.isdir(path):
+        hasher = hashlib.sha256()
+        for root, dirs, files in os.walk(path):
+            dirs.sort()
+            for name in sorted(files):
+                full = os.path.join(root, name)
+                hasher.update(os.path.relpath(full, path).encode())
+                with open(full, 'rb') as handle:
+                    hasher.update(handle.read())
+        return hasher.hexdigest()
+    with open(path, 'rb') as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
+
+
+@unittest.skipUnless(sys.platform == 'win32', 'the supervisor uses a Windows mutex and tasklist')
+@unittest.skipUnless(node_available(), 'node is not on PATH')
+class RelaySupervisorTest(unittest.TestCase):
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix='t221-sup-')
+        self.install = os.path.join(self.root, 'install')
+        os.makedirs(os.path.join(self.install, 'relay'))
+        os.makedirs(os.path.join(self.install, 'state'))
+        os.makedirs(os.path.join(self.root, 'native'))
+        for name in HOST_FILES:
+            source = os.path.join(HERE, name)
+            if os.path.isfile(source):
+                shutil.copy2(source, self.install)
+        with open(os.path.join(self.install, 'host_manifest.json'), 'w', encoding='utf-8') as handle:
+            json.dump({'name': 'drill', 'type': 'stdio', 'path': 'host_launcher.exe',
+                       'allowed_origins': ['chrome-extension://' + 'a' * 32 + '/']}, handle)
+        # a state file that must survive every run untouched
+        with open(os.path.join(self.install, 'state', 'terminal-arm.json'), 'w', encoding='utf-8') as handle:
+            json.dump({'epoch': 'e' * 8, 'armTakenAtMs': 42, 'relayCovered': False}, handle)
+        self.port = free_port()
+        self.write_config()
+
+    def write_config(self, **overrides):
+        config = {
+            'repo': HERE,
+            'install': self.install,
+            'pollMs': 20000,
+            'python': sys.executable,
+            'node': shutil.which('node') or 'node',
+            'sidecarArgs': ['--native-root', os.path.join(self.root, 'native')],
+        }
+        config.update(overrides)
+        with open(os.path.join(self.install, 'relay_autostart.json'), 'w', encoding='utf-8') as handle:
+            json.dump(config, handle)
+
+    def write_relay_txt(self, token_name='service.token'):
+        with open(os.path.join(self.install, 'relay.txt'), 'w', encoding='ascii') as handle:
+            handle.write('http://127.0.0.1:%d\n%s\n' % (self.port, os.path.join(self.install, 'relay', token_name)))
+
+    def tearDown(self):
+        self.kill_children()
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    # ---- helpers ------------------------------------------------------------------------------------------------
+    def run_once(self, expect=0):
+        proc = subprocess.run([sys.executable, '-B', SUPERVISOR, '--once', '--install-dir', self.install],
+                              capture_output=True, text=True, timeout=180)
+        self.assertEqual(proc.returncode, expect, proc.stdout + proc.stderr)
+        for line in proc.stdout.splitlines():
+            line = line.strip()
+            if line.startswith('{'):
+                return json.loads(line)
+        self.fail('no JSON on stdout: %r' % proc.stdout)
+
+    def children(self):
+        """Pids the supervisor recorded, filtered to ones still alive."""
+        alive = []
+        for name in ('service.pid', 'sidecar.pid'):
+            path = os.path.join(self.install, 'relay', name)
+            if not os.path.exists(path):
+                continue
+            with open(path, encoding='ascii') as handle:
+                pid = int(handle.read().strip() or 0)
+            if pid and subprocess.run(['tasklist', '/FI', 'PID eq %d' % pid, '/NH'],
+                                      capture_output=True, text=True, timeout=30).stdout.count(str(pid)):
+                alive.append(pid)
+        return alive
+
+    def kill_children(self):
+        for pid in self.children():
+            subprocess.run(['taskkill', '/PID', str(pid), '/F'], capture_output=True, timeout=30)
+        time.sleep(0.5)
+
+    def wait_for(self, predicate, timeout=30):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.25)
+        return False
+
+    # ---- refusals ------------------------------------------------------------------------------------------------
+    def test_unconfigured_relay_starts_nothing(self):
+        result = self.run_once(expect=1)
+        self.assertEqual(result['code'], 'relay_unconfigured')
+        self.assertEqual(self.children(), [])
+
+    def test_missing_manifest_origin_starts_nothing(self):
+        self.write_relay_txt()
+        with open(os.path.join(self.install, 'host_manifest.json'), 'w', encoding='utf-8') as handle:
+            json.dump({'name': 'drill'}, handle)
+        result = self.run_once(expect=1)
+        self.assertEqual(result['code'], 'manifest_missing')
+        self.assertEqual(self.children(), [])
+
+    def test_token_missing_while_the_port_is_in_use_is_refused(self):
+        """The dangerous shape: a service is up, its token file is gone. A sidecar now would post into a wall."""
+        self.write_relay_txt()
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1', self.port))
+            listener.listen(1)
+            result = self.run_once(expect=1)
+        self.assertEqual(result['code'], 'token_missing')
+        self.assertNotIn('sidecar.pid', os.listdir(os.path.join(self.install, 'relay')))
+
+    # ---- starting and staying single -----------------------------------------------------------------------------
+    def test_starts_the_pair_then_leaves_it_alone(self):
+        self.write_relay_txt()
+        first = self.run_once()
+        self.assertEqual(first['code'], 'ok')
+        codes = [action['code'] for action in first['actions']]
+        self.assertIn('service_started', codes)
+        self.assertIn('sidecar_started', codes)
+        self.assertTrue(self.wait_for(lambda: len(self.children()) == 2, timeout=30),
+                        'the two children are not both alive: %r' % self.children())
+        before = self.children()
+
+        second = self.run_once()
+        self.assertEqual(second['code'], 'ok')
+        self.assertEqual([action['code'] for action in second['actions']], ['service_healthy', 'sidecar_alive'])
+        self.assertEqual(self.children().__len__(), 2)
+        self.assertEqual(sorted(before), sorted(self.children()), 'a second reconcile replaced a live process')
+
+    def test_killed_service_is_restarted_and_the_sidecar_is_not(self):
+        self.write_relay_txt()
+        self.run_once()
+        self.assertTrue(self.wait_for(lambda: len(self.children()) == 2, timeout=30))
+        service_pid, sidecar_pid = self.first_pids()
+        subprocess.run(['taskkill', '/PID', str(service_pid), '/F'], capture_output=True, timeout=30)
+        self.assertTrue(self.wait_for(lambda: service_pid not in self.children(), timeout=20))
+        result = self.run_once()
+        self.assertIn('service_started', [action['code'] for action in result['actions']])
+        self.assertIn('sidecar_alive', [action['code'] for action in result['actions']])
+        self.assertIn(sidecar_pid, self.children())
+
+    def test_killed_sidecar_is_restarted(self):
+        self.write_relay_txt()
+        self.run_once()
+        self.assertTrue(self.wait_for(lambda: len(self.children()) == 2, timeout=30))
+        service_pid, sidecar_pid = self.first_pids()
+        subprocess.run(['taskkill', '/PID', str(sidecar_pid), '/F'], capture_output=True, timeout=30)
+        self.assertTrue(self.wait_for(lambda: sidecar_pid not in self.children(), timeout=20))
+        result = self.run_once()
+        self.assertIn('sidecar_started', [action['code'] for action in result['actions']])
+        self.assertIn(service_pid, self.children(), 'the service was restarted for no reason')
+
+    def first_pids(self):
+        pids = []
+        for name in ('service.pid', 'sidecar.pid'):
+            with open(os.path.join(self.install, 'relay', name), encoding='ascii') as handle:
+                pids.append(int(handle.read().strip()))
+        return pids[0], pids[1]
+
+    def test_a_resident_loop_holds_the_instance_and_a_second_run_refuses(self):
+        self.write_relay_txt()
+        loop = subprocess.Popen([sys.executable, '-B', SUPERVISOR, '--loop', '--interval', '120',
+                                 '--install-dir', self.install], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            time.sleep(3)
+            result = self.run_once()
+            self.assertEqual(result['code'], 'already_running')
+        finally:
+            loop.terminate()
+            loop.wait(timeout=30)
+
+    def test_adopt_records_a_running_pair_and_refuses_when_there_is_nothing_to_adopt(self):
+        empty = subprocess.run([sys.executable, '-B', SUPERVISOR, '--adopt', '--install-dir', self.install],
+                               capture_output=True, text=True, timeout=120)
+        self.assertEqual(json.loads(empty.stdout.strip().splitlines()[-1])['code'], 'adopt_nothing_found')
+        self.assertEqual(empty.returncode, 1)
+
+        self.write_relay_txt()
+        self.run_once()
+        self.assertTrue(self.wait_for(lambda: len(self.children()) == 2, timeout=30))
+        for name in ('service.pid', 'sidecar.pid'):
+            os.remove(os.path.join(self.install, 'relay', name))
+        adopted = subprocess.run([sys.executable, '-B', SUPERVISOR, '--adopt', '--install-dir', self.install],
+                                 capture_output=True, text=True, timeout=120)
+        self.assertEqual(adopted.returncode, 0, adopted.stdout + adopted.stderr)
+        self.assertEqual(len(json.loads(adopted.stdout.strip().splitlines()[-1])['found']['service']), 1)
+        self.assertEqual(sorted(self.children()).__len__(), 2)
+
+    # ---- the two things that must not happen ---------------------------------------------------------------------
+    def test_consent_state_is_byte_identical_after_a_full_cycle(self):
+        arm = os.path.join(self.install, 'state', 'terminal-arm.json')
+        before = digest(arm)
+        self.write_relay_txt()
+        self.run_once()
+        self.wait_for(lambda: len(self.children()) == 2, timeout=30)
+        self.run_once()
+        self.assertEqual(digest(arm), before, 'the supervisor touched the consent snapshot')
+
+    def test_the_token_value_is_written_nowhere(self):
+        self.write_relay_txt()
+        self.run_once()
+        self.assertTrue(self.wait_for(lambda: len(self.children()) == 2, timeout=30))
+        token_path = os.path.join(self.install, 'relay', 'service.token')
+        self.assertTrue(self.wait_for(lambda: os.path.exists(token_path), timeout=20))
+        with open(token_path, encoding='ascii') as handle:
+            token = handle.read().strip()
+        self.assertGreater(len(token), 16)
+        leaking = []
+        for root, _, files in os.walk(os.path.join(self.install, 'relay')):
+            for name in files:
+                if name == 'service.token':
+                    continue
+                with open(os.path.join(root, name), 'rb') as handle:
+                    if token.encode() in handle.read():
+                        leaking.append(name)
+        self.assertEqual(leaking, [], 'the token appears in %r' % leaking)
+        status = json.load(open(os.path.join(self.install, 'relay', 'supervisor.json'), encoding='utf-8'))
+        self.assertNotIn('origin', status, 'the status file names the extension id')
+
+    def test_status_mode_reports_the_last_run(self):
+        self.write_relay_txt()
+        self.run_once()
+        proc = subprocess.run([sys.executable, '-B', SUPERVISOR, '--status', '--install-dir', self.install],
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(proc.stdout)['health'], 'healthy')
+
+
+if __name__ == '__main__':
+    unittest.main()
