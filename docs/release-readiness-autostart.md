@@ -37,12 +37,18 @@ tools/service/relay_supervisor.py     协调器：一次 --once 或常驻 --loop
 ```
 读 relay.txt                     缺失或不足两行        -> relay_unconfigured，什么都不启动
 读 host_manifest.json 的 origin   没有 allowed_origins   -> manifest_missing，什么都不启动
+列本安装的进程清单（CIM 命令行）  查询失败               -> inventory_unavailable，不动任何进程
 token 缺失 + 端口已在监听         （service 在、token 没了）-> token_missing，不启动 sidecar
-带 token 探 /health              200                    -> service_healthy
-                                 401/403                -> service_unauthorized + sidecar_deferred
+带 token 探 /health              200                    -> service_healthy（pid 与清单一致，否则顺手 service_adopted）
                                  连不上                  -> 启动 service，等它写出 token，再探
-sidecar.pid 里的 pid 还活着       是                     -> sidecar_alive
-                                 否                     -> 启动 sidecar
+                                 401/403 + 能证明是本安装的 service
+                                                        -> service_token_rotated -> 杀掉它 -> service_restarted -> 重探
+                                 401/403 + 证明不了        -> service_unauthorized_foreign，不碰那个监听者
+sidecar.pid 在清单里且是本安装的 sidecar                      -> sidecar_alive
+              pid 活着但不是本安装的 sidecar（pid 被复用）    -> sidecar_pid_foreign，再按清单找
+              清单里恰好一个真 sidecar                        -> sidecar_adopted
+              清单里多于一个                                  -> sidecar_ambiguous，拒绝再加第三个
+              清单里没有                                      -> 启动 sidecar
 写 supervisor.json
 ```
 
@@ -50,9 +56,36 @@ sidecar.pid 里的 pid 还活着       是                     -> sidecar_alive
 **端口已经有人监听**时才构成拒绝；否则正是由 service 来生产这个文件。删掉这条区分会让冷启动永远起不来，
 `test_starts_the_pair_then_leaves_it_alone` 就是钉这条的（去掉 `listening(...)` 它会红）。
 
-`service_unauthorized` 这个分支是"token 文件在运行中被换掉"的真实形态：service 拿着启动时的 token，
-sidecar 拿着文件里的新 token，此时**不**启动 sidecar——否则它每一轮都在 401 上打转，日志里全是噪音，
-而真正的修复是重启 service（协调器下一步就会做，因为文件与内存不一致时探活失败）。
+`401/403` 这个分支是"token 文件在运行中被换掉"的真实形态：service 在启动时把 token 读进内存（`relay_service.mjs`
+第 154 行：文件存在就用文件里的值），此后与文件不再同步，于是每一轮都是 401。修复只有一条——**重启 service**，
+让新进程重新读那份文件。但重启前必须先证明"这个监听者归本安装所有"：
+
+1. `service.pid` 里的 pid 在进程清单里且命令行含本安装路径 + `relay_service.mjs`；或
+2. 清单里恰好只有一个 `relay_service.mjs` 属于本安装。
+
+两条都不成立就是 `service_unauthorized_foreign`：那个端口上是别人的程序（或者是我们的 service 已被别的东西取代），
+去杀它是**对无法识别的程序动手**，所以只记录、不操作、也不启动 sidecar。杀掉之前还会再查一次清单
+（`managed_kill`），身份在检查与动手之间变了就记 `service_restart_refused`。T221 之前的说法
+（"协调器下一步就会做"）是错的：那一版只是记下 `service_unauthorized` 就返回，每两分钟重复一次，永远不会自愈。
+这部分在 T222 修正，`test_a_rotated_token_restarts_the_service_this_install_owns` 与
+`test_unauthorized_from_a_listener_this_install_does_not_own_is_refused` 分别钉住两条边。
+
+### 3.1 进程身份，而不是"这个 pid 还活着"
+
+旧实现用 `tasklist /FI "PID eq N"` 的输出里是否出现这个数字来判断 sidecar 活着。问题是 pid 会被复用：
+sidecar 死了、pid 被别的程序接手，协调器就永远认为 sidecar 在跑，于是**再也不重启它**，而且每次都说成功。
+
+现在的判据是命令行：一次 CIM 查询列出所有 `node.exe`，只有命令行**同时**含本安装的绝对路径与
+`relay_service.mjs` / `host_mirror.mjs` 的进程才被认作本安装的 service / sidecar。由此得到：
+
+| 情形 | 行为 |
+|---|---|
+| pid 在清单里，kind 对 | `sidecar_alive` / `service_healthy` |
+| pid 活着但不在清单里 | `sidecar_pid_foreign`，然后按清单找真正的那个 |
+| 真 sidecar 在、pid 文件写错 | `sidecar_adopted`（改写 pid 文件，不启第二个） |
+| 一个都没有 | 启动；启动后 pid 由清单确认 |
+| 清单查询失败 | `inventory_unavailable`，什么都不启动——"我没查到"不能变成"没有在跑" |
+
 
 ## 4. 为什么是这两个任务，而不是一个
 
@@ -92,15 +125,40 @@ python -B tools/service/relay_supervisor.py --adopt --install-dir <INSTALL>
 | native host | PID 33076（21:56:36）未受影响 |
 | readiness 审计 | `decision: GO`、`blocking_failed: []`、`armPrecision: ms` |
 
-隔离演练（`test_t095b221_relay_supervisor.py`，11 项，真实 node 进程 + 临时 install + 空 `--native-root`）：
+隔离演练（`test_t095b221_relay_supervisor.py`，16 项，真实 node 进程 + 临时 install + 空 `--native-root`）：
 unconfigured 拒绝、manifest 无 origin 拒绝、token 在端口占用时缺失拒绝、启动服务再启动 sidecar、
 第二次 reconcile 不动已活的进程、service 被杀只重启 service、sidecar 被杀只重启 sidecar、
 常驻 loop 占用时第二个实例 `already_running`、`--adopt` 记录在跑的 pid 且空时拒绝、
 **同意快照逐字节不变**、**token 值不出现在协调器写的任何文件里**（`supervisor.json` 只记
 `originPresent`/`originLength`，不记扩展 id 的任何字节）。
 
-红灯证明：去掉 token 判断里的端口条件 -> `test_starts_the_pair_then_leaves_it_alone` FAILED(exit 1)；
-mutex 名里加入 pid -> 单实例测试 FAILED(exit 1)；恢复后两者都 exit 0，源文件逐字节还原。
+T222 追加的五项（都在真实进程上跑，用真的 pid 复用、真的 401 监听者、真的无关进程）：
+
+| 测试 | 钉住的行为 |
+|---|---|
+| `test_a_rotated_token_restarts_the_service_this_install_owns` | token 文件被换 -> 服务被重启、恢复 healthy、sidecar pid 不变 |
+| `test_unauthorized_from_a_listener_this_install_does_not_own_is_refused` | 401 且无归属 -> `service_unauthorized_foreign`，监听者仍活着，不起任何 service |
+| `test_a_reused_pid_is_not_mistaken_for_a_live_sidecar` | pid 被无关进程复用 -> `sidecar_pid_foreign` + 启动真 sidecar，无关进程不被杀 |
+| `test_a_wrong_pid_file_adopts_the_running_sidecar_instead_of_adding_one` | pid 文件写错但真 sidecar 在 -> `sidecar_adopted`，sidecar 数量仍是 1 |
+| `test_an_unreadable_process_inventory_is_a_refusal` | 清单查询失败 -> `inventory_unavailable`，什么都不启动 |
+
+红灯证明（两次演练都以退出码判定，恢复后源文件逐字节还原）：
+去掉 token 判断里的端口条件 -> `test_starts_the_pair_then_leaves_it_alone` FAILED(exit 1)；
+mutex 名里加入 pid -> 单实例测试 FAILED(exit 1)；
+`kind` 退回 `pid_exists(pid)` -> `test_a_reused_pid_is_not_mistaken_for_a_live_sidecar` FAILED(exit 1)；
+`401` 分支不再要求归属证明 -> `test_unauthorized_from_a_listener_this_install_does_not_own_is_refused` FAILED(exit 1)。
+
+### 6.1 T222 在生产上的只读复核（2026-11-03 23:12）
+
+```
+python -B tools/service/relay_supervisor.py --once --install-dir <INSTALL>
+{"actions":[{"code":"service_healthy","detail":"pid 27216"},
+            {"code":"sidecar_alive","detail":"pid 44752"}],"code":"ok","ok":true}
+```
+
+`pid` 现在来自命令行核验，而不是"这个数字在 tasklist 里出现过"。本轮没有对生产做任何故障注入：
+没有杀进程、没有改 token、没有动 `state\`、没有动扩展。<INSTALL> 的两个计划任务仍在，触发器与 principal 未变。
+
 
 ## 7. 启动顺序与重复触发
 

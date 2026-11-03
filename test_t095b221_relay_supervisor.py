@@ -59,6 +59,67 @@ def digest(path):
         return hashlib.sha256(handle.read()).hexdigest()
 
 
+SUPERVISOR_MODULE = os.path.join(HERE, 'tools', 'service', 'relay_supervisor.py')
+
+# Runs the supervisor with the process inventory deliberately broken, via the same code path the tool uses at run time.
+UNREADABLE_INVENTORY = """
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location('sup', r'%s')
+sup = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(sup)
+sup.process_map = lambda install: ({}, 'query_failed')
+raise SystemExit(sup.main(['--once', '--install-dir', sys.argv[1]]))
+""" % SUPERVISOR_MODULE
+
+
+def pid_alive(pid):
+    if not pid:
+        return False
+    out = subprocess.run(['tasklist', '/FI', 'PID eq %d' % int(pid), '/NH'],
+                         capture_output=True, text=True, timeout=20).stdout
+    return bool(out.strip()) and 'No tasks' not in out
+
+
+def process_map_for(install):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('sup_map', SUPERVISOR_MODULE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    mapping, _trouble = module.process_map(install)
+    return mapping
+
+
+class Fake401:
+    """A listener that answers 401 to everything: the shape of a service whose token we do not have."""
+
+    def __init__(self, port):
+        import http.server
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(401)
+                self.end_headers()
+                self.wfile.write(b'{"ok":false}')
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.HTTPServer(('127.0.0.1', port), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.alive = True
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.alive = False
+
+
+def start_401_server(port):
+    return Fake401(port)
+
+
 @unittest.skipUnless(sys.platform == 'win32', 'the supervisor uses a Windows mutex and tasklist')
 @unittest.skipUnless(node_available(), 'node is not on PATH')
 class RelaySupervisorTest(unittest.TestCase):
@@ -272,6 +333,111 @@ class RelaySupervisorTest(unittest.TestCase):
         self.assertEqual(leaking, [], 'the token appears in %r' % leaking)
         status = json.load(open(os.path.join(self.install, 'relay', 'supervisor.json'), encoding='utf-8'))
         self.assertNotIn('origin', status, 'the status file names the extension id')
+
+    # ---- T222: identity, ownership, and the unauthorized path ----------------------------------------------------
+    def unrelated_process(self):
+        """A live process that is definitely not this install's sidecar, standing in for a reused pid."""
+        proc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(180)'])
+        self.addCleanup(proc.kill)
+        self.assertTrue(self.wait_for(lambda: pid_alive(proc.pid), timeout=20))
+        return proc.pid
+
+    def test_a_rotated_token_restarts_the_service_this_install_owns(self):
+        """A token file replaced under a running service is a 401 forever unless the service is restarted. It may only be
+        restarted when the process can be shown to belong to this install."""
+        self.write_relay_txt()
+        self.run_once()
+        self.assertTrue(self.wait_for(lambda: len(self.children()) == 2, timeout=30))
+        service_pid, sidecar_pid = self.first_pids()
+        with open(os.path.join(self.install, 'relay', 'service.token'), 'w', encoding='ascii') as handle:
+            handle.write('f' * 48 + '\n')
+
+        result = self.run_once()
+        codes = [action['code'] for action in result['actions']]
+        self.assertEqual(result['code'], 'ok', codes)
+        self.assertIn('service_token_rotated', codes)
+        self.assertIn('service_restarted', codes)
+        self.assertIn('sidecar_alive', codes, 'the sidecar was restarted although only the service was stale')
+        self.assertIn(sidecar_pid, self.children(), 'the sidecar was replaced for no reason')
+        self.assertNotEqual(self.read_pid('service.pid'), service_pid, 'the stale service was not replaced')
+        status = json.load(open(os.path.join(self.install, 'relay', 'supervisor.json'), encoding='utf-8'))
+        self.assertEqual(status['health'], 'healthy')
+
+    def test_unauthorized_from_a_listener_this_install_does_not_own_is_refused(self):
+        """Something answers 401 on our port and no process of ours owns it: refuse, and touch nothing."""
+        server = start_401_server(self.port)
+        try:
+            self.write_relay_txt()
+            with open(os.path.join(self.install, 'relay', 'service.token'), 'w', encoding='ascii') as handle:
+                handle.write('a' * 48 + '\n')
+            result = self.run_once(expect=1)
+            self.assertEqual(result['code'], 'service_unauthorized_foreign')
+            codes = [action['code'] for action in result['actions']]
+            self.assertIn('sidecar_deferred', codes)
+            self.assertTrue(server.alive, 'the foreign listener was killed')
+            self.assertEqual([pid for pid, kind in process_map_for(self.install).items() if kind == 'service'], [],
+                             'a service was started although a foreign listener holds the port')
+        finally:
+            server.stop()
+
+    def test_a_reused_pid_is_not_mistaken_for_a_live_sidecar(self):
+        self.write_relay_txt()
+        self.run_once()
+        self.assertTrue(self.wait_for(lambda: len(self.children()) == 2, timeout=30))
+        service_pid, sidecar_pid = self.first_pids()
+        subprocess.run(['taskkill', '/PID', str(sidecar_pid), '/F'], capture_output=True, timeout=30)
+        self.assertTrue(self.wait_for(lambda: not pid_alive(sidecar_pid), timeout=20))
+        squatter = self.unrelated_process()
+        self.write_pid('sidecar.pid', squatter)
+
+        result = self.run_once()
+        codes = [action['code'] for action in result['actions']]
+        self.assertEqual(result['code'], 'ok', codes)
+        self.assertIn('sidecar_pid_foreign', codes, 'a live foreign pid was accepted as the sidecar')
+        self.assertIn('sidecar_started', codes)
+        self.assertTrue(pid_alive(squatter), 'the unrelated process was killed')
+        new_sidecar = self.read_pid('sidecar.pid')
+        self.assertNotEqual(new_sidecar, squatter)
+        self.assertTrue(pid_alive(new_sidecar))
+
+    def test_a_wrong_pid_file_adopts_the_running_sidecar_instead_of_adding_one(self):
+        self.write_relay_txt()
+        self.run_once()
+        self.assertTrue(self.wait_for(lambda: len(self.children()) == 2, timeout=30))
+        real_sidecar = self.first_pids()[1]
+        squatter = self.unrelated_process()
+        self.write_pid('sidecar.pid', squatter)
+
+        result = self.run_once()
+        codes = [action['code'] for action in result['actions']]
+        self.assertEqual(result['code'], 'ok', codes)
+        self.assertIn('sidecar_adopted', codes)
+        self.assertNotIn('sidecar_started', codes, 'a second sidecar was started beside a live one')
+        self.assertEqual(self.read_pid('sidecar.pid'), real_sidecar)
+        sidecars = [pid for pid, kind in process_map_for(self.install).items() if kind == 'sidecar']
+        self.assertEqual(len(sidecars), 1, sidecars)
+
+    def test_an_unreadable_process_inventory_is_a_refusal(self):
+        """'I could not look' must not become 'nothing is running' -- that answer starts a duplicate sidecar."""
+        self.write_relay_txt()
+        # A file, not `-c`: Windows command-line quoting mangles a multi-line program and the failure then looks like
+        # "the supervisor printed nothing".
+        script = os.path.join(self.root, 'unreadable_inventory.py')
+        with open(script, 'w', encoding='utf-8') as handle:
+            handle.write(UNREADABLE_INVENTORY)
+        proc = subprocess.run([sys.executable, '-B', script, self.install], capture_output=True, text=True,
+                              timeout=120)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn('inventory_unavailable', proc.stdout)
+        self.assertEqual(self.children(), [])
+
+    def read_pid(self, name):
+        with open(os.path.join(self.install, 'relay', name), encoding='ascii') as handle:
+            return int(handle.read().strip())
+
+    def write_pid(self, name, pid):
+        with open(os.path.join(self.install, 'relay', name), 'w', encoding='ascii') as handle:
+            handle.write('%d\n' % pid)
 
     def test_status_mode_reports_the_last_run(self):
         self.write_relay_txt()

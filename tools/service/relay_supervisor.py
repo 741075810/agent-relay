@@ -168,13 +168,37 @@ def find_processes(install):
     return found, None
 
 
-def process_alive(pid):
+def process_map(install):
+    """{pid: 'service'|'sidecar'} for the node processes whose command line names this install.
+
+    The pid file alone proves nothing: pids are reused, and a pid that is alive can be any program at all. What makes a
+    process "ours" is its command line naming this install and the script it runs, which is what this returns.
+    """
+    found, trouble = find_processes(install)
+    mapping = {}
+    for pid in found['service']:
+        mapping[pid] = 'service'
+    for pid in found['sidecar']:
+        mapping[pid] = 'sidecar'
+    return mapping, trouble
+
+
+def pid_exists(pid):
+    """Whether *any* process holds this pid. Used only to tell "gone" from "something else is wearing this pid"."""
     if not pid:
         return False
     try:
         out = subprocess.run(['tasklist', '/FI', 'PID eq %d' % int(pid), '/NH'],
                              capture_output=True, text=True, timeout=20).stdout
-        return str(pid) in out and 'No tasks' not in out
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return bool(out.strip()) and 'No tasks' not in out
+
+
+def kill_pid(pid):
+    try:
+        subprocess.run(['taskkill', '/PID', str(int(pid)), '/F'], capture_output=True, timeout=30)
+        return True
     except (OSError, subprocess.SubprocessError):
         return False
 
@@ -221,6 +245,63 @@ class Supervisor:
         self.actions.append({'at': now(), 'code': code, 'detail': detail})
         self.log(code, detail)
 
+    # ---- identity ---------------------------------------------------------------------------------------------------
+    def inventory(self):
+        """A fresh map of pids this install owns. A query failure is a refusal, not an empty answer: "I could not look"
+        and "nothing is running" must not collapse into one, because the second one starts a duplicate process."""
+        mapping, trouble = process_map(self.install)
+        if trouble:
+            self.record('inventory_unavailable', trouble)
+            return None
+        return mapping
+
+    def read_pid(self, path):
+        try:
+            with open(path, encoding='ascii') as handle:
+                return int(handle.read().strip() or 0) or None
+        except (OSError, ValueError):
+            return None
+
+    def write_pid(self, path, pid):
+        with open(path, 'w', encoding='ascii') as handle:
+            handle.write('%d\n' % pid)
+
+    def service_owner(self, inventory):
+        """The pid of the relay service that belongs to this install, or None when that cannot be proven."""
+        pid = self.read_pid(self.service_pid_path)
+        if pid and inventory.get(pid) == 'service':
+            return pid
+        candidates = sorted(pid for pid, kind in inventory.items() if kind == 'service')
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
+
+    def managed_kill(self, pid, kind):
+        """Kill only if the identity still says this install owns that pid -- checked again immediately before acting."""
+        inventory = self.inventory()
+        if inventory is None or inventory.get(int(pid)) != kind:
+            return False
+        kill_pid(pid)
+        for _ in range(40):
+            time.sleep(0.25)
+            fresh = self.inventory()
+            if fresh is None or int(pid) not in fresh:
+                return True
+        return False
+
+    def await_service(self, base, token_file, seconds=10):
+        deadline = time.time() + seconds
+        state, detail = 'unreachable', None
+        while time.time() < deadline:
+            if not os.path.isfile(token_file):
+                time.sleep(0.25)
+                continue
+            state, detail = health(base, token_file, timeout=3)
+            if state in ('healthy', 'unauthorized'):
+                return state, detail
+            time.sleep(0.25)
+        return state, detail
+
     # ---- the two processes ----------------------------------------------------------------------------------------
     def service_command(self, base):
         repo = self.config.get('repo') or os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -255,6 +336,10 @@ class Supervisor:
             self.record('manifest_missing', 'no allowed origin in the installed manifest')
             return 'manifest_missing'
 
+        inventory = self.inventory()
+        if inventory is None:
+            return 'inventory_unavailable'
+
         # Ordering: on a first run the token does not exist yet -- the service creates it. So a missing token only refuses
         # when something is already listening on that port; otherwise the service is what will produce it.
         if not os.path.isfile(token_file) and listening(port_of(base)):
@@ -263,47 +348,87 @@ class Supervisor:
 
         state, detail = health(base, token_file)
         restarted_service = False
+
         if state in ('unreachable', 'token_missing'):
             pid = spawn(self.service_command(base), self.install, os.path.join(self.relay_dir, 'service.log'))
+            self.write_pid(self.service_pid_path, pid)
             self.record('service_started', 'pid %d' % pid)
-            with open(self.service_pid_path, 'w', encoding='ascii') as handle:
-                handle.write('%d\n' % pid)
             restarted_service = True
-            for _ in range(40):
-                time.sleep(0.25)
-                if not os.path.isfile(token_file):
-                    continue
-                state, detail = health(base, token_file, timeout=3)
-                if state in ('healthy', 'unauthorized'):
-                    break
+            state, detail = self.await_service(base, token_file)
+
         elif state == 'healthy':
-            self.record('service_healthy', 'no action')
+            owner = self.service_owner(inventory)
+            if owner is None:
+                self.record('service_healthy', 'no action (no pid recorded for it)')
+            else:
+                self.record('service_healthy', 'pid %d' % owner)
+                if self.read_pid(self.service_pid_path) != owner:
+                    self.write_pid(self.service_pid_path, owner)
+                    self.record('service_adopted', 'pid %d' % owner)
+
+        elif state == 'unauthorized':
+            # The token file changed under a running service: the repair is to restart the service this install owns, so
+            # it reads the file again. If no process of this install can be shown to own the listener, the honest answer is
+            # to refuse -- killing whatever else answers on that port would be acting on a program we cannot identify.
+            owner = self.service_owner(inventory)
+            if owner is None:
+                self.record('service_unauthorized_foreign',
+                            'a listener answers 401 and no process of this install owns it; refusing to touch it')
+                self.record('sidecar_deferred', 'service is unauthorized and unowned; a sidecar would post into a wall')
+                return 'service_unauthorized_foreign'
+            self.record('service_token_rotated', 'restarting the service this install owns (pid %d)' % owner)
+            if not self.managed_kill(owner, 'service'):
+                self.record('service_restart_refused', 'pid %d stopped looking like this install\'s service' % owner)
+                self.record('sidecar_deferred', 'service could not be restarted safely')
+                return 'service_restart_refused'
+            pid = spawn(self.service_command(base), self.install, os.path.join(self.relay_dir, 'service.log'))
+            self.write_pid(self.service_pid_path, pid)
+            self.record('service_restarted', 'pid %d (after the token file changed)' % pid)
+            restarted_service = True
+            state, detail = self.await_service(base, token_file)
+            if state != 'healthy':
+                self.record('service_restart_failed', detail or state)
+                self.record('sidecar_deferred', 'service is %s after the restart' % state)
+                return 'service_restart_failed'
+
         else:
             self.record('service_' + state, detail or '')
-
-        if state not in ('healthy',):
-            # A service that answers 401 while the sidecar holds the same token file means the file changed under it.
             self.record('sidecar_deferred', 'service is %s, so a sidecar would post into a wall' % state)
             return 'service_' + state
 
-        pid = None
-        try:
-            with open(self.sidecar_pid_path, encoding='ascii') as handle:
-                pid = int(handle.read().strip() or 0)
-        except (OSError, ValueError):
-            pid = None
+        inventory = self.inventory()
+        if inventory is None:
+            return 'inventory_unavailable'
 
-        if pid and process_alive(pid):
+        pid = self.read_pid(self.sidecar_pid_path)
+        kind = inventory.get(pid) if pid else None
+
+        if kind == 'sidecar':
             self.record('sidecar_alive', 'pid %d' % pid)
         else:
-            if not os.path.isfile(os.path.join(self.install, 'host.py')):
-                self.record('sidecar_missing', 'host.py is not in the install directory')
-                return 'sidecar_missing'
-            new_pid = spawn(self.sidecar_command(base, token_file, origin), self.install,
-                            os.path.join(self.relay_dir, 'sidecar.log'))
-            with open(self.sidecar_pid_path, 'w', encoding='ascii') as handle:
-                handle.write('%d\n' % new_pid)
-            self.record('sidecar_started', 'pid %d%s' % (new_pid, ' (after service restart)' if restarted_service else ''))
+            if pid and pid_exists(pid):
+                # The pid in the file is alive but is not this install's sidecar: pids get reused. Saying "alive" here is
+                # how a dead sidecar stays dead while the supervisor reports success.
+                self.record('sidecar_pid_foreign', 'pid %d is alive but is not this install\'s sidecar' % pid)
+            candidates = sorted(pid_ for pid_, kind_ in inventory.items() if kind_ == 'sidecar')
+            if len(candidates) == 1:
+                self.write_pid(self.sidecar_pid_path, candidates[0])
+                self.record('sidecar_adopted', 'pid %d (the pid file said %s)' % (candidates[0], pid or 'nothing'))
+            elif len(candidates) > 1:
+                self.record('sidecar_ambiguous',
+                            '%d sidecars belong to this install; refusing to add another' % len(candidates))
+                self.write_status(base, token_file, origin)
+                return 'sidecar_ambiguous'
+            else:
+                if not os.path.isfile(os.path.join(self.install, 'host.py')):
+                    self.record('sidecar_missing', 'host.py is not in the install directory')
+                    return 'sidecar_missing'
+                new_pid = spawn(self.sidecar_command(base, token_file, origin), self.install,
+                                os.path.join(self.relay_dir, 'sidecar.log'))
+                self.write_pid(self.sidecar_pid_path, new_pid)
+                self.record('sidecar_started',
+                            'pid %d%s' % (new_pid, ' (after service restart)' if restarted_service else ''))
+
         self.write_status(base, token_file, origin)
         return 'ok'
 
