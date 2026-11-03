@@ -42,7 +42,7 @@ export function askTerminalList(host, { timeoutMs = 15000 } = {}) {
     : [];
   const args = [host.script, ...extra, ...relayFlags];
   return new Promise((resolve) => {
-    const child = spawn(host.python, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(host.python, args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     let buffer = Buffer.alloc(0);
     let stderr = '';
     let settled = false;

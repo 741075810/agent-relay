@@ -54,7 +54,9 @@ export function mirrorFromHost(host, { timeoutMs = 20000 } = {}) {
   if (host.bridgeFixture) args.push('--bridge-db-fixture', host.bridgeFixture);
 
   return new Promise((resolve) => {
-    const child = spawn(host.python, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    // windowsHide: this sidecar has no console, so a child console program is given a new one -- a window that
+    // appears and disappears every poll. Node's default is false, and only this flag asks Windows for no window.
+    const child = spawn(host.python, args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     let buffer = Buffer.alloc(0);
     let stderr = '';
     let settled = false;
