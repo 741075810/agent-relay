@@ -35,7 +35,15 @@ is bound; this module is the interface and the refusals, ready for one.
 
 import json
 import os
+import sys
 import time
+
+# Run as a script (`python -B tools/service/independent_terminal_source.py ...`) the repository root is not on the path,
+# and `relay_merge` lives there -- it is shared with the host, and this module deliberately reuses its consent rules
+# rather than copying them. Add the root when started as a file; when imported as part of a package this is a no-op.
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 import relay_merge
 
