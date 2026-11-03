@@ -264,6 +264,7 @@ def arm_snapshot(state_dir, root=None, epoch=None, relay_source=None):
         for item in relay_candidates:
             ids.append(item['runId'])
             relay_count += 1
+
     if len(ids) > MAX_SNAPSHOT_IDS:
         return {'ok': False, 'code': 'snapshot_truncated', 'epoch': None,
                 'count': len(ids), 'limit': MAX_SNAPSHOT_IDS,
@@ -279,8 +280,14 @@ def arm_snapshot(state_dir, root=None, epoch=None, relay_source=None):
         # What this snapshot actually covers. `relayCovered: false` is not a defect -- it is the honest statement that
         # relay consent must then be decided per run from completion evidence.
         'sources': sorted(['bridge_ledger'] + (['relay'] if relay_covered else [])),
+        # `relayCovered` means "the relay service was read", nothing more. The service is a cache filled by an
+        # asynchronous sidecar, so an empty read is not a complete picture of the original ledger.
         'relayCovered': relay_covered,
         'relayCount': relay_count,
+        'relaySource': 'service-cache' if relay_covered else None,
+        # No writer can produce this today: it would need a watermark from the original terminal source, not a cache.
+        # Written explicitly so a reader of the file cannot mistake `relayCovered` for it.
+        'relayUpstreamComplete': False,
     }
     try:
         save_arm(state_dir, doc)
@@ -290,7 +297,8 @@ def arm_snapshot(state_dir, root=None, epoch=None, relay_source=None):
     return {'ok': True, 'code': None, 'epoch': epoch,
             'takenAt': doc['takenAt'], 'count': len(doc['ids']),
             'truncated': False, 'source': 'codex-bridge-ledger',
-            'sources': doc['sources'], 'relayCovered': relay_covered, 'relayCount': relay_count}
+            'sources': doc['sources'], 'relayCovered': relay_covered, 'relayCount': relay_count,
+            'relaySource': doc['relaySource'], 'relayUpstreamComplete': False}
 
 
 def load_state(state_dir):
@@ -912,7 +920,9 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
     relay_absorbed = 0
     relay_unverified = 0
     relay_implausible = 0
+    # Kept in the report, permanently zero: absence from a snapshot has no evidentiary value for this source.
     relay_snapshot_authorised = 0
+    relay_absence_refused = 0
     relay_activation = next_state.get('relayActivation')
     if relay_source:
         # The relay is an optional source that can arrive long after the native one, so it keeps an activation of its
@@ -934,14 +944,14 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
             # completion is at or after it, which is the wrong direction for a decision about consent.
             boundary_ms = int(arm['takenAt']) * 1000 if arm is not None else activated_at
             now_ms = int(time.time() * 1000)
-            # T211: a snapshot that read *this* source and recorded its id set is itself the proof. Every id it saw is
-            # history; a run missing from that complete set was not terminal when the operator consented, so its
-            # absence authorises it without needing a completion instant the data path may not carry.
+            # T212: a snapshot may never authorise by absence. `relayCovered` only records that the relay *service*
+            # was read, and that service is filled asynchronously by the `host_mirror.mjs` sidecar -- so an empty read
+            # proves nothing about the original ledger. A run that finished long ago and had not been mirrored yet
+            # would be absent from a "complete" snapshot and would then arrive as if it finished after consent.
             #
-            # This is only true when the snapshot covered the relay (`relayCovered`). A ledger-only snapshot knows
-            # nothing about relay runs, so for it absence still proves nothing and the per-run completion instant is
-            # the only evidence that can authorise.
-            snapshot_proves_absence = bool(arm is not None and arm.get('relayCovered') is True)
+            # Authorisation therefore needs positive evidence about *this* run: a credible completion instant. The
+            # snapshot keeps its other job, which needs no such trust -- what it did contain is history.
+            snapshot_proves_absence = False
             existing = list(next_state.get('relayBaselineIds') or [])
             history_ids = []
             for item in relay_candidates:
@@ -950,16 +960,13 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
                     continue
                 evidence = relay_merge.completed_ms(item)
                 if evidence is None:
-                    if snapshot_proves_absence:
-                        # Proved by the snapshot's own completeness rather than by a timestamp.
-                        item['postArm'] = True
-                        item['postArmEvidence'] = 'relay_complete_snapshot'
-                        relay_snapshot_authorised += 1
-                        continue
-                    # No completion time and no complete snapshot: this run cannot be shown to have finished after
-                    # consent. Held, not announced, and counted -- "unprovable" is a refusal with a reason.
+                    # No completion instant. Whether or not a snapshot exists, this run cannot be shown to have
+                    # finished after consent, so it is held and counted -- "unprovable" is a refusal with a reason,
+                    # never an authorisation borrowed from what some cache did not happen to contain.
                     history_ids.append(item['runId'])
                     relay_unverified += 1
+                    if arm is not None:
+                        relay_absence_refused += 1
                     continue
                 if not relay_merge.plausible(evidence, now_ms):
                     # A timestamp far in the future (or impossibly old) proves nothing; reading it as "after the arm"
@@ -1035,9 +1042,16 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
         # Whether the arm snapshot on disk was built with this source included. `False` means relay consent is decided
         # per run from completion evidence, never from absence in the snapshot.
         'armRelayCovered': bool(arm is not None and arm.get('relayCovered') is True),
-        # How many candidates this sample authorised by the snapshot's completeness rather than by a timestamp. Zero
-        # on a ledger-only snapshot, always: that path has no such proof.
+        # How many candidates an arm snapshot's completeness authorised. Always zero: the relay is a service cache fed
+        # asynchronously by a sidecar, so absence from it is not evidence about the original ledger. Kept in the report
+        # so the refusal is visible rather than implied.
         'relaySnapshotAuthorised': relay_snapshot_authorised,
+        # Candidates refused *specifically* because an arm existed and the run had no completion instant: the case
+        # where a cache-reading snapshot used to be mistaken for proof.
+        'relayAbsenceRefused': relay_absence_refused,
+        # Whether the snapshot on disk claims an upstream-complete read. No writer produces such a proof today, and
+        # nothing authorises on it.
+        'armRelayProof': bool(arm is not None and arm.get('relayUpstreamComplete') is True),
         'confirmed': False,
         'requiresAck': True,
         'redelivered': info['redelivered'],

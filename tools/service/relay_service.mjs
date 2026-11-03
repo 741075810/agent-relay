@@ -360,13 +360,29 @@ export function createRelay(config) {
         }
         const existing = state0.runs.find((run) => run.runId === runId);
         if (existing) {
+          const incomingInstant = Number.isFinite(item.completedAt) ? item.completedAt : null;
+          const incomingSource = typeof item.completedAtSource === 'string' ? item.completedAtSource : 'unknown';
           if (existing.terminalStatus !== terminalStatus) {
+            // The status moved, so the instant must move with it: an instant that belonged to the previous status is
+            // no longer evidence for this one. `null` means the new report had none, and unknown stays unknown.
             existing.terminalStatus = terminalStatus;
             existing.statusSource = statusSource;
+            existing.completedAt = incomingInstant;
+            existing.completedAtSource = incomingInstant === null ? 'unknown' : incomingSource;
             existing.updatedAt = now();
             accepted.push({ runId, terminalStatus, duplicate: true, updated: true, seq: existing.seq });
           } else {
-            accepted.push({ runId, terminalStatus, duplicate: true, updated: false, seq: existing.seq });
+            // Same status: the earliest credible instant wins. A re-post must never be able to push an old run's
+            // completion time later and so make it look newer than an arm.
+            let refreshed = false;
+            if (incomingInstant !== null) {
+              if (!Number.isFinite(existing.completedAt) || incomingInstant < existing.completedAt) {
+                existing.completedAt = incomingInstant;
+                existing.completedAtSource = incomingSource;
+                refreshed = true;
+              }
+            }
+            accepted.push({ runId, terminalStatus, duplicate: true, updated: false, refreshed, seq: existing.seq });
           }
           persist();
           continue;

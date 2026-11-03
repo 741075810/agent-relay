@@ -224,22 +224,30 @@ class RealDataPath(RelayScene):
         listed = self.host('terminal-list')['result']['candidates']
         self.assertEqual([item['runId'] for item in listed], [RELAY_RUN])
 
-    def test_a_complete_snapshot_authorises_without_a_completion_instant(self):
+    def test_a_complete_looking_snapshot_does_not_authorise_a_late_mirrored_old_completion(self):
+        """T212 corrects this case. T211 expected authorisation here, and that expectation was the defect.
+
+        The arm reads the relay *service*, which the sidecar fills asynchronously. A run that finished long ago and had
+        not been mirrored yet is absent from that read, so `relayCovered: true` described a cache, not the ledger. The
+        right answer is to hold: the run has no completion instant and no snapshot read the original source.
+        """
         build_bridge_db(self.db, [(RELAY_RUN, 'completed', None, None)])
         self.other_runs([{'requestID': RELAY_RUN, 'status': 'completed', 'createdAt': OLD_START_MS}])
         self.start_service()
         self.host('terminal-list')                       # activation, relay empty
-        # Arm through the host: it reads the relay source and records that it covered it. The run has not arrived yet,
-        # so the snapshot does not contain it.
         arm = self.host('terminal-arm-snapshot', {'epoch': 'e-t211'})
         self.assertTrue(arm['result']['relayCovered'], arm)
-        pushed = self.sidecar()
+        # The snapshot says what it actually did: a cache read is not an upstream proof.
+        self.assertEqual(arm['result']['relaySource'], 'service-cache')
+        self.assertFalse(arm['result']['relayUpstreamComplete'])
+        pushed = self.sidecar()                          # the old completion is mirrored only now
         self.assertTrue(pushed['ok'], pushed)
         after = self.host('terminal-list')['result']
-        self.assertEqual([item['runId'] for item in after['candidates']], [RELAY_RUN],
-                         'the snapshot read this source and did not contain the run, so it finished after consent')
-        self.assertEqual(after['candidates'][0]['postArmEvidence'], 'relay_complete_snapshot')
-        self.assertEqual(after['relaySnapshotAuthorised'], 1)
+        self.assertEqual([item['runId'] for item in after['candidates']], [],
+                         'a run absent from an asynchronously filled cache is not proof that it finished after consent')
+        self.assertEqual(after['relaySnapshotAuthorised'], 0)
+        self.assertEqual(after['relayAbsenceRefused'], 1)
+        self.assertEqual(after['relayCode'], 'relay_completion_unknown')
 
     def test_a_ledger_only_snapshot_never_authorises_that_way(self):
         build_bridge_db(self.db, [(RELAY_RUN, 'completed', None, None)])
