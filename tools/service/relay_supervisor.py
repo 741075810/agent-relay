@@ -145,6 +145,37 @@ def port_of(base):
         return None
 
 
+CREATE_NO_WINDOW = 0x08000000
+DETACHED_PROCESS = 0x00000008
+CREATE_NEW_PROCESS_GROUP = 0x00000200
+
+
+def hidden_startup():
+    """STARTUPINFO asking for an invisible window. Windows only: other platforms get None."""
+    if os.name != 'nt':
+        return None
+    info = subprocess.STARTUPINFO()
+    info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    info.wShowWindow = subprocess.SW_HIDE
+    return info
+
+
+def run_hidden(command, timeout=60, capture=True):
+    """Run a console program without giving it a console window.
+
+    The supervisor is started by the Task Scheduler through `pythonw.exe`, which owns no console. A console child of a
+    console-less parent gets a *new* console allocated for it -- and a new console is a window that appears and
+    disappears. That is what flashed on the operator's desktop every two minutes: `powershell.exe` for the process
+    inventory, `tasklist.exe` for the pid check, `taskkill.exe` for a kill. CREATE_NO_WINDOW suppresses the console
+    itself, and the STARTUPINFO asks for SW_HIDE as a second line of defence for programs that create their own window.
+    """
+    kwargs = {'capture_output': capture, 'text': True, 'timeout': timeout}
+    if os.name == 'nt':
+        kwargs['creationflags'] = CREATE_NO_WINDOW
+        kwargs['startupinfo'] = hidden_startup()
+    return subprocess.run(command, **kwargs)
+
+
 def find_processes(install):
     """Node processes whose command line names this install, split by which script they run.
 
@@ -155,8 +186,7 @@ def find_processes(install):
     command = ("Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | "
                "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress")
     try:
-        out = subprocess.run(['powershell', '-NoProfile', '-Command', command],
-                             capture_output=True, text=True, timeout=60).stdout.strip()
+        out = run_hidden(['powershell', '-NoProfile', '-Command', command], timeout=60).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return found, 'query_failed'
     if not out:
@@ -199,8 +229,7 @@ def pid_exists(pid):
     if not pid:
         return False
     try:
-        out = subprocess.run(['tasklist', '/FI', 'PID eq %d' % int(pid), '/NH'],
-                             capture_output=True, text=True, timeout=20).stdout
+        out = run_hidden(['tasklist', '/FI', 'PID eq %d' % int(pid), '/NH'], timeout=20).stdout
     except (OSError, subprocess.SubprocessError):
         return False
     return bool(out.strip()) and 'No tasks' not in out
@@ -208,7 +237,7 @@ def pid_exists(pid):
 
 def kill_pid(pid):
     try:
-        subprocess.run(['taskkill', '/PID', str(int(pid)), '/F'], capture_output=True, timeout=30)
+        run_hidden(['taskkill', '/PID', str(int(pid)), '/F'], timeout=30)
         return True
     except (OSError, subprocess.SubprocessError):
         return False
@@ -217,12 +246,16 @@ def kill_pid(pid):
 def spawn(command, cwd, log_path, env=None):
     """Detached: no inherited handles, so the caller can exit and the child keeps running."""
     flags = 0
+    info = None
     if os.name == 'nt':
-        flags = 0x00000008 | 0x00000200            # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        # DETACHED_PROCESS: no console at all, which is what lets the child outlive this process. The STARTUPINFO is
+        # belt and braces against anything that creates a window of its own.
+        flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        info = hidden_startup()
     handle = open(log_path, 'ab')
     try:
         proc = subprocess.Popen(command, cwd=cwd, stdin=subprocess.DEVNULL, stdout=handle, stderr=handle,
-                                close_fds=True, creationflags=flags, env=env)
+                                close_fds=True, creationflags=flags, startupinfo=info, env=env)
     finally:
         handle.close()
     return proc.pid

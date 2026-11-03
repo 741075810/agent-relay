@@ -210,3 +210,51 @@ schtasks /Delete /TN "DSH-Relay-Supervisor-Tick" /F
   `/health` 的 200。这两件事不能互相顶替。
 - 杀掉 service 会丢掉它内存里的 `seen`/`runs` 计数，靠 `relay.json` 重建；`acked` 计数因此可能回落，
   但已 ACK 的 run 不会被重新当作新候选投递（快照与基线在 host 的 `state\` 里，协调器不碰它）。
+
+## 10. T225：每两分钟闪一次的 shell 窗口
+
+症状：用户报"电脑一直有 Windows shell 窗口弹出来"，频率与 `DSH-Relay-Supervisor-Tick`（`PT2M`）对齐。
+
+证据链（只读）：
+
+```
+计划任务 action      pythonw.exe -B <REPO>\tools\service\relay_supervisor.py --once --install-dir <INSTALL>
+触发周期             MSFT_TaskTimeTrigger / PT2M；ONLOGON 那条 action 完全相同
+运行中的父子关系     pythonw.exe 9000 (parent 2648 = Task Scheduler) -> powershell.exe 11272 (parent 9000)
+```
+
+`pythonw.exe` 自己没有控制台。控制台子进程从无控制台的父进程启动时，Windows 会给它**新分配一个控制台**，那就是
+一闪而过的窗口；`subprocess.run` 从未请求 `CREATE_NO_WINDOW`。每次 tick 至少一个 `powershell.exe`（CIM 进程
+清单），需要核对 pid 时再加 `tasklist.exe`，真要杀进程时再加 `taskkill.exe`。从终端手工跑同一份代码看不到这个
+问题——父进程有控制台，子进程只是复用它、不新建窗口，这就是它一直没被测出来的原因。
+
+实测（父进程 `pythonw.exe`，问子进程自己的控制台窗口是否可见，即 `GetConsoleWindow()` + `IsWindowVisible`）：
+
+| 启动方式 | 子进程控制台窗口 |
+|---|---|
+| 旧的 `subprocess.run(...)` | **VISIBLE** |
+| 新的 `run_hidden(...)` | `no-console-window` |
+| 从有控制台的终端启动（对照组） | `hidden`（复用父控制台，不新建） |
+
+修复：`relay_supervisor.py` 新增 `run_hidden()`，Windows 上带 `CREATE_NO_WINDOW` 与
+`STARTUPINFO{STARTF_USESHOWWINDOW, SW_HIDE}`，其它平台不传任何 Windows 专属参数。四个控制台调用点
+（`find_processes` 的 powershell、`pid_exists` 的 tasklist、`kill_pid` 的 taskkill、`spawn` 的 node）全部经由它；
+`spawn` 原有的 `DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP` 保留，另加同一份 `STARTUPINFO`。捕获输出、真实 pid、
+退出码与全部拒绝码不变——这一层只影响窗口，不影响任何判断。
+
+测试（`test_t095b221_relay_supervisor.py` 24 项，本轮新增 3 项）：
+
+| 测试 | 钉住的行为 |
+|---|---|
+| `test_a_console_child_of_a_console_less_parent_gets_no_window` | 在 `pythonw.exe` 父进程下，旧路径必须复现 `VISIBLE`、新路径必须是 `no-console-window` |
+| `test_every_console_child_goes_through_the_hidden_helper` | AST 断言：除 `run_hidden` / `spawn` 外，任何函数再出现 `subprocess.run/Popen/call/check_output/check_call` 即失败 |
+| `test_run_hidden_asks_windows_for_no_window` | `creationflags == CREATE_NO_WINDOW`，`startupinfo` 带 `STARTF_USESHOWWINDOW` 与 `SW_HIDE` |
+
+红灯：删掉 `run_hidden` 里那两个 Windows 参数 → 探针测试 FAILED；恢复后 OK，源文件逐字节还原。
+
+处置顺序（本次实际执行）：先 `schtasks /Change /TN "DSH-Relay-Supervisor-Tick" /DISABLE` 止血——service 与
+sidecar 保持运行，不重启、不杀、不动授权；改代码、跑测试与门禁；再 `/ENABLE` 并 `schtasks /Run` 复核一次。登录自启
+那条（`DSH-Relay-Supervisor`，ONLOGON）用的是同一份脚本，无需另改。
+
+回滚：`git revert` 本轮提交即恢复旧行为（计划任务读的就是仓库里这份脚本，不需要重新部署）；若只想回到"没有窗口修复"
+的状态，`schtasks /Change /TN "DSH-Relay-Supervisor-Tick" /DISABLE` 可再次止血，代价是失去每两分钟的自愈检查。

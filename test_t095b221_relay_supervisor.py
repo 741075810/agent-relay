@@ -61,6 +61,35 @@ def digest(path):
 
 SUPERVISOR_MODULE = os.path.join(HERE, 'tools', 'service', 'relay_supervisor.py')
 
+# Asks Windows whether the console window this process owns is visible. `[Console]::Title` is the wrong question:
+# CREATE_NO_WINDOW still creates a console, it just never shows one.
+CONSOLE_PROBE = """
+Add-Type -Namespace W -Name K -MemberDefinition @'
+[DllImport("kernel32.dll")] public static extern System.IntPtr GetConsoleWindow();
+'@
+Add-Type -Namespace W -Name U -MemberDefinition @'
+[DllImport("user32.dll")] public static extern bool IsWindowVisible(System.IntPtr h);
+'@
+$h = [W.K]::GetConsoleWindow()
+if ($h -eq [System.IntPtr]::Zero) { 'no-console-window' }
+elseif ([W.U]::IsWindowVisible($h)) { 'VISIBLE' } else { 'hidden' }
+"""
+
+# The driver runs under pythonw.exe (no console of its own), which is the parent the scheduled task creates: a console
+# child of a console-less parent gets a brand-new console window unless CREATE_NO_WINDOW is asked for.
+CONSOLE_DRIVER = """
+import importlib.util, subprocess, sys
+spec = importlib.util.spec_from_file_location('sup', sys.argv[3])
+sup = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(sup)
+probe, out = sys.argv[1], sys.argv[2]
+command = ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', probe]
+fixed = sup.run_hidden(command, timeout=60)
+plain = subprocess.run(command, capture_output=True, text=True, timeout=60)
+with open(out, 'w', encoding='utf-8') as handle:
+    handle.write('|'.join([(fixed.stdout or '').strip(), (plain.stdout or '').strip()]))
+"""
+
 # Runs the supervisor with the process inventory failing after N successful queries: the shape of "the CIM query broke
 # right after the kill", which is where a naive implementation reads "could not look" as "it is gone".
 INVENTORY_FAILS_AFTER = """
@@ -576,6 +605,74 @@ class RelaySupervisorTest(unittest.TestCase):
             self.assertEqual(self.children(), [])
         finally:
             server.stop()
+
+    # ---- T225: no console window may appear on the operator's desktop -------------------------------------------
+    def test_a_console_child_of_a_console_less_parent_gets_no_window(self):
+        """The defect and the fix, measured in the condition production runs in.
+
+        Under pythonw, `subprocess.run` hands the child a console whose window is visible -- that is the shell that flashed
+        every two minutes. Through `run_hidden` the child gets no console window at all.
+        """
+        pythonw = os.path.join(os.path.dirname(sys.executable), 'pythonw.exe')
+        if not os.path.exists(pythonw):
+            self.skipTest('pythonw.exe is not next to the interpreter')
+        probe = os.path.join(self.root, 'console_probe.ps1')
+        with open(probe, 'w', encoding='utf-8') as handle:
+            handle.write(CONSOLE_PROBE)
+        driver = os.path.join(self.root, 'console_driver.py')
+        with open(driver, 'w', encoding='utf-8') as handle:
+            handle.write(CONSOLE_DRIVER)
+        out = os.path.join(self.root, 'console_result.txt')
+        subprocess.run([pythonw, '-B', driver, probe, out, SUPERVISOR_MODULE], timeout=180, check=True)
+        fixed, plain = open(out, encoding='utf-8').read().strip().split('|')
+        self.assertEqual(plain, 'VISIBLE', 'the pre-fix path no longer reproduces the visible console')
+        self.assertIn(fixed, ('no-console-window', 'hidden'),
+                      'run_hidden still leaves a visible console window: %r' % fixed)
+
+    def test_every_console_child_goes_through_the_hidden_helper(self):
+        """A new `subprocess.run` anywhere else would reintroduce the flashing window, so the shape is asserted."""
+        import ast
+        tree = ast.parse(open(SUPERVISOR_MODULE, encoding='utf-8').read())
+        allowed = {'run_hidden', 'spawn'}
+        offenders = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for inner in ast.walk(node):
+                if not isinstance(inner, ast.Call) or not isinstance(inner.func, ast.Attribute):
+                    continue
+                if not (isinstance(inner.func.value, ast.Name) and inner.func.value.id == 'subprocess'):
+                    continue
+                if inner.func.attr in ('run', 'Popen', 'call', 'check_output', 'check_call') \
+                        and node.name not in allowed:
+                    offenders.append('%s() calls subprocess.%s' % (node.name, inner.func.attr))
+        self.assertEqual(offenders, [], offenders)
+
+    def test_run_hidden_asks_windows_for_no_window(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('sup_flags', SUPERVISOR_MODULE)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        captured = {}
+
+        class Recorder:
+            def __init__(self, *args, **kwargs):
+                captured.update(kwargs)
+                self.returncode = 0
+                self.stdout = ''
+                self.stderr = ''
+
+        original = module.subprocess.run
+        module.subprocess.run = Recorder
+        try:
+            module.run_hidden(['tasklist', '/?'])
+        finally:
+            module.subprocess.run = original
+        self.assertEqual(captured.get('creationflags'), module.CREATE_NO_WINDOW)
+        startup = captured.get('startupinfo')
+        self.assertIsNotNone(startup)
+        self.assertTrue(startup.dwFlags & module.subprocess.STARTF_USESHOWWINDOW)
+        self.assertEqual(startup.wShowWindow, module.subprocess.SW_HIDE)
 
     def test_status_mode_reports_the_last_run(self):
         self.write_relay_txt()
