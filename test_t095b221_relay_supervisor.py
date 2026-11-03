@@ -78,16 +78,22 @@ elseif ([W.U]::IsWindowVisible($h)) { 'VISIBLE' } else { 'hidden' }
 # The driver runs under pythonw.exe (no console of its own), which is the parent the scheduled task creates: a console
 # child of a console-less parent gets a brand-new console window unless CREATE_NO_WINDOW is asked for.
 CONSOLE_DRIVER = """
-import importlib.util, subprocess, sys
+import importlib.util, os, subprocess, sys
 spec = importlib.util.spec_from_file_location('sup', sys.argv[3])
 sup = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(sup)
 probe, out = sys.argv[1], sys.argv[2]
 command = ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', probe]
 fixed = sup.run_hidden(command, timeout=60)
-plain = subprocess.run(command, capture_output=True, text=True, timeout=60)
+# The control run is what proves the mechanism and it puts a real window on the desktop, so it only happens when
+# somebody asked for it: without the flag this driver must not create a single visible window.
+if os.environ.get('DSH_T226_VISIBLE_CONTROL') == '1':
+    plain = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    plain_out = (plain.stdout or '').strip()
+else:
+    plain_out = 'skipped'
 with open(out, 'w', encoding='utf-8') as handle:
-    handle.write('|'.join([(fixed.stdout or '').strip(), (plain.stdout or '').strip()]))
+    handle.write('|'.join([(fixed.stdout or '').strip(), plain_out]))
 """
 
 # Runs the supervisor with the process inventory failing after N successful queries: the shape of "the CIM query broke
@@ -632,7 +638,7 @@ class RelaySupervisorTest(unittest.TestCase):
         if os.environ.get('DSH_T226_VISIBLE_CONTROL') == '1':
             self.assertEqual(plain, 'VISIBLE', 'the pre-fix path no longer reproduces the visible console')
         else:
-            self.assertIn(plain, ('VISIBLE', 'no-console-window', 'hidden'))
+            self.assertEqual(plain, 'skipped', 'the driver ran the visible control anyway')
 
     def test_every_console_child_goes_through_the_hidden_helper(self):
         """A new `subprocess.run` anywhere else would reintroduce the flashing window, so the shape is asserted."""
