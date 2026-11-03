@@ -134,6 +134,39 @@ def plausible(value_ms, now_ms):
     return (isinstance(value_ms, int) and EARLIEST_MS <= value_ms <= now_ms + CLOCK_SKEW_MS)
 
 
+# T214: a numeric `completedAt` is only evidence when something says where it came from *and* that source is the
+# terminal event for the very status being announced. A number with no provenance, or one whose provenance contradicts
+# the status, is not a smaller piece of evidence -- it is no evidence, and it is deferred rather than trusted.
+#
+# The trust boundary is explicit and local: this list describes the Bridge's own event kinds as read by `run_origin`.
+# Nothing here verifies a third-party credential, and nothing pretends to -- a candidate that arrives from another
+# sidecar carrying a plausible number is refused unless it also carries a source this list names.
+TRUSTED_COMPLETION_SOURCES = {
+    'completed': 'bridge.task_events.task.completed',
+    'failed': 'bridge.task_events.task.failed',
+    'interrupted': 'bridge.task_events.task.interrupted',
+}
+
+
+def completion_source_ok(item):
+    """Whether this candidate's stated instant has a provenance that matches its own status."""
+    if not isinstance(item, dict):
+        return False
+    expected = TRUSTED_COMPLETION_SOURCES.get(item.get('status'))
+    if expected is None:
+        return False
+    source = item.get('completedAtSource')
+    return isinstance(source, str) and source == expected
+
+
+def trusted_completed_ms(item):
+    """The completion instant, when the candidate carries both a plausible number and a matching source."""
+    value = completed_ms(item)
+    if value is None:
+        return None
+    return value if completion_source_ok(item) else None
+
+
 def was_offered(offered, run_id, status=None):
     """Whether this identity names something the host actually handed out.
 

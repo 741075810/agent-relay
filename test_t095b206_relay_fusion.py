@@ -81,9 +81,15 @@ class RelayScene(unittest.TestCase):
     def seed_relay(self, candidates):
         # A relay candidate with no start time cannot be proven newer than the activation instant, so the host absorbs
         # it rather than announcing it. These fixtures describe runs that finished after activation, and say so.
+        def event_source(status):
+            return {'completed': 'bridge.task_events.task.completed',
+                    'failed': 'bridge.task_events.task.failed',
+                    'interrupted': 'bridge.task_events.task.interrupted'}.get(status)
+
         candidates = [dict(item,
                            startedAt=item.get('startedAt', RECENT_MS),
-                           completedAt=item.get('completedAt') or (int(time.time() * 1000) + 60000))
+                           completedAt=item.get('completedAt') or (int(time.time() * 1000) + 60000),
+                           completedAtSource=item.get('completedAtSource') or event_source(item.get('terminalStatus')))
                   for item in candidates]
         token = open(self.token_file, encoding='utf-8').read().strip()
         import urllib.request

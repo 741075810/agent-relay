@@ -71,7 +71,7 @@ async function seed(service, items) {
     // cannot drift into the past while the suite runs.
     body: JSON.stringify({ candidates: items.map(([runId, startedAt, completedAt]) => ({ runId,
       terminalStatus: 'completed', startedAt,
-      completedAt: completedAt ?? (Date.now() + 60000),
+      completedAt: completedAt ?? (Date.now() + 60000), completedAtSource: 'bridge.task_events.task.completed',
       hostSource: 'native_host.terminal-mirror', statusSource: 'bridge_ledger.status', origin: 'bridge' })) }),
   });
 }

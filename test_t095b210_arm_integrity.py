@@ -36,6 +36,8 @@ class ArmIntegrity(RelayScene):
                 'statusSource': 'bridge_ledger.status', 'origin': 'bridge'}
         if completed_at is not None:
             item['completedAt'] = completed_at
+            item['completedAtSource'] = {'completed': 'bridge.task_events.task.completed',
+                                         'failed': 'bridge.task_events.task.failed'}.get(status)
         return item
 
     def seed(self, items):

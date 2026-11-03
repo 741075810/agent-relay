@@ -65,7 +65,7 @@ async function seed(service, status = 'completed') {
   const response = await fetch(service.base + '/host/terminal-candidates', {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: 'Bearer ' + token },
-    body: JSON.stringify({ candidates: [{ runId: RUN, terminalStatus: status, startedAt: 1700000000000, completedAt: Date.now() + 60000,
+    body: JSON.stringify({ candidates: [{ runId: RUN, terminalStatus: status, startedAt: 1700000000000, completedAt: Date.now() + 60000, completedAtSource: 'bridge.task_events.task.' + (status === 'failed' ? 'failed' : 'completed'),
       hostSource: 'native_host.terminal-mirror', statusSource: 'bridge_ledger.status', origin: 'bridge' }] }),
   });
   return response.json();

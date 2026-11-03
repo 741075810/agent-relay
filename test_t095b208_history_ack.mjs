@@ -70,7 +70,7 @@ async function seed(service, runIds) {
     headers: { 'content-type': 'application/json', authorization: 'Bearer ' + token },
     body: JSON.stringify({ candidates: runIds.map((runId) => ({ runId, terminalStatus: 'completed',
       startedAt: 1700000000000,
-      completedAt: stamp(runId),
+      completedAt: stamp(runId), completedAtSource: 'bridge.task_events.task.completed',
       hostSource: 'native_host.terminal-mirror', statusSource: 'bridge_ledger.status', origin: 'bridge' })) }),
   });
 }

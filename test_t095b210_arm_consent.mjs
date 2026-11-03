@@ -116,7 +116,7 @@ test('a long run that began before the arm and finished after it is delivered on
     takenAt: 1793600000, truncated: false, ids: [], sources: ['bridge_ledger'], relayCovered: false }));
   await pass(world, service);
   await seed(service, [{ runId: LONG_RUN, terminalStatus: 'completed', startedAt: OLD,
-    completedAt: Date.now() + 60000,
+    completedAt: Date.now() + 60000, completedAtSource: 'bridge.task_events.task.completed',
     hostSource: 'native_host.terminal-mirror', statusSource: 'bridge_ledger.status', origin: 'bridge' }]);
   const pass1 = await pass(world, service);
   assert.deepEqual(pass1.admitted.map((item) => item.runId), [LONG_RUN]);

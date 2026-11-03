@@ -37,6 +37,8 @@ class RelayActivation(RelayScene):
                 'statusSource': 'bridge_ledger.status', 'origin': 'bridge'}
         if stamps is not None:
             item['startedAt'], item['completedAt'] = stamps
+            item['completedAtSource'] = {'completed': 'bridge.task_events.task.completed',
+                                         'failed': 'bridge.task_events.task.failed'}.get(status)
         return item
 
     def sample(self):

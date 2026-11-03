@@ -206,6 +206,13 @@ def load_arm(state_dir):
         raise SourceError('%s is not a complete snapshot' % path)
     if not isinstance(doc.get('takenAt'), (int, float)):
         raise SourceError('%s has no numeric takenAt' % path)
+    precision = doc.get('armTakenAtMs')
+    if precision is not None:
+        if isinstance(precision, bool) or not isinstance(precision, int) or precision <= 0:
+            raise SourceError('%s has a malformed armTakenAtMs' % path)
+        # A millisecond field that disagrees with its own second field is not a boundary anyone can trust.
+        if precision // 1000 != int(doc['takenAt']):
+            raise SourceError('%s has armTakenAtMs and takenAt in different seconds' % path)
     return doc
 
 
@@ -274,10 +281,16 @@ def arm_snapshot(state_dir, root=None, epoch=None, relay_source=None):
                 'error': ('%d terminal runs exceed the %d id snapshot bound; '
                           'refusing to arm on a partial snapshot'
                           % (len(ids), MAX_SNAPSHOT_IDS))}
+    now_ms = int(time.time() * 1000)
     doc = {
         'version': ARM_VERSION,
         'epoch': epoch,
-        'takenAt': int(time.time()),
+        # `takenAt` stays whole seconds because older extension builds read it. It is *not* used for the consent
+        # boundary any more: truncating 12:00:00.900 to 12:00:00 made a task that finished at 12:00:00.500 -- before the
+        # operator consented -- look as though it finished after.
+        'takenAt': now_ms // 1000,
+        # The instant this snapshot was taken, to the millisecond. This is the boundary.
+        'armTakenAtMs': now_ms,
         'ids': sorted(set(ids)),
         'truncated': False,
         # What this snapshot actually covers. `relayCovered: false` is not a defect -- it is the honest statement that
@@ -302,6 +315,22 @@ def arm_snapshot(state_dir, root=None, epoch=None, relay_source=None):
             'truncated': False, 'source': 'codex-bridge-ledger',
             'sources': doc['sources'], 'relayCovered': relay_covered, 'relayCount': relay_count,
             'relaySource': doc['relaySource'], 'relayUpstreamComplete': False}
+
+
+def _arm_boundary(arm, activated_at):
+    """The instant consent begins, and how precisely it is known.
+
+    A snapshot written before `armTakenAtMs` existed records only the second. The operator armed somewhere inside that
+    second, so every candidate finishing *within* it is uncertain, and uncertainty here must not be rounded towards
+    sending: the boundary becomes the end of that second, and a run must complete strictly after it. That costs at most
+    one second of notifications and cannot produce a notice about work that had already finished.
+    """
+    if arm is None:
+        return activated_at, 'activation'
+    precise = arm.get('armTakenAtMs')
+    if isinstance(precise, int) and not isinstance(precise, bool) and precise > 0:
+        return precise, 'ms'
+    return (int(arm['takenAt']) + 1) * 1000 - 1, 'second'
 
 
 def load_state(state_dir):
@@ -928,6 +957,8 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
     relay_absence_refused = 0
     relay_deferred = 0
     relay_deferred_dropped = 0
+    relay_source_untrusted = 0
+    arm_precision = 'activation'
     relay_activation = next_state.get('relayActivation')
     if relay_source:
         # The relay is an optional source that can arrive long after the native one, so it keeps an activation of its
@@ -947,7 +978,7 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
             # The boundary is the consent instant when a snapshot exists, and the moment this source first became
             # readable when it does not. Either way the only usable proof is a *completion* time: creation time says
             # completion is at or after it, which is the wrong direction for a decision about consent.
-            boundary_ms = int(arm['takenAt']) * 1000 if arm is not None else activated_at
+            boundary_ms, arm_precision = _arm_boundary(arm, activated_at)
             now_ms = int(time.time() * 1000)
             # T212: a snapshot may never authorise by absence. `relayCovered` only records that the relay *service*
             # was read, and that service is filled asynchronously by the `host_mirror.mjs` sidecar -- so an empty read
@@ -972,6 +1003,11 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
                     history_ids.append(item['runId'])
                     continue
                 evidence = relay_merge.completed_ms(item)
+                if evidence is not None and not relay_merge.completion_source_ok(item):
+                    # A number without a matching provenance: refused by name, kept recoverable.
+                    deferred_ids.append(item['runId'])
+                    relay_source_untrusted += 1
+                    continue
                 if evidence is None:
                     # Terminal, but when is unknown. Not sent, not absorbed: deferred with the reason kept.
                     deferred_ids.append(item['runId'])
@@ -1079,9 +1115,15 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
         # so a Bridge terminal event that lands later can still authorise them.
         'relayDeferred': relay_deferred,
         'relayDeferredDropped': relay_deferred_dropped,
+        # Candidates carrying a numeric instant whose stated source is missing or does not match its status. Counted
+        # apart from "no instant at all", because the two say different things about the reporting host.
+        'relaySourceUntrusted': relay_source_untrusted,
         # Whether the snapshot on disk claims an upstream-complete read. No writer produces such a proof today, and
         # nothing authorises on it.
         'armRelayProof': bool(arm is not None and arm.get('relayUpstreamComplete') is True),
+        # `ms` -- the snapshot recorded its own instant; `second` -- an old snapshot, where the whole recorded second is
+        # treated as before consent; `activation` -- no snapshot, so consent begins at first successful read.
+        'armPrecision': arm_precision,
         'confirmed': False,
         'requiresAck': True,
         'redelivered': info['redelivered'],
