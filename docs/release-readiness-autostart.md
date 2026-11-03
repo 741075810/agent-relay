@@ -303,3 +303,24 @@ ame(pid) <- parent <- ... 的
 T227 查过：除 Bridge 台账之外没有可证实的独立来源，relay 是同源第二运输，不能当故障备用通路。接口约束、候选
 清单与关闭条件见 docs/independent-terminal-source.md；适配器 	ools/service/independent_terminal_source.py
 现在什么都没绑（PRODUCTION_SOURCES = ()），不被任何生产入口 import。
+
+## 13. 跨重启一致性（T228）
+
+现场：`onInstalled`（chrome://extensions 上按 Reload）只恢复 poll 与 terminal 两个闹钟，**不处理已过期的
+`retryAt`**；`onStartup`（真正启动浏览器）处理。两条路径语义本该一致，差别在于闹钟表在两种情况下都会被清空。
+后果：笔记本合盖过夜、队列里有待重试的投递、回来按 Reload —— `retryAt` 已过期，`chrome.alarms.create({when:
+过去})` 兜不住（代码里根本没走到那一步），队列要等到**第二次** Reload 才动。
+
+修法：抽出 `restoreRetryAlarm()`，两个钩子共用：未来 → 按原时刻建一次性闹钟；已过期 → 清掉 `retryAt` 并立刻
+`queueDelivery.retryFromAlarm()`。
+
+回归：`test_t095b228_restart_consistency.mjs`（20 断言，5 组）
+- A 已过期 retry 的 Reload 必须立刻重试（**红灯**：改前 host 调用 0 次、`retryAt` 原地不动）
+- B 未来 retry 的 Reload 必须按原时刻建闹钟、不提前发
+- C 浏览器启动的同一场景（A 对齐的目标形态）
+- D worker 中途被回收：run 落 `stopped` + `worker_restarted_during_attempt`，写屏障释放，trigger 置为
+  disabled 等人工复核，**不重发、不写页面**，`armEpoch` 不变
+- E Reload 后两个闹钟都在，且不改写已存的授权
+
+沙箱化：`test_support_chrome.mjs` 提供带真实监听器的 `chrome.*` 假实现，`connectNative` 只记录不建端口；
+没有浏览器、没有页面、没有 native host。

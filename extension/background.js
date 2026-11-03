@@ -271,10 +271,12 @@ chrome.runtime.onInstalled.addListener(async () => {
   // form cannot promise that, and a worker suspended mid-flight would leave the table
   // empty while reporting success.
   await restoreTerminalAlarm();
-  const { retryAt } = await chrome.storage.local.get({ retryAt: null });
-  if (Number.isFinite(retryAt) && retryAt > Date.now()) {
-    chrome.alarms.create(RETRY_ALARM, { when: retryAt });
-  }
+  // T228: a reload is the same event as a start for this purpose -- the alarm table went away either way. When the
+  // stored instant is already past (the laptop was closed, the queue waited through a sleep), recreating the alarm
+  // would schedule it for now, and Chrome never fires a `when` that is behind the clock: the queued delivery then sat
+  // until the extension was reloaded a second time. The browser-start path already did this; the reload path did not,
+  // which is why the two branches are now one function.
+  await restoreRetryAlarm();
   await note({ kind: 'installed', periodMinutes: POLL_PERIOD_MINUTES });
 });
 
@@ -283,14 +285,7 @@ chrome.runtime.onStartup.addListener(() => {
   // The alarm table does not survive a restart but the stored authorization
   // does; without this the trigger would look armed and never tick.
   restoreTerminalAlarm().catch(() => {});
-  chrome.storage.local.get({ retryAt: null }).then(({ retryAt }) => {
-    if (Number.isFinite(retryAt) && retryAt > Date.now()) {
-      chrome.alarms.create(RETRY_ALARM, { when: retryAt });
-    } else if (Number.isFinite(retryAt)) {
-      chrome.storage.local.remove('retryAt');
-      queueDelivery.retryFromAlarm();
-    }
-  });
+  restoreRetryAlarm().catch(() => {});
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
@@ -390,6 +385,20 @@ function terminalAlarmPeriod(state) {
   const clamped = Math.max(MIN_ALARM_PERIOD_MINUTES,
     Math.min(wanted, MAX_ALARM_PERIOD_MINUTES));
   return Math.round(clamped * 100) / 100;
+}
+
+// The retry instant survives a restart (it is in storage) but the alarm that would honour it does not. Restoring it is
+// two different operations depending on the clock: still in the future means recreate the one-shot alarm; already past
+// means the queue is overdue and has to be polled now, because Chrome will not fire an alarm whose `when` is behind it.
+async function restoreRetryAlarm() {
+  const { retryAt } = await chrome.storage.local.get({ retryAt: null });
+  if (!Number.isFinite(retryAt)) return;
+  if (retryAt > Date.now()) {
+    chrome.alarms.create(RETRY_ALARM, { when: retryAt });
+    return;
+  }
+  await chrome.storage.local.remove('retryAt');
+  await queueDelivery.retryFromAlarm();
 }
 
 async function syncTerminalAlarm() {
