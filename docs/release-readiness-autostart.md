@@ -258,3 +258,42 @@ sidecar 保持运行，不重启、不杀、不动授权；改代码、跑测试
 
 回滚：`git revert` 本轮提交即恢复旧行为（计划任务读的就是仓库里这份脚本，不需要重新部署）；若只想回到"没有窗口修复"
 的状态，`schtasks /Change /TN "DSH-Relay-Supervisor-Tick" /DISABLE` 可再次止血，代价是失去每两分钟的自愈检查。
+
+## 11. T226：T225 之后仍在闪的窗口，是 sidecar 每 20 秒拉起一次 python host
+
+T225 只修了 coordinator 自己的子进程。用户复验仍在闪，所以这一轮不再靠推理，改为观测：一个只读观察器
+（EnumWindows + IsWindowVisible + Toolhelp 进程表，自身不起任何子进程、不记录窗口标题）跑了 12 分钟，
+覆盖 6 个 tick 周期。
+
+第一次（修复前）：
+
+| 可见控制台窗口 | 数量 | 归属 |
+|---|---|---|
+| PseudoConsoleWindow / python.exe | **24** | 父进程是 
+ode.exe 44752，即 relay sidecar（--poll-ms 20000），中位间隔 **20.5 s** |
+| PseudoConsoleWindow / powershell.exe | 1 | 父进程是 WindowsTerminal，是观察者自己的宿主，不是本项目 |
+
+根因在 	ools/service/host_mirror.mjs 第 57 行：spawn(host.python, args, { stdio: [...] })，Node 的
+windowsHide 默认 **false**。sidecar 自己是 detached、无控制台，于是每个子控制台程序都被分配一个新控制台 ——
+一个新控制台就是一个窗口，每 20 秒一次。
+elay_candidate_intake.mjs 是同一个形状，同样的问题。两处都加了
+windowsHide: true。
+
+同时清掉两个 10 月遗留、仍在每 2 分钟触发的任务：DSH-WatchTasks-A-120s 用的是 python.exe（控制台程序），
+改为 pythonw.exe 并给它的内层 subprocess.run 加 CREATE_NO_WINDOW；DSH-NotifyFlush-Bridge 本来就是
+pythonw，且不起子进程。两个任务的定义都先导出到 inbox\backup-t226\*.xml 再改。
+
+第二次（修复后，13 分钟）：可见窗口 5 个 —— 3 个是 WindowsTerminal（观察者宿主），1 个是它下面的 powershell，
+剩下 1 个是**回归测试里那条对照用例**故意复现旧行为造成的。sidecar 在这段时间起了 29 个子进程（13 个 python.exe、
+15 个 conhost），**没有一个拥有可见窗口**。于是再改一条：对照用例改为 opt-in（DSH_T226_VISIBLE_CONTROL=1），
+守护断言不变 —— 测试自己也不许在桌面上弹窗。
+
+复查工具（随仓库走，只读）：
+
+`
+pythonw.exe -B tools/service/console_window_probe.py --seconds 780 --out windows.jsonl
+`
+
+输出每行一条 JSON：kind（start/window/proc/stop）、时间戳、窗口类名、pid、以及 
+ame(pid) <- parent <- ... 的
+父子链。只记类名不记标题、不记命令行，避免把用户屏幕上的内容写进日志。
