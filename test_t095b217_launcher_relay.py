@@ -320,6 +320,43 @@ class AuditNoticesAGenerationMismatch(unittest.TestCase):
         self.assertEqual(done.returncode, 2)
         self.assertIn('missing_launcher', done.stderr)
 
+    def test_the_probe_runs_in_a_copy_and_leaves_the_source_alone(self):
+        """T219: the probe promised it wrote nothing to the state directory, and it did.
+
+        The host it starts samples with `--state-dir <dir>\\state`, which writes `terminal-source.json`. Pointed at the live
+        install, that is a probe mutating production -- which happened once. It now copies first.
+        """
+        probe = os.path.join(ROOT, 'tools', 'rollout', 'installed_chain_probe.py')
+        work = tempfile.mkdtemp(prefix='t217-probe-copy-')
+        self.addCleanup(shutil.rmtree, work, True)
+        os.makedirs(os.path.join(work, 'state'))
+        state_file = os.path.join(work, 'state', 'terminal-source.json')
+        with open(state_file, 'w', encoding='utf-8') as handle:
+            handle.write('{"version": 1}')
+        before = os.stat(state_file)
+        with open(os.path.join(work, 'host_launcher.exe'), 'wb') as handle:
+            handle.write(b'MZ not a real launcher')
+        done = subprocess.run([sys.executable, '-B', probe, '--dir', work, '--origin', CHROME_ORIGIN],
+                              capture_output=True, text=True, timeout=120)
+        report = json.loads(done.stdout.strip().splitlines()[-1])
+        self.assertEqual(report['ranIn'], 'copy')
+        after = os.stat(state_file)
+        self.assertEqual((before.st_size, before.st_mtime_ns), (after.st_size, after.st_mtime_ns),
+                         'the source state directory was written by the probe')
+
+    def test_no_copy_state_runs_in_place_for_a_caller_who_asks_for_it(self):
+        probe = os.path.join(ROOT, 'tools', 'rollout', 'installed_chain_probe.py')
+        work = tempfile.mkdtemp(prefix='t217-probe-place-')
+        self.addCleanup(shutil.rmtree, work, True)
+        with open(os.path.join(work, 'host_launcher.exe'), 'wb') as handle:
+            handle.write(b'MZ not a real launcher')
+        done = subprocess.run([sys.executable, '-B', probe, '--dir', work, '--no-copy-state',
+                               '--origin', CHROME_ORIGIN],
+                              capture_output=True, text=True, timeout=120)
+        report = json.loads(done.stdout.strip().splitlines()[-1])
+        self.assertEqual(report['ranIn'], 'place')
+        self.assertFalse(report['ok'])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -118,8 +118,18 @@ The order matters: each item makes the next one possible, and the audit is the e
    `--relay-token-file` when a `relay.txt` (two lines: URL, token file) sits beside it; without that file the command
    line is byte-identical to the pre-T217 one. Build with `launcher\build_launcher.ps1`.
    **The file is locked while any host is running** — Chrome holds `host_launcher.exe` open for as long as the native
-   messaging port lives, so the copy fails with `The process cannot access the file`. Do not kill that process: the
-   extension is using it. Replace the binary in the same window as step 3, which is when Chrome drops the port.
+   messaging port lives, so overwriting it fails with `The process cannot access the file`. Do not kill that process: the
+   extension is using it. A reload does **not** open a window either: Chrome starts a new host immediately, and that host
+   takes the lock again (measured in T219 — new host PID created the same second as the reload). Rename the live image
+   aside instead, which needs no window at all:
+
+   ```powershell
+   Move-Item $INST\host_launcher.exe $INST\host_launcher.pre-t219.exe   # the running image keeps running
+   Copy-Item $REPO\host_launcher.exe $INST\host_launcher.exe           # next spawn gets the new binary
+   ```
+
+   The live session keeps the old image until Chrome spawns a host again; the relay therefore becomes live in the
+   extension's own path on the next spawn, not on the copy.
    Hash pin: before `34CFE482D518C690…`, after `4197B3581AC45CFD…` (7,680 B both) — update whatever records the pin in
    the same commit that ships the new build, never silently.
 3. **Reload the extension** from the build carrying `postArmEpoch`/`postArmUsable`
@@ -128,9 +138,14 @@ The order matters: each item makes the next one possible, and the audit is the e
    `$env:T150_EXT_ROOT=$EXT_INSTALL; node $REPO\test_t095b150_postarm_epoch.mjs` (the pre-T217 install fails 3 of 6).
 4. **Point the registration at the new directory** by updating `host_manifest.json`'s `path` (the reversible half of a
    swap), leaving `nmh.reg` untouched unless the manifest file itself moves.
-5. **Start the relay service, then the sidecar**, on production paths, without `--once`:
-   `node $REPO\tools\service\relay_service.mjs --state-dir $RELAY_DIR`
-   then `host_mirror.mjs` with `--service-url`/`--service-token-file` pointing at `$RELAY_DIR`.
+5. **Start the relay service, then the sidecar**, on production paths, without `--once` and **with `--poll-ms`** —
+   without it the sidecar does one pass and exits (`const once = argv.includes('--once') || !pollMs`):
+   `node $REPO\tools\service\relay_service.mjs --state-dir $RELAY_DIR --port 53066`
+   then `host_mirror.mjs --poll-ms 20000` with `--service-url`/`--service-token-file` pointing at `$RELAY_DIR`.
+   Start both detached from the shell (`Win32_Process.Create`), not with `Start-Process`: a `Start-Process` child inherits
+   the caller's pipes, and ending that caller takes the service down (T219 lost the service exactly that way).
+   The origin the sidecar speaks as is `allowed_origins[0]` from the installed manifest — read it, do not hard-code an id.
+   Restrict the relay directory first: `icacls $RELAY_DIR /inheritance:r /grant:r "<account>:(OI)(CI)F"`.
 6. **Re-run the audit against the new install** — this is the gate:
    `python -B $REPO\tools\rollout\readiness_audit.py --audit --installed-root $HOST_INSTALL-next … --json`.
    Only a `GO` with an empty `blocking_failed` permits step 7.
