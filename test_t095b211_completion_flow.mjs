@@ -62,6 +62,16 @@ function bridgeDatabase(dbPath, kind, seconds) {
   db.close();
 }
 
+function eventAfterActivation(world, kind, deltaMs = 5000) {
+  const state = JSON.parse(readFileSync(path.join(world.state, 'terminal-source.json'), 'utf8'));
+  assert.equal(typeof state.relayActivatedAt, 'number', 'the activation instant must be on disk');
+  const db = new DatabaseSync(world.db);
+  db.prepare('insert into bridge_service_task_events (task_id, kind, summary, created_at) values (?,?,?,?)')
+    .run('tsk-1', kind, 'after activation', (state.relayActivatedAt + deltaMs) / 1000);
+  db.close();
+  return state.relayActivatedAt;
+}
+
 async function startService(dir) {
   const child = spawn(process.execPath, [SERVICE, '--state-dir', dir], { stdio: ['ignore', 'pipe', 'pipe'] });
   children.push(child);
@@ -135,9 +145,10 @@ test('a run with no terminal event reaches the service as unknown, not as a gues
 
 test('the extension consumer receives the run the real chain authorised', async () => {
   const world = scene();
-  bridgeDatabase(world.db, 'task.completed', Math.floor(Date.now() / 1000) + 2);
+  bridgeDatabase(world.db, null, null);
   const service = await startService(path.join(world.state, 'svc'));
   await visit(world, service);                       // activation with an empty relay
+  eventAfterActivation(world, 'task.completed');     // and only then does the Bridge commit its event
   runSidecar(world, service);
   const pass = await visit(world, service);
   assert.deepEqual(pass.admitted.map((item) => item.runId), [RUN]);
