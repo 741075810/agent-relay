@@ -1,0 +1,54 @@
+T218: the extension files are in the directory Chrome loads, verified there, and Chrome has not been asked to reload
+
+The operator authorised the extension upgrade. The mistake this round had to avoid was telling him to press Reload on the
+*old* files: the reload must land on the new build, so the new build goes into the directory Chrome already loads, gets
+verified there, and only then is he asked to act.
+
+**Where it actually loads, from Chrome's own record.** `Secure Preferences` names the path, `location: 4`
+(`LOAD_UNPACKED`), and the granted APIs (`alarms`, `nativeMessaging`, `storage`, `tabs`, `scripting`) with host access to
+`chatgpt.com` and `chat.openai.com`. The manifest carries no `key`, so the id is a consequence of the path: sha256 of the
+**UTF-16LE** path string, first 32 hex digits mapped onto `a`..`p`. `extension_identity.py` recomputes it and compares it
+with Chrome's record (`agrees=True`). That is why the files were written into that directory: a copy elsewhere would have
+minted a different id and orphaned the manifest's `allowed_origins`, the host's allow-list and Chrome's stored grants.
+
+**What was written.** Fifteen files, in place: `background.js`, `popup.js`, `popup.html`, `lib/terminal_trigger.js`
+(55,524 → 59,772 B, `postArmUsable` present), `lib/autosend.js`, `lib/autosend_chrome_wiring.js`, `lib/send_adapter.js`,
+`lib/build_stamp.js`, plus seven new modules (`terminal_events.js`, the three `diagnostic_*`, `notice_runtime_view.js`,
+`readiness_queue_view.js`, `run_history_view.js`). `manifest.json` was **not** touched — it is byte-identical (`89FF5835…`),
+so permissions and identity cannot have moved. Nothing was deleted; every replaced file's previous bytes are in the T217
+backup, re-verified this round (43 entries, 0 problems, and its extension tree differs from the install by zero files).
+
+**Verified against the loaded directory, not the repository copy.**
+
+| check | result |
+|---|---|
+| `T150_EXT_ROOT=<loaded dir> node test_t095b150_postarm_epoch.mjs` | **pass 6 / fail 0** |
+| the same suite against the previous build from the backup | pass 3 / fail 3 |
+| import graph from `background.js` | 21 modules reached, none missing |
+| manifest vs repository | byte-identical |
+| id vs Chrome's record | agrees |
+| Chrome / launcher / host processes | untouched |
+
+**Delivered.**
+* `tools/rollout/extension_identity.py` — recomputes an unpacked id (UTF-16LE path digest) and optionally compares it with
+  Chrome's `Secure Preferences`; exit 3 when Chrome disagrees, 2 when the directory is absent.
+* `tools/rollout/extension_imports.py` — follows `background.js`'s relative imports, including the side-effect
+  `import './x.js'` form that has no `from`, and names what is missing with the file that asked for it. A half-copied
+  upgrade otherwise fails at registration, where the popup cannot see it.
+* `docs/release-readiness-extension-pending.md` — Chrome's record, the fifteen files with before/after sizes, the
+  verification table, what is still running the old code, the single UI step, and the rollback.
+* `test_t095b218_extension_upgrade.py` — 13 tests: the id derivation is Chrome's rule (with a one-character path change
+  changing the id), a manifest `key` overrides it, Chrome disagreeing exits non-zero, the repository tree resolves with no
+  missing module, a missing import and a missing entry point are both named, bare specifiers are not treated as files, and
+  — under `T218_INSTALLED_EXT` — the installed tree is byte-identical to the repository with no extra and no missing file.
+
+Red-light: pointing the comparison at a copy with `lib/terminal_events.js` removed fails two of its three tests; pointing
+it at the real tree is green.
+
+Not done, and stated as not done: Chrome has **not** been reloaded, no page was opened, no `chrome.debugger` or CDP was
+used, the launcher was not replaced (still locked), the relay service was not started, no arm snapshot was written, no
+message was sent. The running service worker is still the previous build — the new code is on disk and verified, not live.
+
+Audit now reads `installed_ext_epoch_bound: ok`; the only remaining blocker is `launcher_passes_relay`, which the reload
+releases. Gates: 720 Python tests OK (25 skips, 28 in a clone), 105 JS suites 0 failures, hygiene
+`0 unexplained, 13 excused, 0 stale`.
