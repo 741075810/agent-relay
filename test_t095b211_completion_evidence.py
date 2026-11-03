@@ -158,6 +158,23 @@ class RealDataPath(RelayScene):
         self.assertEqual(proc.returncode, 0, proc.stderr.decode('utf-8', 'replace'))
         return json.loads(proc.stdout.decode('utf-8').strip().splitlines()[0])
 
+    def event_after_activation(self, kind, delta_ms=5000):
+        """Commit a terminal event a fixed distance after the consent instant this run recorded."""
+        with open(os.path.join(self.state, terminal_source.STATE_NAME), encoding='utf-8') as handle:
+            state = json.load(handle)
+        activated_at = state.get('relayActivatedAt')
+        self.assertIsInstance(activated_at, int, state)
+        seconds = (activated_at + delta_ms) / 1000.0
+        conn = sqlite3.connect(self.db)
+        # The task id is whatever the fixture's own builder chose; the event has to join on it, not on a guess.
+        task_id = conn.execute('select task_id from bridge_service_tasks where provider_run_id = ?',
+                               (RELAY_RUN,)).fetchone()[0]
+        conn.execute('insert into bridge_service_task_events (task_id, kind, summary, created_at) values (?,?,?,?)',
+                     (task_id, kind, 'after activation', seconds))
+        conn.commit()
+        conn.close()
+        return activated_at
+
     def test_the_mirror_carries_the_instant_and_says_where_it_came_from(self):
         build_bridge_db(self.db, [(RELAY_RUN, 'completed', 'task.completed', EVENT_SECONDS)])
         self.other_runs([{'requestID': RELAY_RUN, 'status': 'completed', 'createdAt': OLD_START_MS}])
@@ -190,11 +207,11 @@ class RealDataPath(RelayScene):
         self.assertIsNone(report['candidates'][0]['completedAt'])
 
     def test_the_real_chain_announces_a_run_it_could_never_have_announced_before(self):
-        # The instant must be after the activation this test is about to create, so it is taken now.
-        build_bridge_db(self.db, [(RELAY_RUN, 'completed', 'task.completed', time.time() + 1)])
+        build_bridge_db(self.db, [(RELAY_RUN, 'completed', None, None)])
         self.other_runs([{'requestID': RELAY_RUN, 'status': 'completed', 'createdAt': OLD_START_MS}])
         self.start_service()
         self.host('terminal-list')                       # activation with an empty relay
+        self.event_after_activation('task.completed')    # the Bridge commits its event after consent
         pushed = self.sidecar()
         self.assertTrue(pushed['ok'], pushed)
         self.assertEqual(pushed['candidates'], 1)
@@ -206,20 +223,22 @@ class RealDataPath(RelayScene):
         self.assertTrue(listed[0]['postArm'] is None or listed[0]['postArm'] is True)
 
     def test_a_failed_run_travels_with_its_own_event(self):
-        build_bridge_db(self.db, [(RELAY_RUN, 'failed', 'task.failed', time.time() + 1)])
+        build_bridge_db(self.db, [(RELAY_RUN, 'failed', None, None)])
         self.other_runs([{'requestID': RELAY_RUN, 'status': 'failed', 'createdAt': OLD_START_MS}])
         self.start_service()
         self.host('terminal-list')
+        self.event_after_activation('task.failed')
         self.sidecar()
         reply = self.host('terminal-list')
         listed = reply['result']['candidates']
         self.assertEqual([(item['runId'], item['status']) for item in listed], [(RELAY_RUN, 'failed')])
 
     def test_a_long_run_is_announced_by_its_completion_not_its_start(self):
-        build_bridge_db(self.db, [(RELAY_RUN, 'completed', 'task.completed', time.time() + 1)])
+        build_bridge_db(self.db, [(RELAY_RUN, 'completed', None, None)])
         self.other_runs([{'requestID': RELAY_RUN, 'status': 'completed', 'createdAt': OLD_START_MS}])
         self.start_service()
         self.host('terminal-list')
+        self.event_after_activation('task.completed')
         self.sidecar()
         listed = self.host('terminal-list')['result']['candidates']
         self.assertEqual([item['runId'] for item in listed], [RELAY_RUN])
