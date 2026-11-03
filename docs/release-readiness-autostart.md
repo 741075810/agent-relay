@@ -39,11 +39,18 @@ tools/service/relay_supervisor.py     协调器：一次 --once 或常驻 --loop
 读 host_manifest.json 的 origin   没有 allowed_origins   -> manifest_missing，什么都不启动
 列本安装的进程清单（CIM 命令行）  查询失败               -> inventory_unavailable，不动任何进程
 token 缺失 + 端口已在监听         （service 在、token 没了）-> token_missing，不启动 sidecar
-带 token 探 /health              200                    -> service_healthy（pid 与清单一致，否则顺手 service_adopted）
-                                 连不上                  -> 启动 service，等它写出 token，再探
+带 token 探 /health              200 且回包是 relay 信封  -> 有归属则 service_healthy / service_adopted
+                                 200 但不是 relay 信封     -> service_not_a_relay，不启动 sidecar
+                                 200 但无本安装进程归属    -> service_healthy_unowned，不启动 sidecar
+连不上 + 本安装没有 service                            -> 启动一个，等它写出 token，再探
+连不上 + 本安装恰好一个 service                        -> service_unresponsive：等 8 秒；
+                                                          端口仍被别人占着 -> 拒绝，不杀不启
+                                                          端口空着 -> 停它（须核实退出）-> service_restarted_unresponsive
+连不上 + 本安装多于一个 service                        -> service_ambiguous，拒绝
                                  401/403 + 能证明是本安装的 service
-                                                        -> service_token_rotated -> 杀掉它 -> service_restarted -> 重探
+                                                         -> service_token_rotated -> 停它（核实退出）-> service_restarted -> 重探
                                  401/403 + 证明不了        -> service_unauthorized_foreign，不碰那个监听者
+停进程后核对退出                 清单查询失败             -> service_stop_unverified，**不启动替代者**
 sidecar.pid 在清单里且是本安装的 sidecar                      -> sidecar_alive
               pid 活着但不是本安装的 sidecar（pid 被复用）    -> sidecar_pid_foreign，再按清单找
               清单里恰好一个真 sidecar                        -> sidecar_adopted
@@ -65,7 +72,7 @@ sidecar.pid 在清单里且是本安装的 sidecar                      -> sidec
 
 两条都不成立就是 `service_unauthorized_foreign`：那个端口上是别人的程序（或者是我们的 service 已被别的东西取代），
 去杀它是**对无法识别的程序动手**，所以只记录、不操作、也不启动 sidecar。杀掉之前还会再查一次清单
-（`managed_kill`），身份在检查与动手之间变了就记 `service_restart_refused`。T221 之前的说法
+（`stop_managed`），身份在检查与动手之间变了就记 `service_restart_refused`。T221 之前的说法
 （"协调器下一步就会做"）是错的：那一版只是记下 `service_unauthorized` 就返回，每两分钟重复一次，永远不会自愈。
 这部分在 T222 修正，`test_a_rotated_token_restarts_the_service_this_install_owns` 与
 `test_unauthorized_from_a_listener_this_install_does_not_own_is_refused` 分别钉住两条边。
@@ -125,7 +132,7 @@ python -B tools/service/relay_supervisor.py --adopt --install-dir <INSTALL>
 | native host | PID 33076（21:56:36）未受影响 |
 | readiness 审计 | `decision: GO`、`blocking_failed: []`、`armPrecision: ms` |
 
-隔离演练（`test_t095b221_relay_supervisor.py`，16 项，真实 node 进程 + 临时 install + 空 `--native-root`）：
+隔离演练（`test_t095b221_relay_supervisor.py`，21 项，真实 node 进程 + 临时 install + 空 `--native-root`）：
 unconfigured 拒绝、manifest 无 origin 拒绝、token 在端口占用时缺失拒绝、启动服务再启动 sidecar、
 第二次 reconcile 不动已活的进程、service 被杀只重启 service、sidecar 被杀只重启 sidecar、
 常驻 loop 占用时第二个实例 `already_running`、`--adopt` 记录在跑的 pid 且空时拒绝、
@@ -147,6 +154,20 @@ T222 追加的五项（都在真实进程上跑，用真的 pid 复用、真的 
 mutex 名里加入 pid -> 单实例测试 FAILED(exit 1)；
 `kind` 退回 `pid_exists(pid)` -> `test_a_reused_pid_is_not_mistaken_for_a_live_sidecar` FAILED(exit 1)；
 `401` 分支不再要求归属证明 -> `test_unauthorized_from_a_listener_this_install_does_not_own_is_refused` FAILED(exit 1)。
+
+### 6.0 T223 追加的五项
+
+| 测试 | 钉住的行为 |
+|---|---|
+| `test_a_failed_inventory_after_the_kill_is_not_taken_for_an_exit` | 停进程后清单查询失败 -> `service_stop_unverified`，**不启动替代者**，旧 service 确实已死、端口空置 |
+| `test_unreachable_health_with_an_owned_service_replaces_it_instead_of_adding_one` | 健康不可达但本安装的 service 还在 -> 不是 `service_started`（不并存第二个），而是核实退出后 `service_restarted_unresponsive`，事后恰好一个 service |
+| `test_unreachable_health_with_a_held_port_kills_nothing` | 端口被别的监听者占着且不回应 -> `service_unresponsive`，那个还活着的 service 不被杀 |
+| `test_a_healthy_listener_this_install_does_not_own_is_not_ready` | 200 但没有本安装的进程归属 -> `service_healthy_unowned`，不启 sidecar、不杀外来监听者 |
+| `test_a_two_hundred_without_the_relay_envelope_is_not_healthy` | 200 但回包不是 relay 信封（无 `ok`/`version`）-> `service_not_a_relay` |
+
+对应的三处红灯：把"查询失败"读成"已退出" -> 第 1 项 FAILED(exit 1)；`unreachable` 分支不看已有
+service 就 spawn -> 第 2 项 FAILED(exit 1)；任意 200 都算健康 -> 第 5 项 FAILED(exit 1)；恢复后均 exit 0，
+源文件逐字节还原。
 
 ### 6.1 T222 在生产上的只读复核（2026-11-03 23:12）
 

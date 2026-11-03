@@ -61,6 +61,54 @@ def digest(path):
 
 SUPERVISOR_MODULE = os.path.join(HERE, 'tools', 'service', 'relay_supervisor.py')
 
+# Runs the supervisor with the process inventory failing after N successful queries: the shape of "the CIM query broke
+# right after the kill", which is where a naive implementation reads "could not look" as "it is gone".
+INVENTORY_FAILS_AFTER = """
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location('sup', r'%s')
+sup = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(sup)
+real = sup.process_map
+counter = {'n': 0}
+limit = int(sys.argv[2])
+def flaky(install):
+    counter['n'] += 1
+    if counter['n'] > limit:
+        return {}, 'query_failed'
+    return real(install)
+sup.process_map = flaky
+raise SystemExit(sup.main(['--once', '--install-dir', sys.argv[1]]))
+""" % SUPERVISOR_MODULE
+
+
+class FakeHTTP:
+    """A listener that answers whatever the test tells it to: 200 with a relay-shaped body, 200 with junk, or 401."""
+
+    def __init__(self, port, status=200, body=b'{"ok":true,"version":"9.9.9","seq":1}'):
+        import http.server
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(status)
+                self.send_header('content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.HTTPServer(('127.0.0.1', port), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.alive = True
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.alive = False
+
+
 # Runs the supervisor with the process inventory deliberately broken, via the same code path the tool uses at run time.
 UNREADABLE_INVENTORY = """
 import importlib.util, json, sys
@@ -438,6 +486,96 @@ class RelaySupervisorTest(unittest.TestCase):
     def write_pid(self, name, pid):
         with open(os.path.join(self.install, 'relay', name), 'w', encoding='ascii') as handle:
             handle.write('%d\n' % pid)
+
+    # ---- T223: a failed verification is not a success ------------------------------------------------------------
+    def test_a_failed_inventory_after_the_kill_is_not_taken_for_an_exit(self):
+        """The kill worked; the proof did not. No replacement may be started, because "I could not look" is not "gone"."""
+        self.write_relay_txt()
+        self.run_once()
+        self.assertTrue(self.wait_for(lambda: len(self.children()) == 2, timeout=30))
+        service_pid, _sidecar = self.first_pids()
+        with open(os.path.join(self.install, 'relay', 'service.token'), 'w', encoding='ascii') as handle:
+            handle.write('e' * 48 + '\n')
+
+        script = os.path.join(self.root, 'flaky_inventory.py')
+        with open(script, 'w', encoding='utf-8') as handle:
+            handle.write(INVENTORY_FAILS_AFTER)
+        proc = subprocess.run([sys.executable, '-B', script, self.install, '2'], capture_output=True, text=True,
+                              timeout=180)
+        output = proc.stdout
+        self.assertEqual(proc.returncode, 1, output + proc.stderr)
+        self.assertIn('service_stop_unverified', output, output)
+        self.assertNotIn('service_restarted', output, 'a replacement was started without proof that the old one stopped')
+        self.assertNotIn('service_started', output)
+        self.assertIn('sidecar_deferred', output)
+        self.assertTrue(self.wait_for(lambda: not pid_alive(service_pid), timeout=20), 'the stale service survived')
+        services = [pid for pid, kind in process_map_for(self.install).items() if kind == 'service']
+        self.assertEqual(services, [], 'a second service was started beside an unverified stop: %r' % services)
+
+    def test_unreachable_health_with_an_owned_service_replaces_it_instead_of_adding_one(self):
+        self.write_relay_txt()
+        self.run_once()
+        self.assertTrue(self.wait_for(lambda: len(self.children()) == 2, timeout=30))
+        old_service = self.first_pids()[0]
+        # Point the relay at a port nothing holds: health is unreachable while our service is still running.
+        self.port = free_port()
+        self.write_relay_txt()
+
+        result = self.run_once()
+        codes = [action['code'] for action in result['actions']]
+        self.assertNotIn('service_started', codes, 'a second service was spawned beside a running one: %r' % codes)
+        self.assertIn('service_restarted_unresponsive', codes, codes)
+        self.assertTrue(self.wait_for(lambda: not pid_alive(old_service), timeout=20))
+        services = [pid for pid, kind in process_map_for(self.install).items() if kind == 'service']
+        self.assertEqual(len(services), 1, 'expecting exactly one replacement, saw %r' % services)
+
+    def test_unreachable_health_with_a_held_port_kills_nothing(self):
+        self.write_relay_txt()
+        self.run_once()
+        self.assertTrue(self.wait_for(lambda: len(self.children()) == 2, timeout=30))
+        service_pid = self.first_pids()[0]
+
+        # A port held by something that never answers HTTP, while our own service is alive on another port. The backlog
+        # is deep on purpose: the health probe consumes a slot before the port check runs, and a backlog of one makes
+        # the later probe look like "nothing is listening" -- which would test the wrong branch.
+        held = socket.socket()
+        held.bind(('127.0.0.1', 0))
+        held.listen(64)
+        self.addCleanup(held.close)
+        self.port = held.getsockname()[1]
+        self.write_relay_txt()
+
+        result = self.run_once(expect=1)
+        self.assertEqual(result['code'], 'service_unresponsive')
+        self.assertIn('sidecar_deferred', [action['code'] for action in result['actions']])
+        self.assertTrue(pid_alive(service_pid), 'a running service was killed because another port was held')
+
+    def test_a_healthy_listener_this_install_does_not_own_is_not_ready(self):
+        """200 with our token is not enough: if no process of ours owns the listener, readiness is not claimed."""
+        server = FakeHTTP(self.port)
+        try:
+            self.write_relay_txt()
+            with open(os.path.join(self.install, 'relay', 'service.token'), 'w', encoding='ascii') as handle:
+                handle.write('b' * 48 + '\n')
+            result = self.run_once(expect=1)
+            self.assertEqual(result['code'], 'service_healthy_unowned')
+            self.assertIn('sidecar_deferred', [action['code'] for action in result['actions']])
+            self.assertTrue(server.alive, 'the foreign listener was killed')
+            self.assertEqual(self.children(), [], 'a sidecar was started against an unattributable listener')
+        finally:
+            server.stop()
+
+    def test_a_two_hundred_without_the_relay_envelope_is_not_healthy(self):
+        server = FakeHTTP(self.port, status=200, body=b'{"hello":"world"}')
+        try:
+            self.write_relay_txt()
+            with open(os.path.join(self.install, 'relay', 'service.token'), 'w', encoding='ascii') as handle:
+                handle.write('c' * 48 + '\n')
+            result = self.run_once(expect=1)
+            self.assertEqual(result['code'], 'service_not_a_relay')
+            self.assertEqual(self.children(), [])
+        finally:
+            server.stop()
 
     def test_status_mode_reports_the_last_run(self):
         self.write_relay_txt()

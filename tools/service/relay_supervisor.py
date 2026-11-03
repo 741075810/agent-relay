@@ -110,12 +110,23 @@ def health(base, token_file, timeout=5):
                                      headers={'authorization': 'Bearer ' + token})
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            body = response.read(2000).decode('utf-8', 'replace')
-        return ('healthy' if response.status == 200 else 'unexpected_status'), body[:200]
+            status = response.status
+            body = response.read(4000).decode('utf-8', 'replace')
     except urllib.error.HTTPError as exc:
         return ('unauthorized' if exc.code in (401, 403) else 'unexpected_status'), 'HTTP %d' % exc.code
     except (urllib.error.URLError, OSError):
         return 'unreachable', None
+    if status != 200:
+        return 'unexpected_status', 'HTTP %d' % status
+    # A 200 is not enough: any listener can return one. Only a reply carrying the service's own envelope counts, so an
+    # unrelated program on the port cannot be mistaken for a healthy relay.
+    try:
+        doc = json.loads(body)
+    except ValueError:
+        return 'not_a_relay', 'the reply is not JSON'
+    if not isinstance(doc, dict) or doc.get('ok') is not True or 'version' not in doc:
+        return 'not_a_relay', 'the reply has no ok/version envelope'
+    return 'healthy', 'v%s' % doc.get('version')
 
 
 def listening(port, timeout=2):
@@ -246,12 +257,13 @@ class Supervisor:
         self.log(code, detail)
 
     # ---- identity ---------------------------------------------------------------------------------------------------
-    def inventory(self):
+    def inventory(self, quiet=False):
         """A fresh map of pids this install owns. A query failure is a refusal, not an empty answer: "I could not look"
         and "nothing is running" must not collapse into one, because the second one starts a duplicate process."""
         mapping, trouble = process_map(self.install)
         if trouble:
-            self.record('inventory_unavailable', trouble)
+            if not quiet:
+                self.record('inventory_unavailable', trouble)
             return None
         return mapping
 
@@ -276,18 +288,33 @@ class Supervisor:
             return candidates[0]
         return None
 
-    def managed_kill(self, pid, kind):
-        """Kill only if the identity still says this install owns that pid -- checked again immediately before acting."""
+    def stop_managed(self, pid, kind):
+        """Stop a process this install owns, and prove it left the process table.
+
+        Returns (verdict, detail) with verdict in stopped / not_owned / still_running / unverified. A failed inventory
+        query *after* the kill is `unverified`, never `stopped`: reading "I could not look" as "it is gone" is what
+        licenses starting a replacement beside a process that may still be running.
+        """
         inventory = self.inventory()
-        if inventory is None or inventory.get(int(pid)) != kind:
-            return False
+        if inventory is None:
+            return 'unverified', 'the process inventory was unreadable before the kill'
+        if inventory.get(int(pid)) != kind:
+            return 'not_owned', 'pid %s is not this install\'s %s' % (pid, kind)
         kill_pid(pid)
-        for _ in range(40):
+        deadline = time.time() + 10
+        trouble = None
+        while time.time() < deadline:
             time.sleep(0.25)
-            fresh = self.inventory()
-            if fresh is None or int(pid) not in fresh:
-                return True
-        return False
+            fresh = self.inventory(quiet=True)
+            if fresh is None:
+                trouble = 'the process inventory was unreadable after the kill'
+                continue
+            if int(pid) not in fresh:
+                return 'stopped', 'pid %d left the process table' % int(pid)
+        fresh = self.inventory(quiet=True)
+        if fresh is None:
+            return 'unverified', trouble or 'the process inventory was unreadable after the kill'
+        return 'still_running', 'pid %d is still in the process table' % int(pid)
 
     def await_service(self, base, token_file, seconds=10):
         deadline = time.time() + seconds
@@ -347,24 +374,77 @@ class Supervisor:
             return 'token_missing'
 
         state, detail = health(base, token_file)
+        if state == 'token_missing':
+            # The dangerous shape (port in use, token gone) was refused above. What is left is a first run: the token does
+            # not exist because the service has not created it yet.
+            state, detail = 'unreachable', None
         restarted_service = False
 
-        if state in ('unreachable', 'token_missing'):
-            pid = spawn(self.service_command(base), self.install, os.path.join(self.relay_dir, 'service.log'))
-            self.write_pid(self.service_pid_path, pid)
-            self.record('service_started', 'pid %d' % pid)
-            restarted_service = True
-            state, detail = self.await_service(base, token_file)
+        if state == 'unreachable':
+            # Something may be starting, or wedged, or the port may be free while a process of ours is stuck. Spawning
+            # here without looking is how two services end up on one port. So: look first, and only ever replace, never
+            # add.
+            owned = sorted(pid for pid, kind in inventory.items() if kind == 'service')
+
+            if len(owned) > 1:
+                self.record('service_ambiguous',
+                            '%d services belong to this install; refusing to add another' % len(owned))
+                self.record('sidecar_deferred', 'more than one service is running for this install')
+                return 'service_ambiguous'
+
+            if not owned:
+                pid = spawn(self.service_command(base), self.install, os.path.join(self.relay_dir, 'service.log'))
+                self.write_pid(self.service_pid_path, pid)
+                self.record('service_started', 'pid %d' % pid)
+                restarted_service = True
+                state, detail = self.await_service(base, token_file)
+                if state == 'unreachable':
+                    self.record('service_unresponsive',
+                                'pid %d was started and did not answer /health' % pid)
+                    self.record('sidecar_deferred', 'the service has not answered yet; not adding a sidecar')
+                    return 'service_unresponsive'
+            else:
+                live = owned[0]
+                self.write_pid(self.service_pid_path, live)
+                self.record('service_unresponsive',
+                            'pid %d belongs to this install but /health does not answer; not starting a second one' % live)
+                state, detail = self.await_service(base, token_file, seconds=8)
+                if state == 'unreachable':
+                    if listening(port_of(base)):
+                        # Something holds the port and does not answer our token: never a reason to start another.
+                        self.record('sidecar_deferred', 'the port is held by a process that does not answer')
+                        return 'service_unresponsive'
+                    verdict, why = self.stop_managed(live, 'service')
+                    self.record('service_stop_' + verdict, why)
+                    if verdict != 'stopped':
+                        self.record('service_restart_refused',
+                                    'the unresponsive service could not be stopped verifiably (%s)' % verdict)
+                        self.record('sidecar_deferred', 'no replacement is started while the old one is unaccounted for')
+                        return 'service_stop_unverified'
+                    pid = spawn(self.service_command(base), self.install,
+                                os.path.join(self.relay_dir, 'service.log'))
+                    self.write_pid(self.service_pid_path, pid)
+                    self.record('service_restarted_unresponsive', 'pid %d replaced unresponsive pid %d' % (pid, live))
+                    restarted_service = True
+                    state, detail = self.await_service(base, token_file)
+                    if state != 'healthy':
+                        self.record('service_restart_failed', detail or state)
+                        self.record('sidecar_deferred', 'service is %s after the restart' % state)
+                        return 'service_restart_failed'
 
         elif state == 'healthy':
             owner = self.service_owner(inventory)
             if owner is None:
-                self.record('service_healthy', 'no action (no pid recorded for it)')
-            else:
-                self.record('service_healthy', 'pid %d' % owner)
-                if self.read_pid(self.service_pid_path) != owner:
-                    self.write_pid(self.service_pid_path, owner)
-                    self.record('service_adopted', 'pid %d' % owner)
+                # A 200 with our token, but nothing of this install is in the process table: the listener is not
+                # attributable, so readiness is not claimed and no sidecar is added to feed it.
+                self.record('service_healthy_unowned',
+                            'a listener answers /health but no process of this install owns it')
+                self.record('sidecar_deferred', 'the healthy listener cannot be attributed to this install')
+                return 'service_healthy_unowned'
+            if self.read_pid(self.service_pid_path) != owner:
+                self.write_pid(self.service_pid_path, owner)
+                self.record('service_adopted', 'pid %d' % owner)
+            self.record('service_healthy', 'pid %d (%s)' % (owner, detail or 'v?'))
 
         elif state == 'unauthorized':
             # The token file changed under a running service: the repair is to restart the service this install owns, so
@@ -377,10 +457,12 @@ class Supervisor:
                 self.record('sidecar_deferred', 'service is unauthorized and unowned; a sidecar would post into a wall')
                 return 'service_unauthorized_foreign'
             self.record('service_token_rotated', 'restarting the service this install owns (pid %d)' % owner)
-            if not self.managed_kill(owner, 'service'):
-                self.record('service_restart_refused', 'pid %d stopped looking like this install\'s service' % owner)
+            verdict, why = self.stop_managed(owner, 'service')
+            if verdict != 'stopped':
+                self.record('service_restart_refused',
+                            'pid %d could not be stopped verifiably (%s: %s)' % (owner, verdict, why))
                 self.record('sidecar_deferred', 'service could not be restarted safely')
-                return 'service_restart_refused'
+                return 'service_stop_unverified' if verdict == 'unverified' else 'service_restart_refused'
             pid = spawn(self.service_command(base), self.install, os.path.join(self.relay_dir, 'service.log'))
             self.write_pid(self.service_pid_path, pid)
             self.record('service_restarted', 'pid %d (after the token file changed)' % pid)
