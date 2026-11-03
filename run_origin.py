@@ -75,6 +75,28 @@ READ_SQL = (
     '       coalesce(t.created_at, 0) as at '
     'from %s b left join %s t on t.task_id = b.task_id' % (BINDINGS, TASKS))
 
+# T211: the terminal *events* the Bridge writes for itself. Verified against the live database before this was written:
+# `bridge_service_task_events.created_at` is epoch **seconds** (REAL, e.g. 1793453704.945753) and the terminal kinds are
+# exactly these three; `execution.command_completed` is per-command and is deliberately not one of them.
+#
+# `bridge_service_tasks.updated_at` is *not* used: any edit moves it, so it is not a completion time. Neither is the
+# ledger's `createdAt` (creation) nor a file mtime nor the sampler's clock.
+TERMINAL_EVENTS = ('task.completed', 'task.failed', 'task.interrupted')
+
+# One row per terminal event. Joined on task_id, because that is the only key the events table has.
+TERMINAL_SQL = (
+    'select t.provider_run_id as rid, e.kind as kind, e.created_at as at '
+    'from bridge_service_tasks t join bridge_service_task_events e on e.task_id = t.task_id '
+    "where e.kind in (%s) and t.provider_run_id is not null and t.provider_run_id <> '' "
+    'order by t.provider_run_id, e.created_at' % ','.join("'%s'" % kind for kind in TERMINAL_EVENTS))
+
+# Which event kind is allowed to speak for which resolved status. An event that contradicts the status is not evidence
+# of anything, so the run's completion time stays unknown rather than becoming a guess.
+EVENT_FOR_STATUS = {'completed': 'task.completed', 'failed': 'task.failed',
+                    'interrupted': 'task.interrupted'}
+
+SECONDS_THRESHOLD = 100000000000     # anything below this is seconds, not milliseconds
+
 BUSY_TIMEOUT_MS = 250
 ATTEMPTS = 3
 RETRY_SLEEP = 0.05
@@ -227,6 +249,114 @@ def read_run_facts(db_path=None, attempts=ATTEMPTS):
             'failureCode': failure_code if isinstance(failure_code, str) else None,
         }
     return facts, None
+
+
+def read_terminal_times(db_path=None, attempts=ATTEMPTS):
+    """`(times, error)`: `{runId: {'completedAtMs', 'event', 'events'}}` from the Bridge's terminal events.
+
+    This is the only credible completion instant the real data path offers. The investigations that led here, all
+    read-only against the live database:
+
+      * the ledger record (`*.runs.json`) carries `requestID`, `createdAt`, `status`, `turn`, `sessionID`, `cursor`,
+        `events` -- no completion time;
+      * `bridge_service_tasks` has `created_at` and `updated_at` only, and `updated_at` moves on any edit;
+      * `bridge_service_task_events` records `task.completed` / `task.failed` / `task.interrupted` with their own
+        `created_at`, which is what this reads.
+
+    It is not complete: on the live database 231 of the 336 terminal-by-status runs have such an event. The other 105
+    get no entry here, and their completion time stays `unknown` -- `mirror` says so with `completedAtSource`, and the
+    relay decides them on snapshot evidence instead of inventing an instant.
+
+    Unit handling: `created_at` is epoch seconds. A value that is already millisecond-sized is accepted as such, because
+    a database that changes units must not silently move every notice a thousand years.
+    """
+    path = db_path or DEFAULT_DB
+    if not os.path.isfile(path):
+        return {}, 'bridge database %s is not a file' % path
+
+    last = None
+    rows = None
+    for attempt in range(max(1, attempts)):
+        conn = None
+        try:
+            conn = sqlite3.connect(_uri(path), uri=True, timeout=1.0)
+            conn.execute('pragma query_only = 1')
+            conn.execute('pragma busy_timeout = %d' % BUSY_TIMEOUT_MS)
+            if not (_has_table(conn, 'bridge_service_tasks')
+                    and _has_table(conn, 'bridge_service_task_events')):
+                return {}, ('%s has no terminal event tables; completion times are '
+                            'unknown' % path)
+            rows = conn.execute(TERMINAL_SQL).fetchall()
+            break
+        except sqlite3.Error as exc:
+            last = '%s: %s' % (type(exc).__name__, exc)
+            if attempt + 1 < max(1, attempts):
+                time.sleep(RETRY_SLEEP)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+    if rows is None:
+        return {}, 'bridge database unreadable after %d attempts (%s)' % (
+            attempts, last)
+
+    times = {}
+    for run_id, kind, at in rows:
+        if not isinstance(run_id, str) or not run_id:
+            continue
+        if kind not in TERMINAL_EVENTS:
+            continue
+        instant = _epoch_ms(at)
+        if instant is None:
+            continue
+        entry = times.get(run_id)
+        if entry is None:
+            times[run_id] = {'completedAtMs': instant, 'event': kind, 'events': 1}
+            continue
+        entry['events'] += 1
+        # Several terminal events for one run: the earliest is when it first became terminal, which is the instant a
+        # notice may not predate. The kind is kept as the first one seen, in `created_at` order.
+        if instant < entry['completedAtMs']:
+            entry['completedAtMs'] = instant
+            entry['event'] = kind
+    return times, None
+
+
+def _epoch_ms(value):
+    """Epoch milliseconds from a stored timestamp, or None when it cannot be one.
+
+    Seconds and milliseconds are told apart by magnitude rather than by column name, because the unit is a property of
+    the value that was written, not of the schema: 1793453704.9 is seconds, 1793453704945 is milliseconds.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value <= 0:
+        return None
+    if value < SECONDS_THRESHOLD:
+        return int(round(value * 1000))
+    return int(round(value))
+
+
+def completion_for_status(run_id, status, times):
+    """The completion instant that is credible for this run and status, or None.
+
+    A `task.completed` event next to a `failed` status is a contradiction, not a timestamp: the run's instant is unknown
+    until the sources agree.
+    """
+    entry = (times or {}).get(run_id)
+    if not entry:
+        return None
+    if not status:
+        return entry['completedAtMs']
+    expected = EVENT_FOR_STATUS.get(status)
+    if expected is None:
+        # A terminal status this table does not describe: keep the instant but do not claim agreement.
+        return entry['completedAtMs'] if entry['event'] in TERMINAL_EVENTS else None
+    if entry['event'] != expected:
+        return None
+    return entry['completedAtMs']
 
 
 def load_cache(state_dir):

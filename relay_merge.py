@@ -68,6 +68,8 @@ def fetch(relay_source, timeout=10):
             'completedAt': item.get('completedAt'),
             'endedAt': item.get('endedAt'),
             'endedAtMs': item.get('endedAtMs'),
+            # Provenance for the completion instant above; `unknown` when the reporting host had none.
+            'completedAtSource': item.get('completedAtSource'),
             'origin': item.get('origin') if item.get('origin') in ('bridge', 'direct', 'unknown') else 'unknown',
             'source': RELAY_SOURCE,
             'relaySource': item.get('source'),

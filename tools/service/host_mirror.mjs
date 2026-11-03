@@ -108,6 +108,10 @@ export function candidatesFromMirror(report) {
     hostAck: item.hostAck || 'unseen',
     origin: item.origin || 'unknown',
     startedAt: item.startedAt,
+    // T211: the completion instant the host resolved, and where it came from. Forwarded verbatim -- `null` means the
+    // host could not prove one, and the service must not fill it in or derive it from `startedAt`.
+    completedAt: Number.isFinite(item.completedAt) ? item.completedAt : null,
+    completedAtSource: item.completedAtSource || 'unknown',
   }));
   return { ok: true, code: null, candidates, counts: report.counts || {}, pageDelivery: 'unknown' };
 }

@@ -912,6 +912,7 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
     relay_absorbed = 0
     relay_unverified = 0
     relay_implausible = 0
+    relay_snapshot_authorised = 0
     relay_activation = next_state.get('relayActivation')
     if relay_source:
         # The relay is an optional source that can arrive long after the native one, so it keeps an activation of its
@@ -933,6 +934,14 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
             # completion is at or after it, which is the wrong direction for a decision about consent.
             boundary_ms = int(arm['takenAt']) * 1000 if arm is not None else activated_at
             now_ms = int(time.time() * 1000)
+            # T211: a snapshot that read *this* source and recorded its id set is itself the proof. Every id it saw is
+            # history; a run missing from that complete set was not terminal when the operator consented, so its
+            # absence authorises it without needing a completion instant the data path may not carry.
+            #
+            # This is only true when the snapshot covered the relay (`relayCovered`). A ledger-only snapshot knows
+            # nothing about relay runs, so for it absence still proves nothing and the per-run completion instant is
+            # the only evidence that can authorise.
+            snapshot_proves_absence = bool(arm is not None and arm.get('relayCovered') is True)
             existing = list(next_state.get('relayBaselineIds') or [])
             history_ids = []
             for item in relay_candidates:
@@ -941,8 +950,14 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
                     continue
                 evidence = relay_merge.completed_ms(item)
                 if evidence is None:
-                    # No completion time: this run cannot be shown to have finished after consent. Held, not
-                    # announced, and counted -- "unprovable" is a refusal with a reason, never an empty list.
+                    if snapshot_proves_absence:
+                        # Proved by the snapshot's own completeness rather than by a timestamp.
+                        item['postArm'] = True
+                        item['postArmEvidence'] = 'relay_complete_snapshot'
+                        relay_snapshot_authorised += 1
+                        continue
+                    # No completion time and no complete snapshot: this run cannot be shown to have finished after
+                    # consent. Held, not announced, and counted -- "unprovable" is a refusal with a reason.
                     history_ids.append(item['runId'])
                     relay_unverified += 1
                     continue
@@ -957,6 +972,8 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
                     continue
                 item['postArm'] = True if arm is not None else None
                 item['postArmEvidence'] = 'relay_completed_at'
+                # Where the instant came from, so a reader can tell a Bridge event from anything else.
+                item['postArmSource'] = item.get('completedAtSource') or 'unknown'
             merged_history = list(dict.fromkeys(existing + history_ids))
             if len(merged_history) > MAX_STATE_IDS:
                 # Never keep a truncated baseline: the remainder would be offered on a later sample, which is exactly
@@ -1018,6 +1035,9 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
         # Whether the arm snapshot on disk was built with this source included. `False` means relay consent is decided
         # per run from completion evidence, never from absence in the snapshot.
         'armRelayCovered': bool(arm is not None and arm.get('relayCovered') is True),
+        # How many candidates this sample authorised by the snapshot's completeness rather than by a timestamp. Zero
+        # on a ledger-only snapshot, always: that path has no such proof.
+        'relaySnapshotAuthorised': relay_snapshot_authorised,
         'confirmed': False,
         'requiresAck': True,
         'redelivered': info['redelivered'],
@@ -1111,6 +1131,9 @@ def mirror(state_dir, root=None, bridge_db=None, origin_fixture=None):
         # pretending the real Bridge table was read. Production passes nothing here.
         origin = run_origin.classify_fixture(origin_fixture, [run.get('requestID') for run in runs])
     facts, facts_error = run_origin.read_run_facts(bridge_db)
+    # T211: the completion instant, from the Bridge's own terminal events. This is the field the relay's consent rule
+    # needs and that this mirror never carried, which is why every real Host->Service->Host candidate was held.
+    times, times_error = run_origin.read_terminal_times(bridge_db)
     acked = set(state.get('ackedIds') or [])
     pending = set(state.get('pendingIds') or [])
     chosen = {}
@@ -1126,6 +1149,7 @@ def mirror(state_dir, root=None, bridge_db=None, origin_fixture=None):
         status = resolve_status(run.get('status'), fact)
         if not status:
             continue  # not terminal yet; the mirror reports finished runs only
+        completed_ms = run_origin.completion_for_status(run_id, status, times)
         report['candidates'].append({
             'runId': run_id,
             'status': status,
@@ -1133,6 +1157,11 @@ def mirror(state_dir, root=None, bridge_db=None, origin_fixture=None):
             'origin': run_origin.origin_for(run_id, origin),
             'hostAck': 'acked' if run_id in acked else ('pending' if run_id in pending else 'unseen'),
             'statusSource': 'bridge.run_facts.status' if fact else 'bridge_ledger.status',
+            # `None` is a statement, not a gap: this run has no terminal event, so when it finished is unknown and
+            # nothing downstream may compute it from `startedAt`.
+            'completedAt': completed_ms,
+            'completedAtSource': ('bridge.task_events.%s' % (times or {})[run_id]['event']
+                                  if completed_ms is not None else 'unknown'),
             'pageDelivery': 'unknown',
         })
     report['ok'] = True
@@ -1145,4 +1174,10 @@ def mirror(state_dir, root=None, bridge_db=None, origin_fixture=None):
         'acked': sum(1 for c in report['candidates'] if c['hostAck'] == 'acked'),
     }
     report['factsError'] = facts_error
+    # "no terminal event" and "could not read the events table" are different facts and must stay distinguishable.
+    report['completionError'] = times_error
+    report['counts']['completedAtKnown'] = sum(
+        1 for c in report['candidates'] if c.get('completedAt') is not None)
+    report['counts']['completedAtUnknown'] = sum(
+        1 for c in report['candidates'] if c.get('completedAt') is None)
     return report

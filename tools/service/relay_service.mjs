@@ -378,6 +378,8 @@ export function createRelay(config) {
           startedAt: Number.isFinite(item.startedAt) ? item.startedAt : null,
           // T210: completion time, when the reporting host has it. Never derived from `startedAt`.
           completedAt: Number.isFinite(item.completedAt) ? item.completedAt : null,
+          // T211: where that instant came from (`bridge.task_events.task.completed`, ...) or `unknown`.
+          completedAtSource: typeof item.completedAtSource === 'string' ? item.completedAtSource : 'unknown',
           reportedBy: 'native_host', origin_kind: 'terminal_candidate',
           pageDelivery: 'unknown', simulated: false, ingestedAt: now() });
         accepted.push({ runId, terminalStatus, duplicate: false, seq: state0.seq });
@@ -401,6 +403,7 @@ export function createRelay(config) {
           status: run.terminalStatus,
           startedAt: Number.isFinite(run.startedAt) ? run.startedAt : null,
           completedAt: Number.isFinite(run.completedAt) ? run.completedAt : null,
+          completedAtSource: run.completedAtSource || 'unknown',
           origin: run.origin || 'unknown',
           postArm: null,
           source: run.hostSource,
