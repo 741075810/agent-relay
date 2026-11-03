@@ -297,3 +297,9 @@ pythonw.exe -B tools/service/console_window_probe.py --seconds 780 --out windows
 输出每行一条 JSON：kind（start/window/proc/stop）、时间戳、窗口类名、pid、以及 
 ame(pid) <- parent <- ... 的
 父子链。只记类名不记标题、不记命令行，避免把用户屏幕上的内容写进日志。
+
+## 12. 独立终态来源
+
+T227 查过：除 Bridge 台账之外没有可证实的独立来源，relay 是同源第二运输，不能当故障备用通路。接口约束、候选
+清单与关闭条件见 docs/independent-terminal-source.md；适配器 	ools/service/independent_terminal_source.py
+现在什么都没绑（PRODUCTION_SOURCES = ()），不被任何生产入口 import。
