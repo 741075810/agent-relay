@@ -156,7 +156,12 @@ class ArmIntegrity(RelayScene):
         self.start_service_preserving_state()
         self.assertEqual([item['runId'] for item in self.sample()['candidates']], [],
                          'held is not a queue that drains later')
-        self.assertIn(RELAY_ONLY, self.source_state().get('relayBaselineIds') or [])
+        # T213: the refusal is recorded as *deferred*, not as history. The two used to be the same set, which is how a
+        # late legitimate completion became unrecoverable; the property under test here -- that it is not announced --
+        # is unchanged, and so is the fact that it is remembered across the restart.
+        state = self.source_state()
+        self.assertIn(RELAY_ONLY, state.get('relayDeferredIds') or [])
+        self.assertNotIn(RELAY_ONLY, state.get('relayBaselineIds') or [])
 
     def start_service_preserving_state(self):
         self.start_service()

@@ -84,6 +84,9 @@ ARM_NAME = 'terminal-arm.json'
 ARM_VERSION = 1
 STATE_VERSION = 1
 MAX_STATE_IDS = 5000
+# Deferrals are a work list, not a history: they are re-decided from the candidate's own instant on every sample, so a
+# bound loses only the record of what was seen.
+MAX_DEFERRED_IDS = 2000
 # The arm snapshot is an id set, so it has the same shape of bound as the
 # baseline. Exceeding it is *not* absorbed: see `arm_snapshot`.
 MAX_SNAPSHOT_IDS = 5000
@@ -923,6 +926,8 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
     # Kept in the report, permanently zero: absence from a snapshot has no evidentiary value for this source.
     relay_snapshot_authorised = 0
     relay_absence_refused = 0
+    relay_deferred = 0
+    relay_deferred_dropped = 0
     relay_activation = next_state.get('relayActivation')
     if relay_source:
         # The relay is an optional source that can arrive long after the native one, so it keeps an activation of its
@@ -953,34 +958,46 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
             # snapshot keeps its other job, which needs no such trust -- what it did contain is history.
             snapshot_proves_absence = False
             existing = list(next_state.get('relayBaselineIds') or [])
+            deferred_before = set(next_state.get('relayDeferredIds') or [])
+            # T213: three outcomes, not two. `history` is proven to predate consent and is permanent. `deferred` is
+            # *unknown*, not history: the run is terminal but nothing yet proves when, and the Bridge writes its
+            # terminal event in a separate transaction that can land after the first mirroring. Recording those as
+            # history is how a legitimate notice was lost for good, because `relay_merge.history()` then answered for
+            # it forever.
             history_ids = []
+            deferred_ids = []
+            announce = set()
             for item in relay_candidates:
                 if arm_ids_now is not None and item['runId'] in arm_ids_now:
                     history_ids.append(item['runId'])
                     continue
                 evidence = relay_merge.completed_ms(item)
                 if evidence is None:
-                    # No completion instant. Whether or not a snapshot exists, this run cannot be shown to have
-                    # finished after consent, so it is held and counted -- "unprovable" is a refusal with a reason,
-                    # never an authorisation borrowed from what some cache did not happen to contain.
-                    history_ids.append(item['runId'])
+                    # Terminal, but when is unknown. Not sent, not absorbed: deferred with the reason kept.
+                    deferred_ids.append(item['runId'])
                     relay_unverified += 1
                     if arm is not None:
                         relay_absence_refused += 1
                     continue
                 if not relay_merge.plausible(evidence, now_ms):
-                    # A timestamp far in the future (or impossibly old) proves nothing; reading it as "after the arm"
-                    # is how a broken or forged clock would authorise an old notice.
-                    history_ids.append(item['runId'])
+                    # Implausible: also unknown rather than false. A clock can be fixed; a baseline cannot be undone.
+                    deferred_ids.append(item['runId'])
                     relay_implausible += 1
                     continue
                 if evidence <= boundary_ms:
+                    # Proven to have finished before consent: permanent, as before.
                     history_ids.append(item['runId'])
                     continue
                 item['postArm'] = True if arm is not None else None
                 item['postArmEvidence'] = 'relay_completed_at'
                 # Where the instant came from, so a reader can tell a Bridge event from anything else.
                 item['postArmSource'] = item.get('completedAtSource') or 'unknown'
+                announce.add(item['runId'])
+            # A run that was deferred and now has proof leaves the deferred set: either it is announced (and becomes
+            # ACK/journal territory) or it is proven history.
+            settled = set(history_ids) | set(announce)
+            deferred_after = [run_id for run_id in dict.fromkeys(deferred_ids + list(deferred_before))
+                              if run_id not in settled]
             merged_history = list(dict.fromkeys(existing + history_ids))
             if len(merged_history) > MAX_STATE_IDS:
                 # Never keep a truncated baseline: the remainder would be offered on a later sample, which is exactly
@@ -991,8 +1008,17 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
                 relay_activation = 'active'
                 relay_absorbed = len([run_id for run_id in history_ids if run_id not in existing])
                 next_state['relayBaselineIds'] = merged_history
+                # Bounded, and bounded is safe here: the decision is made per sample from the candidate's own instant,
+                # so dropping the oldest deferral loses only the record, never the chance to announce it later.
+                if len(deferred_after) > MAX_DEFERRED_IDS:
+                    relay_deferred_dropped = len(deferred_after) - MAX_DEFERRED_IDS
+                    deferred_after = deferred_after[-MAX_DEFERRED_IDS:]
+                next_state['relayDeferredIds'] = deferred_after
+                relay_deferred = len(deferred_after)
                 next_state['relayActivatedAt'] = activated_at
-                due = relay_merge.merge(due, relay_candidates, next_state)
+                # `allow`: only the runs this sample proved. A deferred candidate is neither history nor announceable,
+                # so it must be excluded by an explicit set rather than by being mislabelled as history.
+                due = relay_merge.merge(due, relay_candidates, next_state, allow=announce)
                 # The consent fact travels with the candidate, or the extension cannot tell a run that finished after
                 # the arm from one that was already terminal when the operator consented.
                 for item in due:
@@ -1049,6 +1075,10 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
         # Candidates refused *specifically* because an arm existed and the run had no completion instant: the case
         # where a cache-reading snapshot used to be mistaken for proof.
         'relayAbsenceRefused': relay_absence_refused,
+        # Candidates that are terminal but not yet provable: not sent, and deliberately *not* in the history baseline,
+        # so a Bridge terminal event that lands later can still authorise them.
+        'relayDeferred': relay_deferred,
+        'relayDeferredDropped': relay_deferred_dropped,
         # Whether the snapshot on disk claims an upstream-complete read. No writer produces such a proof today, and
         # nothing authorises on it.
         'armRelayProof': bool(arm is not None and arm.get('relayUpstreamComplete') is True),

@@ -174,14 +174,22 @@ def absorb(candidates, limit):
     return list(dict.fromkeys(ids))[-limit:]
 
 
-def merge(due, relay_candidates, state):
-    """Append the relay candidates that are new to both the native lists and the relay journal."""
+def merge(due, relay_candidates, state, allow=None):
+    """Append the relay candidates that are new to the journals and, when given, proven announceable.
+
+    `allow` is the set the caller has already decided is authorised for *this* sample. Passing it is what keeps a
+    candidate that is merely deferred -- known, terminal, but with no credible completion instant yet -- out of the
+    answer: it is not history and must stay recoverable, so it cannot be filtered by `history()`, and it must not be
+    appended either. `None` keeps the older behaviour for callers that have already filtered.
+    """
     known_native = history(state)
     journal = set(state.get('relayAckedIds') or [])
     merged = list(due)
     taken = {item.get('runId') for item in merged}
     for candidate in relay_candidates:
         run_id = candidate['runId']
+        if allow is not None and run_id not in allow:
+            continue
         if run_id in known_native or run_id in taken:
             continue
         # One notice per run: a run acknowledged as `completed` is not announced again as `failed` either.
