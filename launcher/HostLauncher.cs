@@ -123,6 +123,41 @@ static class HostLauncher
         commandLine.Append(Quote(script));
         commandLine.Append(" --state-dir ").Append(Quote(Path.Combine(dir, "state")));
         commandLine.Append(" --manifest ").Append(Quote(Path.Combine(dir, "host_manifest.json")));
+
+        // T217: the relay, when this installation has been given one.
+        //
+        // The launcher is the only component that decides the host's command line, so a host with `--relay-url` support
+        // is unreachable without this. Two lines beside the launcher, in `relay.txt`:
+        //
+        //     http://127.0.0.1:PORT
+        //     <path to the service token file>
+        //
+        // Absent or blank means "no relay": the command line is then byte-identical to the version that shipped before
+        // this change, which is what makes the switch reversible by deleting one file. Only the token *path* is passed;
+        // the token itself stays in the file the service wrote, with the permissions it set.
+        string relayFile = Path.Combine(dir, "relay.txt");
+        if (File.Exists(relayFile))
+        {
+            string[] relay = File.ReadAllLines(relayFile);
+            string relayUrl = relay.Length > 0 ? relay[0].Trim() : "";
+            string tokenFile = relay.Length > 1 ? relay[1].Trim() : "";
+            if (relayUrl.Length > 0 && tokenFile.Length > 0)
+            {
+                if (!Path.IsPathRooted(tokenFile))
+                {
+                    tokenFile = Path.Combine(dir, tokenFile);
+                }
+                if (!File.Exists(tokenFile))
+                {
+                    // Refuse rather than start a host that will silently run without a relay: "no notification" must not
+                    // look like "nothing finished".
+                    Console.Error.WriteLine("com.dsh.notify: relay token file not found at " + tokenFile);
+                    return 4;
+                }
+                commandLine.Append(" --relay-url ").Append(Quote(relayUrl));
+                commandLine.Append(" --relay-token-file ").Append(Quote(tokenFile));
+            }
+        }
         // Chrome appends the caller origin; forward it unchanged so the host's
         // allow-list check sees exactly what Chrome sent.
         foreach (string arg in args)

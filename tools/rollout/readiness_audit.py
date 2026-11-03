@@ -32,6 +32,7 @@ CHECKS = (
     ('installed_host_arm_snapshot', 'the installed host offers terminal-arm-snapshot'),
     ('installed_ext_epoch_bound', 'the installed extension binds postArm to an arm epoch (postArmEpoch)'),
     ('installed_ext_postarm', 'the installed extension honours a host postArm verdict at all'),
+    ('installed_modules_coherent', 'the installed modules belong to the same generation as the installed host'),
     ('launcher_passes_relay', 'the installed launcher forwards --relay-url to the host it starts'),
     ('launcher_present', 'the registered launcher exists at the manifest path'),
     ('manifest_registered', 'a native-messaging manifest names this host for a Chrome extension'),
@@ -169,27 +170,53 @@ def tree_facts(root):
     return facts
 
 
-def launcher_forwards(path, needle=b'--relay-url'):
-    """Whether the installed launcher's own bytes mention a flag.
+def module_coherence(root):
+    """Whether the installed modules can satisfy the installed host.
+
+    T217 replaced `host.py` alone and the next spawn answered `TypeError: sample() got an unexpected keyword argument
+    'relay_source'`: a new host against an old `terminal_source.py`. The host only breaks *when Chrome spawns it*, so the
+    mistake would have surfaced as an extension that stopped seeing tasks, with no error anywhere in the UI. This reads
+    the modules and reports the three facts that decide it.
+    """
+    facts = {}
+    for name, needle, key in (('terminal_source.py', 'relay_source', 'terminal_source_accepts_relay_source'),
+                              ('host.py', '--relay-url', 'host_mentions_relay'),
+                              ('host.py', 'armTakenAtMs', 'host_mentions_arm_ms')):
+        path = os.path.join(root, name) if root else None
+        text = ''
+        if path and os.path.isfile(path):
+            try:
+                with open(path, encoding='utf-8', errors='replace') as handle:
+                    text = handle.read()
+            except OSError:
+                text = ''
+        facts[key] = needle in text
+    facts['relay_merge_present'] = bool(root) and os.path.isfile(os.path.join(root, 'relay_merge.py'))
+    facts['coherent'] = (not facts['host_mentions_relay']) or (
+        facts['terminal_source_accepts_relay_source'] and facts['relay_merge_present'])
+    return facts
+
+
+def launcher_forwards(path, needle='--relay-url'):
+    """Whether the launcher's own bytes mention a flag, in either string encoding.
 
     The launcher builds the host command line itself -- `--state-dir` and `--manifest`, then Chrome's arguments -- so a
     relay flag can only reach the host if the binary knows the string. Dropping a new `host.py` beside a launcher that
     never says `--relay-url` therefore enables nothing, and that is worth answering from the binary rather than from a
     README.
+
+    A .NET assembly stores its literals as UTF-16LE, so an ASCII-only scan reports `False` for a launcher that *does*
+    forward the flag -- the worse direction, because it would block a correct install. Both encodings are checked.
     """
     if not path or not os.path.isfile(path):
         return None
+    needles = (needle.encode('ascii'), needle.encode('utf-16-le'))
     try:
         with open(path, 'rb') as handle:
-            if needle in handle.read():
-                return True
-            handle.seek(0)
-            for block in iter(lambda: handle.read(1 << 16), b''):
-                if needle in block:
-                    return True
-            return False
+            data = handle.read()
     except OSError:
         return None
+    return any(item in data for item in needles)
 
 
 def token_facts(path):
@@ -206,7 +233,8 @@ def token_facts(path):
 def verdict(checks):
     """A rollout is GO only when every blocking check passes."""
     blocking = ('installed_host_reads_relay', 'installed_host_arm_ms', 'installed_host_arm_snapshot',
-                'installed_ext_epoch_bound', 'installed_ext_postarm', 'launcher_passes_relay',
+                'installed_ext_epoch_bound', 'installed_ext_postarm', 'installed_modules_coherent',
+                'launcher_passes_relay',
                 'launcher_present', 'manifest_registered', 'bridge_db_readable')
     failed = [name for name in blocking if checks.get(name, {}).get('ok') is not True]
     return {'decision': 'GO' if not failed else 'NO-GO', 'blocking_failed': failed}
@@ -244,6 +272,7 @@ def run_audit(options):
                 doc = {}
             report['state']['armPrecision'] = 'ms' if isinstance(doc.get('armTakenAtMs'), int) else 'second'
     launcher_path = options.launcher or ((manifest or {}).get('rawPath') if manifest else None)
+    report['modules'] = module_coherence(options.installed_root)
     report['launcher'] = {'path': launcher_path,
                           'forwards_relay_flag': launcher_forwards(options.launcher or launcher_path)}
     report['token'] = token_facts(options.token_file)
@@ -258,6 +287,7 @@ def run_audit(options):
         'installed_ext_epoch_bound': {'ok': installed_markers.get('extension/background.js') is True
                                       and installed_markers.get('extension/lib/terminal_trigger.js') is True},
         'installed_ext_postarm': {'ok': ext_has(installed, 'postArm')},
+        'installed_modules_coherent': {'ok': report['modules']['coherent']},
         'launcher_passes_relay': {'ok': report['launcher']['forwards_relay_flag'] is True},
         'launcher_present': {'ok': bool((manifest or {}).get('path_exists'))},
         'manifest_registered': {'ok': bool(manifest and manifest.get('origin_count'))},
@@ -287,8 +317,23 @@ def ext_has(root, needle):
     return bool(text and needle in text)
 
 
+def module_has(root, name, needle):
+    """Read one installed module and say whether it knows a string. Read-only, text mode, never executed."""
+    path = os.path.join(root, name) if root else None
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding='utf-8', errors='replace') as handle:
+            return needle in handle.read()
+    except OSError:
+        return None
+
+
 def arm_ms_supported(installed):
-    return host_has(installed, 'armTakenAtMs')
+    # `armTakenAtMs` is written by `terminal_source.arm_snapshot`, so a host-only scan reports a capable install as
+    # incapable. Either module knowing the field is enough.
+    return bool(host_has(installed, 'armTakenAtMs')
+                or module_has(installed, 'terminal_source.py', 'armTakenAtMs'))
 
 
 def probe_relay(url, token_file):
@@ -323,6 +368,10 @@ def render(report):
             lines.append('  %-28s capability %s' % (name, 'yes' if value else 'no'))
     manifest = report.get('manifest') or {}
     launcher = report['launcher']
+    modules = report['modules']
+    lines.append('modules        : coherent=%s (terminal_source accepts relay=%s, relay_merge=%s)'
+                 % (modules['coherent'], modules['terminal_source_accepts_relay_source'],
+                    modules['relay_merge_present']))
     lines.append('launcher       : %s' % (launcher.get('path') or 'unknown'))
     lines.append('  forwards --relay-url : %s' % launcher.get('forwards_relay_flag'))
     lines.append('manifest       : %s' % (manifest.get('name') or manifest.get('error')))

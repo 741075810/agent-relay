@@ -71,6 +71,13 @@ def build_tree(root, with_epoch_binding=True, with_relay=True, with_arm_ms=True)
     launcher = b'MZ --state-dir --manifest'
     if with_relay:
         launcher += b' --relay-url --relay-token-file'
+        # T217: a launcher that forwards the flags is only half of a capable install. The audit now also requires the
+        # modules to belong to the same generation, because a new host.py beside an old terminal_source.py answers
+        # `TypeError: sample() got an unexpected keyword argument 'relay_source'` -- and only on the next spawn.
+        with open(os.path.join(root, 'terminal_source.py'), 'w', encoding='utf-8') as handle:
+            handle.write('def sample(state, relay_source=None):\n    pass\n')
+        with open(os.path.join(root, 'relay_merge.py'), 'w', encoding='utf-8') as handle:
+            handle.write('# merge\n')
     with open(os.path.join(root, 'host_launcher.exe'), 'wb') as handle:
         handle.write(launcher + b'\x00' * 30)
     manifest = os.path.join(root, 'host_manifest.json')

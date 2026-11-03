@@ -65,7 +65,8 @@ if (Test-Path $HOST_INSTALL\python_path.txt) { Copy-Item $HOST_INSTALL\python_pa
 Copy-Item -Recurse $EXT_INSTALL             "$backup\extension"
 if (Test-Path $STATE)     { Copy-Item -Recurse $STATE     "$backup\state" }
 if (Test-Path $RELAY_DIR) { Copy-Item -Recurse $RELAY_DIR "$backup\relay" }
-reg export "HKCU\Software\Google\Chrome\NativeMessagingHosts\com.dsh.notify" "$backup\nmh.reg" /y
+C:\Windows\System32\reg.exe export "HKCU\Software\Google\Chrome\NativeMessagingHosts\com.dsh.notify" "$backup\nmh.reg" /y
+# bare `reg` may resolve to Impacket's reg.py on PATH and silently write nothing
 # a manifest of what was backed up, so the rollback can prove completeness rather than hope
 Get-ChildItem $backup -Recurse -File |
   ForEach-Object { '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash, $_.FullName.Substring($backup.Length) } |
@@ -108,15 +109,23 @@ Success: the sidecar's JSON reports `counts.candidates` equal to the runs in the
 
 The order matters: each item makes the next one possible, and the audit is the exit criterion, not the entry.
 
-1. **Rebuild the launcher with relay flags.** `launcher/HostLauncher.cs` must append `--relay-url` and
-   `--relay-token-file` (from a file beside the launcher, e.g. `relay.txt`, so the token is not in the command line).
-   Build with `launcher\build_launcher.ps1`, then update the pinned hash the preflight checks. Until this binary is
-   replaced, no other step can enable relay.
-2. **Install the new host** into a new directory, leaving the old one untouched:
-   `New-Item -ItemType Directory $HOST_INSTALL-next; Copy-Item $REPO\host.py $HOST_INSTALL-next\`.
+1. **Install the module set, never one file.** `host.py`, `terminal_source.py`, `run_origin.py`, `protocol.py`,
+   `native_turns.py` and `relay_merge.py` go in together (T217: replacing `host.py` alone produced
+   `TypeError: sample() got an unexpected keyword argument 'relay_source'`, visible only on the next spawn). Verify with
+   `readiness_audit.py`: `installed_modules_coherent` must be `ok`, and
+   `tools/rollout/installed_chain_probe.py --dir COPY --origin ORIGIN` must answer `"ok": true`.
+2. **Rebuild the launcher with relay flags.** `launcher/HostLauncher.cs` appends `--relay-url` and
+   `--relay-token-file` when a `relay.txt` (two lines: URL, token file) sits beside it; without that file the command
+   line is byte-identical to the pre-T217 one. Build with `launcher\build_launcher.ps1`.
+   **The file is locked while any host is running** — Chrome holds `host_launcher.exe` open for as long as the native
+   messaging port lives, so the copy fails with `The process cannot access the file`. Do not kill that process: the
+   extension is using it. Replace the binary in the same window as step 3, which is when Chrome drops the port.
+   Hash pin: before `34CFE482D518C690…`, after `4197B3581AC45CFD…` (7,680 B both) — update whatever records the pin in
+   the same commit that ships the new build, never silently.
 3. **Reload the extension** from the build carrying `postArmEpoch`/`postArmUsable`
    (`$EXT_INSTALL\lib\terminal_trigger.js` must contain `postArmUsable`). This is the step that cannot be done
-   unattended.
+   unattended, and it is also what releases the launcher lock. Measure it first, read-only:
+   `$env:T150_EXT_ROOT=$EXT_INSTALL; node $REPO\test_t095b150_postarm_epoch.mjs` (the pre-T217 install fails 3 of 6).
 4. **Point the registration at the new directory** by updating `host_manifest.json`'s `path` (the reversible half of a
    swap), leaving `nmh.reg` untouched unless the manifest file itself moves.
 5. **Start the relay service, then the sidecar**, on production paths, without `--once`:
@@ -165,7 +174,7 @@ Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'host_mirro
   ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
 
 # 6.2 restore the registration, the manifest and (if it was touched) the interpreter pointer
-reg import "$backup\nmh.reg"
+C:\Windows\System32\reg.exe import "$backup\nmh.reg"
 Copy-Item "$backup\host_manifest.json" $HOST_INSTALL\host_manifest.json -Force
 if (Test-Path "$backup\python_path.txt") { Copy-Item "$backup\python_path.txt" $HOST_INSTALL\python_path.txt -Force }
 
@@ -184,6 +193,9 @@ Get-ChildItem $backup -Recurse -File | Where-Object { $_.Name -ne 'SHA256SUMS.tx
 Get-Content "$backup\SHA256SUMS.txt" | ForEach-Object { $hash, $rel = $_ -split '  ', 2
   if ($rel -notlike '\nmh.reg') { "$rel  {0}" -f (Get-FileHash ($HOST_INSTALL + $rel) -Algorithm SHA256).Hash -eq $hash } }
 ```
+
+The switch performed under T217 is recorded step by step, with hashes and the one mistake it made, in
+`release-readiness-switch-log.md`. Read that before repeating the sequence.
 
 Complete verification is the audit, not a hash list:
 

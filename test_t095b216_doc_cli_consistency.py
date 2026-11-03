@@ -130,25 +130,37 @@ class OrderingIsHonest(unittest.TestCase):
         self.assertIn('NO-GO', text)
 
     def test_the_documents_do_not_promise_a_host_only_switch(self):
+        """A host swap is not a rollout: the launcher is locked and the extension has no epoch binding (T217).
+
+        The wording changed when the launcher gained the forwarding code, but the property has not: two steps remain
+        that a file copy cannot perform.
+        """
         for name in ('release-readiness-runbook.md', 'release-readiness-checklist.md'):
             text = flat(read(name)).lower()
             self.assertNotIn('only swap the host is safe', text)
-            self.assertTrue(('no other step can enable relay' in text or 'not safe' in text
-                             or 'cannot reach a relay service' in text),
-                            '%s must state that a host-only swap cannot enable relay' % name)
+            self.assertTrue('extension' in text and 'reload' in text,
+                            '%s must say the extension has to be reloaded' % name)
+            self.assertTrue('lock' in text or 'cannot access the file' in text,
+                            '%s must say the launcher is locked while a host runs' % name)
 
 
 class LauncherEntryIsDescribedTruthfully(unittest.TestCase):
 
     def test_the_runbook_matches_what_the_launcher_actually_passes(self):
+        """T217: the launcher now forwards the relay flags when a `relay.txt` sits beside it.
+
+        This assertion used to require the opposite, so that shipping the forwarding would force this document to be
+        updated in the same commit. That is what happened; the check now pins the new behaviour instead.
+        """
         with open(os.path.join(ROOT, 'launcher', 'HostLauncher.cs'), encoding='utf-8') as handle:
             source = handle.read()
-        # the launcher builds the command line itself
         self.assertIn('--state-dir', source)
         self.assertIn('--manifest', source)
-        self.assertNotIn('--relay-url', source, 'if the launcher ever forwards relay flags, update the runbook first')
-        runbook = read('release-readiness-runbook.md')
-        self.assertIn('passes **only** `--state-dir', runbook)
+        self.assertIn('--relay-url', source, 'the launcher must forward the relay flags it was taught')
+        self.assertIn('relay.txt', source, 'the forwarding is opt-in through a file beside the launcher')
+        runbook = flat(read('release-readiness-runbook.md'))
+        self.assertIn('relay.txt', runbook)
+        self.assertIn('byte-identical', runbook, 'without relay.txt the command line must be unchanged')
         self.assertIn('launcher.forwards_relay_flag', runbook)
 
     def test_the_audit_reads_the_launcher_bytes_rather_than_a_claim(self):

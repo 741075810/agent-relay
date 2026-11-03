@@ -66,6 +66,13 @@ needs_launcher = unittest.skipUnless(
     'host_launcher.exe is not built; run launcher\\build_launcher.ps1 '
     '(see docs/HOST_INSTALL.md)')
 
+# T217: the launcher always passes `--manifest <repo>\host_manifest.json`, and that file is gitignored because it carries
+# a machine absolute path and a real extension id. A tree with the binary built but no manifest therefore used to produce
+# four failures whose message was `stdout EOF` -- the host refusing with `not_allowed: no allowed_origins`.
+needs_manifest = unittest.skipUnless(
+    os.path.isfile(MANIFEST),
+    'host_manifest.json is absent; copy host_manifest.example.json and fill in the real path and extension id')
+
 if os.name == 'nt':
     K32 = ctypes.WinDLL('kernel32', use_last_error=True)
     INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
@@ -422,7 +429,15 @@ class JobGuardedHost:
 @unittest.skipUnless(os.name == 'nt' and msvcrt is not None,
                      'Windows Job Objects and msvcrt are required')
 @needs_launcher
+@needs_manifest
 class LiveLauncherTests(unittest.TestCase):
+    """T217: this class also needs `host_manifest.json`, not only the binary.
+
+    The launcher passes `--manifest <repo>\host_manifest.json`; the file is gitignored (it carries a machine absolute path
+    and a real extension id), so a developer who has built `host_launcher.exe` but has no manifest used to get four
+    failures whose text was `stdout EOF` -- the host refusing with `not_allowed: no allowed_origins`. Guarding on the
+    manifest turns that into the documented skip.
+    """
     def test_hello_and_queue_cycle_before_eof_with_tree_cleanup(self):
         self.assertTrue(os.path.isfile(LAUNCHER), 'build host_launcher.exe first')
         state_dir = tempfile.mkdtemp(prefix='.t046-live-', dir=HERE)
