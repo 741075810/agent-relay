@@ -31,10 +31,12 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # `AGENTS.md`: with the launcher binary and the real manifest absent, the Python suite
 # must report exactly this many skips. Asserting the number means a check that silently
 # stopped running is noticed; a changed number is a deliberate edit to this constant.
-EXPECTED_SKIPS = 28  # +4: POSIX lock-swap, Windows junction, Windows job-object case, unproven cross-process lock probe
+EXPECTED_SKIPS = 31  # +4: POSIX lock-swap, Windows junction, Windows job-object case, unproven cross-process lock probe
 # +6 T217: a clone has no `host_launcher.exe` and no `host_manifest.json`, so the five live-launcher cases in
 # `test_t046_live_launcher.py` skip on the manifest and the T217 suites skip on the binary (2) / manifest guard (4).
-# The number moved because a new suite needed the built artefacts, not because a check stopped running.
+# +3 T218: `TheInstalledTreeIsACopyOfTheRepository` needs `T218_INSTALLED_EXT` (the directory Chrome loads) and skips
+# elsewhere, including in a clone.
+# The number moved because new suites need artefacts a clone does not have, never because a check stopped running.
 
 RESULT_LINE = re.compile(r'^RESULT: (\d+) passed, (\d+) failed', re.MULTILINE)
 # Three output conventions live in this repository and all are legitimate:
