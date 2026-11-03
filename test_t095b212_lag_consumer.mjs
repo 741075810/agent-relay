@@ -149,10 +149,14 @@ test('an old completion mirrored after the arm is never offered to the consumer'
 
 test('a completion after the arm still reaches the consumer', async () => {
   const world = scene();
-  bridgeDatabase(world.db, [[NEW_RUN, 'completed', 'task.completed', Math.floor(Date.now() / 1000) + 2]]);
   const service = await startService(path.join(world.state, 'svc'));
   await visit(world, service);
   hostCall(world, service, 'terminal-arm-snapshot', { epoch: 'e-t212' });
+  // Anchored to the arm that was just written, not to the wall clock. `Date.now() + 2` was a fixture that raced the
+  // runner: on a slow Windows worker more than two seconds could pass between writing the row and taking the arm, which
+  // put the completion *before* consent and failed the admission check -- the same shape of flake T211 had.
+  const armed = JSON.parse(readFileSync(path.join(world.state, 'terminal-arm.json'), 'utf8'));
+  bridgeDatabase(world.db, [[NEW_RUN, 'completed', 'task.completed', Math.floor((armed.armTakenAtMs || 0) / 1000) + 5]]);
   runSidecar(world, service, [{ requestID: NEW_RUN, status: 'completed', createdAt: OLD_START_MS }]);
   const pass = await visit(world, service);
   assert.deepEqual(pass.admitted.map((item) => item.runId), [NEW_RUN]);
