@@ -856,8 +856,10 @@ def handle_request(state_dir, doc, ledger_root=None, bridge_db=None,            
             # Refusing is the whole point: a partial snapshot, an unreadable
             # ledger or a malformed epoch all come back as `ok:false`, and the
             # extension must not enable the trigger on that answer.
+            # T210: the snapshot covers the sources it actually read. When a relay source is configured it is
+            # included, and an unreadable relay refuses the arm rather than producing a snapshot that omits it.
             report = terminal_source.arm_snapshot(
-                state_dir, ledger_root, args.get('epoch'))
+                state_dir, ledger_root, args.get('epoch'), relay_source=relay_source)
             return P.ok_response(ident, report)
 
         if op == 'terminal-ack':            # T059: consumed, and only on Chrome's word. The candidate list is

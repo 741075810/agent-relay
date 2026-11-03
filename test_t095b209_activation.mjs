@@ -67,8 +67,12 @@ async function seed(service, items) {
   await fetch(service.base + '/host/terminal-candidates', {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: 'Bearer ' + token },
-    body: JSON.stringify({ candidates: items.map(([runId, startedAt]) => ({ runId, terminalStatus: 'completed',
-      startedAt, hostSource: 'native_host.terminal-mirror', statusSource: 'bridge_ledger.status', origin: 'bridge' })) }),
+    // `startedAt` says when the run began; the host decides consent from `completedAt`, computed here so a literal
+    // cannot drift into the past while the suite runs.
+    body: JSON.stringify({ candidates: items.map(([runId, startedAt, completedAt]) => ({ runId,
+      terminalStatus: 'completed', startedAt,
+      completedAt: completedAt ?? (Date.now() + 60000),
+      hostSource: 'native_host.terminal-mirror', statusSource: 'bridge_ledger.status', origin: 'bridge' })) }),
   });
 }
 
@@ -97,14 +101,14 @@ test('a relay switched on after the native baseline never delivers its old compl
   const world = scene();
   const service = await startService(world.serviceDir);
   await pass(world, service);                              // native + relay baseline, both empty
-  await seed(service, [[OLD_RUN, 1700000000000]]);
+  await seed(service, [[OLD_RUN, 1700000000000, 1700000000000]]);
   const enabling = await pass(world, service);
   assert.deepEqual(enabling.admitted, [], 'enabling the relay is not a reason to announce old work');
   const store = mergeIntoStore([], enabling.admitted, Date.now());
   const wiring = createChromeAutoSend(chromeWith(store.list), {});
   assert.deepEqual(await wiring.readCandidates(), [], 'nothing reaches the extension store');
 
-  await seed(service, [[OLD_RUN, 1700000000000], [NEW_RUN, 4000000000000]]);
+  await seed(service, [[OLD_RUN, 1700000000000, 1700000000000], [NEW_RUN, 1700000000000, Date.now() + 60000]]);
   const later = await pass(world, service);
   assert.deepEqual(later.admitted.map((item) => item.runId), [NEW_RUN]);
   const second = mergeIntoStore(store.list, later.admitted, Date.now());
@@ -119,7 +123,7 @@ test('with an arm snapshot the old run stays silent and the post-arm run is deli
   const armPath = path.join(world.state, 'terminal-arm.json');
   writeFileSync(armPath, JSON.stringify({ version: 1, epoch: 'e1', takenAt: 1793600000, truncated: false,
     ids: [OLD_RUN] }));
-  await seed(service, [[OLD_RUN, 1700000000000], [NEW_RUN, 1700000000001]]);
+  await seed(service, [[OLD_RUN, 1700000000000, 1700000000000], [NEW_RUN, 1700000000000, Date.now() + 60000]]);
   const first = await pass(world, service);
   assert.deepEqual(first.admitted.map((item) => item.runId), [NEW_RUN],
     'the arm snapshot proves the first was already terminal when consent was recorded');

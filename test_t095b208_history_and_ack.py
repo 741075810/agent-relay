@@ -11,6 +11,7 @@ Real components: the shipping `host.py` subprocess and the real Node service, ov
 """
 
 import os
+import time
 import unittest
 
 import relay_merge
@@ -23,8 +24,10 @@ class HistoryIsNotNews(RelayScene):
 
     def relay_candidate(self, run_id, status='completed', origin='bridge'):
         # Old runs carry a start time before any activation; LATE_RUN one far after it. The boundary is in the data.
-        stamp = 4000000000000 if run_id == LATE_RUN else 1700000000000
-        return {'runId': run_id, 'terminalStatus': status, 'startedAt': stamp,
+        stamp = (int(time.time() * 1000) + 60000) if run_id == LATE_RUN else 1700000000000
+        return {'runId': run_id, 'terminalStatus': status,
+                'startedAt': 1700000000000, 'completedAt': int(time.time() * 1000) + 60000,
+                'completedAt': stamp,
                 'hostSource': 'native_host.terminal-mirror',
                 'statusSource': 'bridge_ledger.status', 'origin': origin}
 
@@ -88,7 +91,8 @@ class AckCannotSwallowAnUnannouncedRun(RelayScene):
 
     def relay_candidate(self, run_id, status='completed'):
         # Everything in this scene is a post-activation completion; the act of finishing is what makes it announceable.
-        return {'runId': run_id, 'terminalStatus': status, 'startedAt': 4000000000000,
+        return {'runId': run_id, 'terminalStatus': status,
+                'startedAt': 1700000000000, 'completedAt': int(time.time() * 1000) + 60000,
                 'hostSource': 'native_host.terminal-mirror',
                 'statusSource': 'bridge_ledger.status', 'origin': 'bridge'}
 

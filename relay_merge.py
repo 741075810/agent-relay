@@ -64,6 +64,10 @@ def fetch(relay_source, timeout=10):
             'runId': run_id,
             'status': status,
             'startedAt': item.get('startedAt'),
+            # Carried verbatim; `terminal_source` decides whether any of them is usable evidence.
+            'completedAt': item.get('completedAt'),
+            'endedAt': item.get('endedAt'),
+            'endedAtMs': item.get('endedAtMs'),
             'origin': item.get('origin') if item.get('origin') in ('bridge', 'direct', 'unknown') else 'unknown',
             'source': RELAY_SOURCE,
             'relaySource': item.get('source'),
@@ -85,8 +89,8 @@ def ack_forms(run_id, status=None):
     return forms
 
 
-def started_ms(value):
-    """A start time in epoch milliseconds, or None when the source did not say.
+def epoch_ms(value):
+    """An epoch instant in milliseconds, or None when the source did not say.
 
     The relay forwards whatever the host recorded; a second-resolution stamp is converted rather than mistaken for a
     1970 millisecond value, and anything unreadable stays None so the caller can fail closed on it.
@@ -96,6 +100,36 @@ def started_ms(value):
     if value <= 0:
         return None
     return int(value * 1000) if value < 100000000000 else int(value)
+
+
+def started_ms(value):
+    return epoch_ms(value)
+
+
+COMPLETION_FIELDS = ('completedAt', 'endedAtMs', 'endedAt')
+# A clock that is ahead by more than this is not evidence of anything: the arms window and every future comparison are
+# made of wall-clock time, so a stamp that is implausibly far ahead can only be wrong or hostile.
+CLOCK_SKEW_MS = 300000
+EARLIEST_MS = 978307200000          # 2001-01-01; older values are not a run this system could have watched
+
+
+def completed_ms(item):
+    """When the source says the run finished, in epoch milliseconds, or None.
+
+    Deliberately *not* `startedAt`: creation time says completion is at or after it, which is the wrong direction for
+    consent. A long task that began before the operator consented and finished afterwards is exactly the case a start
+    time gets wrong.
+    """
+    for field in COMPLETION_FIELDS:
+        if isinstance(item, dict) and field in item:
+            value = epoch_ms(item.get(field))
+            if value is not None:
+                return value
+    return None
+
+
+def plausible(value_ms, now_ms):
+    return (isinstance(value_ms, int) and EARLIEST_MS <= value_ms <= now_ms + CLOCK_SKEW_MS)
 
 
 def was_offered(offered, run_id, status=None):

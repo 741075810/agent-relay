@@ -18,12 +18,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 import protocol as P
 import terminal_source
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+RECENT_MS = 1700000000000
 ORIGIN = 'chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/'
 RELAY_RUN = 'aaaaaaaa-1111-4222-8333-444455556666'
 NATIVE_RUN = 'bbbbbbbb-1111-4222-8333-444455556666'
@@ -79,7 +81,10 @@ class RelayScene(unittest.TestCase):
     def seed_relay(self, candidates):
         # A relay candidate with no start time cannot be proven newer than the activation instant, so the host absorbs
         # it rather than announcing it. These fixtures describe runs that finished after activation, and say so.
-        candidates = [dict(item, startedAt=item.get('startedAt', 4000000000000)) for item in candidates]
+        candidates = [dict(item,
+                           startedAt=item.get('startedAt', RECENT_MS),
+                           completedAt=item.get('completedAt') or (int(time.time() * 1000) + 60000))
+                  for item in candidates]
         token = open(self.token_file, encoding='utf-8').read().strip()
         import urllib.request
         body = json.dumps({'candidates': candidates}).encode('utf-8')

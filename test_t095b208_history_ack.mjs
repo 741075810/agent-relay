@@ -64,12 +64,13 @@ async function seed(service, runIds) {
   const token = readFileSync(service.tokenFile, 'utf8').trim();
   // OLD_RUN finished before any activation; everything else is a later completion. The host decides from these stamps,
   // so the fixture has to state the fact rather than imply it with the order of calls.
-  const stamp = (runId) => (runId === OLD_RUN ? 1700000000000 : 4000000000000);
+  const stamp = (runId) => (runId === OLD_RUN ? 1700000000000 : Date.now() + 60000);
   await fetch(service.base + '/host/terminal-candidates', {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: 'Bearer ' + token },
     body: JSON.stringify({ candidates: runIds.map((runId) => ({ runId, terminalStatus: 'completed',
-      startedAt: stamp(runId),
+      startedAt: 1700000000000,
+      completedAt: stamp(runId),
       hostSource: 'native_host.terminal-mirror', statusSource: 'bridge_ledger.status', origin: 'bridge' })) }),
   });
 }

@@ -25,7 +25,7 @@ class AckIdentity(RelayScene):
         return [item['runId'] for item in self.candidates(self.host('terminal-list'))]
 
     def seed(self):
-        self.seed_relay([{'runId': RELAY_RUN, 'terminalStatus': 'completed',
+        self.seed_relay([{'runId': RELAY_RUN, 'terminalStatus': 'completed', 
                           'hostSource': 'native_host.terminal-mirror',
                           'statusSource': 'bridge_ledger.status', 'origin': 'bridge'}])
 

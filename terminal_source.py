@@ -210,7 +210,7 @@ def save_arm(state_dir, doc):
     _atomic_write(_arm_path(state_dir), doc)
 
 
-def arm_snapshot(state_dir, root=None, epoch=None):
+def arm_snapshot(state_dir, root=None, epoch=None, relay_source=None):
     """Record which runs were already terminal at this instant (T091).
 
     This is the boundary T086 could not draw. `startedAt` only proves "completion
@@ -249,6 +249,21 @@ def arm_snapshot(state_dir, root=None, epoch=None):
     for run in runs:
         if TERMINAL.get(run.get('status')):
             ids.append(run['requestID'])
+    # T210: an arm snapshot is a statement about *the sources it read*. The Bridge ledger knows nothing about runs that
+    # only the relay saw, so a snapshot built without the relay cannot authorise a relay candidate by its absence --
+    # that was the cross-source gap: every relay-only run looked "not in the arm", hence "finished after consent".
+    relay_covered = False
+    relay_count = 0
+    if relay_source:
+        relay_candidates, relay_code = relay_merge.fetch(relay_source)
+        if relay_code is not None:
+            # Arming with a source we cannot read would produce a snapshot that silently omits it. Refuse instead.
+            return {'ok': False, 'code': 'relay_source_unavailable_for_arm', 'epoch': None,
+                    'error': relay_code}
+        relay_covered = True
+        for item in relay_candidates:
+            ids.append(item['runId'])
+            relay_count += 1
     if len(ids) > MAX_SNAPSHOT_IDS:
         return {'ok': False, 'code': 'snapshot_truncated', 'epoch': None,
                 'count': len(ids), 'limit': MAX_SNAPSHOT_IDS,
@@ -261,6 +276,11 @@ def arm_snapshot(state_dir, root=None, epoch=None):
         'takenAt': int(time.time()),
         'ids': sorted(set(ids)),
         'truncated': False,
+        # What this snapshot actually covers. `relayCovered: false` is not a defect -- it is the honest statement that
+        # relay consent must then be decided per run from completion evidence.
+        'sources': sorted(['bridge_ledger'] + (['relay'] if relay_covered else [])),
+        'relayCovered': relay_covered,
+        'relayCount': relay_count,
     }
     try:
         save_arm(state_dir, doc)
@@ -269,7 +289,8 @@ def arm_snapshot(state_dir, root=None, epoch=None):
                 'error': str(exc)}
     return {'ok': True, 'code': None, 'epoch': epoch,
             'takenAt': doc['takenAt'], 'count': len(doc['ids']),
-            'truncated': False, 'source': 'codex-bridge-ledger'}
+            'truncated': False, 'source': 'codex-bridge-ledger',
+            'sources': doc['sources'], 'relayCovered': relay_covered, 'relayCount': relay_count}
 
 
 def load_state(state_dir):
@@ -890,6 +911,7 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
     relay_candidates, relay_code = relay_merge.fetch(relay_source)
     relay_absorbed = 0
     relay_unverified = 0
+    relay_implausible = 0
     relay_activation = next_state.get('relayActivation')
     if relay_source:
         # The relay is an optional source that can arrive long after the native one, so it keeps an activation of its
@@ -906,23 +928,35 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
             if activated_at is None:
                 activated_at = int(time.time() * 1000)
             arm_ids_now = set(arm['ids']) if arm is not None else None
+            # The boundary is the consent instant when a snapshot exists, and the moment this source first became
+            # readable when it does not. Either way the only usable proof is a *completion* time: creation time says
+            # completion is at or after it, which is the wrong direction for a decision about consent.
+            boundary_ms = int(arm['takenAt']) * 1000 if arm is not None else activated_at
+            now_ms = int(time.time() * 1000)
             existing = list(next_state.get('relayBaselineIds') or [])
             history_ids = []
             for item in relay_candidates:
-                if arm_ids_now is not None:
-                    # The arm snapshot is the consent proof: what it already contained is history, what it did not
-                    # finished afterwards and must not be swallowed.
-                    if item['runId'] in arm_ids_now:
-                        history_ids.append(item['runId'])
+                if arm_ids_now is not None and item['runId'] in arm_ids_now:
+                    history_ids.append(item['runId'])
                     continue
-                stamp = relay_merge.started_ms(item.get('startedAt'))
-                if stamp is None:
-                    # No start time means no way to prove this is new. Refusing to announce is the safe half; the count
-                    # is reported so the refusal is not silent.
+                evidence = relay_merge.completed_ms(item)
+                if evidence is None:
+                    # No completion time: this run cannot be shown to have finished after consent. Held, not
+                    # announced, and counted -- "unprovable" is a refusal with a reason, never an empty list.
                     history_ids.append(item['runId'])
                     relay_unverified += 1
-                elif stamp < activated_at:
+                    continue
+                if not relay_merge.plausible(evidence, now_ms):
+                    # A timestamp far in the future (or impossibly old) proves nothing; reading it as "after the arm"
+                    # is how a broken or forged clock would authorise an old notice.
                     history_ids.append(item['runId'])
+                    relay_implausible += 1
+                    continue
+                if evidence <= boundary_ms:
+                    history_ids.append(item['runId'])
+                    continue
+                item['postArm'] = True if arm is not None else None
+                item['postArmEvidence'] = 'relay_completed_at'
             merged_history = list(dict.fromkeys(existing + history_ids))
             if len(merged_history) > MAX_STATE_IDS:
                 # Never keep a truncated baseline: the remainder would be offered on a later sample, which is exactly
@@ -938,9 +972,12 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
                 # The consent fact travels with the candidate, or the extension cannot tell a run that finished after
                 # the arm from one that was already terminal when the operator consented.
                 for item in due:
-                    if item.get('source') != relay_merge.RELAY_SOURCE or 'postArm' in item:
+                    if item.get('source') != relay_merge.RELAY_SOURCE:
                         continue
-                    item['postArm'] = None if arm_ids_now is None else item['runId'] not in arm_ids_now
+                    if 'postArm' not in item:
+                        # Only the evidence loop above can set it. This branch is a guard: nothing reaches `due`
+                        # without having passed that decision.
+                        item['postArm'] = None
                 # What was actually offered is what a later ACK may name: journalling an unoffered id would let an ACK
                 # swallow a run nobody has seen yet, and its real completion would never be announced.
                 offered = list(next_state.get('relayOfferedIds') or [])
@@ -961,7 +998,9 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
         # until `acknowledge()` names them. `confirmed: false` says so out loud
         # so no caller can mistake this list for "already handed over safely".
         'candidates': due,
-        'relayCode': relay_code,
+        # Distinct from an unreachable source: candidates may have been read, and none of them was provable as new.
+        'relayCode': relay_code or ('relay_completion_unknown'
+                                    if (relay_unverified or relay_implausible) else None),
         'relayCandidates': len(relay_candidates),
         # Counted, not listed: "the relay had history at the moment this was enabled" and "the relay had nothing" must
         # not look the same, and the ids themselves are already in the state file.
@@ -973,6 +1012,12 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
         # Candidates the relay reported without a usable start time and no arm snapshot to compare against. They are
         # absorbed rather than announced, and counted here so the refusal has a reason attached to it.
         'relayUnverified': relay_unverified,
+        # Candidates whose completion stamp was not credible (far future, impossibly old). Counted apart from "no stamp
+        # at all": a clock problem and a missing field are different facts.
+        'relayImplausible': relay_implausible,
+        # Whether the arm snapshot on disk was built with this source included. `False` means relay consent is decided
+        # per run from completion evidence, never from absence in the snapshot.
+        'armRelayCovered': bool(arm is not None and arm.get('relayCovered') is True),
         'confirmed': False,
         'requiresAck': True,
         'redelivered': info['redelivered'],

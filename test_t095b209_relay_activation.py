@@ -17,6 +17,7 @@ These tests are written against the behaviour that is required, and they fail on
 import json
 import os
 import shutil
+import time
 import unittest
 
 import relay_merge
@@ -30,12 +31,12 @@ NATIVE_RUN = '55555555-1111-4222-8333-444455556666'
 
 class RelayActivation(RelayScene):
 
-    def candidate(self, run_id, status='completed', started_at=None):
+    def candidate(self, run_id, status='completed', stamps=None):
         item = {'runId': run_id, 'terminalStatus': status,
                 'hostSource': 'native_host.terminal-mirror',
                 'statusSource': 'bridge_ledger.status', 'origin': 'bridge'}
-        if started_at is not None:
-            item['startedAt'] = started_at
+        if stamps is not None:
+            item['startedAt'], item['completedAt'] = stamps
         return item
 
     def sample(self):
@@ -46,8 +47,10 @@ class RelayActivation(RelayScene):
     def seed_ids(self, run_ids):
         # Old runs carry a start time well before any activation; new ones a start time far in the future, so the
         # boundary is provable from the data rather than inferred from when the test happened to run.
-        stamps = {OLD_RUN: 1700000000000, NEW_RUN: 4000000000000}
-        self.seed_relay([self.candidate(run_id, started_at=stamps.get(run_id)) for run_id in run_ids])
+        # OLD finished long ago; NEW began long ago too but finished after any boundary in these tests.
+        plan = {OLD_RUN: (1700000000000, 1700000000000),
+                NEW_RUN: (1700000000000, int(time.time() * 1000) + 60000)}
+        self.seed_relay([self.candidate(run_id, stamps=plan.get(run_id)) for run_id in run_ids])
 
     def saved(self):
         return self.source_state()
@@ -128,7 +131,7 @@ class RelayActivation(RelayScene):
         self.sample()
         many = ['%08d-1111-4222-8333-444455556666' % index
                 for index in range(terminal_source.MAX_STATE_IDS + 5)]
-        self.seed_relay([self.candidate(run_id, started_at=1700000000000) for run_id in many])
+        self.seed_relay([self.candidate(run_id, stamps=(1700000000000, 1700000000000)) for run_id in many])
         stalled = self.sample()
         self.assertEqual(stalled['relayActivation'], 'stalled')
         self.assertEqual(stalled['relayCode'], 'relay_history_overflow')

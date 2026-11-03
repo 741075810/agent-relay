@@ -376,6 +376,8 @@ export function createRelay(config) {
           hostAck: typeof item.hostAck === 'string' ? item.hostAck : 'unseen',
           origin: typeof item.origin === 'string' ? item.origin : 'unknown',
           startedAt: Number.isFinite(item.startedAt) ? item.startedAt : null,
+          // T210: completion time, when the reporting host has it. Never derived from `startedAt`.
+          completedAt: Number.isFinite(item.completedAt) ? item.completedAt : null,
           reportedBy: 'native_host', origin_kind: 'terminal_candidate',
           pageDelivery: 'unknown', simulated: false, ingestedAt: now() });
         accepted.push({ runId, terminalStatus, duplicate: false, seq: state0.seq });
@@ -398,6 +400,7 @@ export function createRelay(config) {
           runId: run.runId,
           status: run.terminalStatus,
           startedAt: Number.isFinite(run.startedAt) ? run.startedAt : null,
+          completedAt: Number.isFinite(run.completedAt) ? run.completedAt : null,
           origin: run.origin || 'unknown',
           postArm: null,
           source: run.hostSource,
