@@ -67,8 +67,12 @@ def build_tree(root, with_epoch_binding=True, with_relay=True, with_arm_ms=True)
         handle.write(trigger)
     with open(os.path.join(root, 'extension', 'manifest.json'), 'w', encoding='utf-8') as handle:
         json.dump({'name': 'DSH Notify Bridge', 'version': '0.1.1', 'manifest_version': 3}, handle)
+    # T216: a capable install needs a launcher that can *forward* the relay flags, so the fixture's launcher says so.
+    launcher = b'MZ --state-dir --manifest'
+    if with_relay:
+        launcher += b' --relay-url --relay-token-file'
     with open(os.path.join(root, 'host_launcher.exe'), 'wb') as handle:
-        handle.write(b'MZ' + b'\x00' * 30)
+        handle.write(launcher + b'\x00' * 30)
     manifest = os.path.join(root, 'host_manifest.json')
     with open(manifest, 'w', encoding='utf-8') as handle:
         json.dump({'name': 'com.dsh.notify', 'type': 'stdio',

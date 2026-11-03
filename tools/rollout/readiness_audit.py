@@ -32,6 +32,7 @@ CHECKS = (
     ('installed_host_arm_snapshot', 'the installed host offers terminal-arm-snapshot'),
     ('installed_ext_epoch_bound', 'the installed extension binds postArm to an arm epoch (postArmEpoch)'),
     ('installed_ext_postarm', 'the installed extension honours a host postArm verdict at all'),
+    ('launcher_passes_relay', 'the installed launcher forwards --relay-url to the host it starts'),
     ('launcher_present', 'the registered launcher exists at the manifest path'),
     ('manifest_registered', 'a native-messaging manifest names this host for a Chrome extension'),
     ('bridge_db_readable', 'the Bridge database is readable and carries terminal events'),
@@ -90,6 +91,8 @@ def load_manifest(path):
         'name': doc.get('name'),
         'type': doc.get('type'),
         'path': shorten(doc.get('path')),
+        # Kept unshortened: the launcher has to be opened, and `~` is a display convention, not a path.
+        'rawPath': doc.get('path'),
         'path_exists': bool(doc.get('path') and os.path.isfile(doc.get('path'))),
         'origin_count': len(origins),
         'origins': [redact(item) for item in origins],
@@ -166,6 +169,29 @@ def tree_facts(root):
     return facts
 
 
+def launcher_forwards(path, needle=b'--relay-url'):
+    """Whether the installed launcher's own bytes mention a flag.
+
+    The launcher builds the host command line itself -- `--state-dir` and `--manifest`, then Chrome's arguments -- so a
+    relay flag can only reach the host if the binary knows the string. Dropping a new `host.py` beside a launcher that
+    never says `--relay-url` therefore enables nothing, and that is worth answering from the binary rather than from a
+    README.
+    """
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, 'rb') as handle:
+            if needle in handle.read():
+                return True
+            handle.seek(0)
+            for block in iter(lambda: handle.read(1 << 16), b''):
+                if needle in block:
+                    return True
+            return False
+    except OSError:
+        return None
+
+
 def token_facts(path):
     """Present or not, and how long -- never the value."""
     if not path or not os.path.isfile(path):
@@ -180,8 +206,8 @@ def token_facts(path):
 def verdict(checks):
     """A rollout is GO only when every blocking check passes."""
     blocking = ('installed_host_reads_relay', 'installed_host_arm_ms', 'installed_host_arm_snapshot',
-                'installed_ext_epoch_bound', 'installed_ext_postarm', 'launcher_present',
-                'manifest_registered', 'bridge_db_readable')
+                'installed_ext_epoch_bound', 'installed_ext_postarm', 'launcher_passes_relay',
+                'launcher_present', 'manifest_registered', 'bridge_db_readable')
     failed = [name for name in blocking if checks.get(name, {}).get('ok') is not True]
     return {'decision': 'GO' if not failed else 'NO-GO', 'blocking_failed': failed}
 
@@ -217,6 +243,9 @@ def run_audit(options):
             except ValueError:
                 doc = {}
             report['state']['armPrecision'] = 'ms' if isinstance(doc.get('armTakenAtMs'), int) else 'second'
+    launcher_path = options.launcher or ((manifest or {}).get('rawPath') if manifest else None)
+    report['launcher'] = {'path': launcher_path,
+                          'forwards_relay_flag': launcher_forwards(options.launcher or launcher_path)}
     report['token'] = token_facts(options.token_file)
     if options.probe_relay and options.relay_url:
         report['relayProbe'] = probe_relay(options.relay_url, options.token_file)
@@ -229,6 +258,7 @@ def run_audit(options):
         'installed_ext_epoch_bound': {'ok': installed_markers.get('extension/background.js') is True
                                       and installed_markers.get('extension/lib/terminal_trigger.js') is True},
         'installed_ext_postarm': {'ok': ext_has(installed, 'postArm')},
+        'launcher_passes_relay': {'ok': report['launcher']['forwards_relay_flag'] is True},
         'launcher_present': {'ok': bool((manifest or {}).get('path_exists'))},
         'manifest_registered': {'ok': bool(manifest and manifest.get('origin_count'))},
         'bridge_db_readable': {'ok': bridge.get('has_events') is True and 'error' not in bridge},
@@ -292,6 +322,9 @@ def render(report):
         for name, value in sorted(installed['markers'].items()):
             lines.append('  %-28s capability %s' % (name, 'yes' if value else 'no'))
     manifest = report.get('manifest') or {}
+    launcher = report['launcher']
+    lines.append('launcher       : %s' % (launcher.get('path') or 'unknown'))
+    lines.append('  forwards --relay-url : %s' % launcher.get('forwards_relay_flag'))
     lines.append('manifest       : %s' % (manifest.get('name') or manifest.get('error')))
     if manifest.get('path'):
         lines.append('  launcher     : %s (exists=%s)' % (manifest['path'], manifest.get('path_exists')))
@@ -326,6 +359,8 @@ def parse_args(argv=None):
     ap.add_argument('--bridge-db', default=None)
     ap.add_argument('--state-dir', default=None)
     ap.add_argument('--token-file', default=None)
+    ap.add_argument('--launcher', default=None,
+                    help='launcher executable to inspect (default: the manifest path); read as bytes, never executed')
     ap.add_argument('--relay-url', default=None)
     ap.add_argument('--probe-relay', action='store_true', help='one GET /health; still writes nothing')
     ap.add_argument('--json', action='store_true')
