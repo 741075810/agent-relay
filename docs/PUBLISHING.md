@@ -34,7 +34,9 @@ Exit code 0 means source may be pushed, **not** that Chrome has upgraded. Anythi
 prints which check disagreed and the last few lines of its output.
 
 The `install` stage is read-only and opt-in via `DSH_EXTENSION_INSTALL` (legacy
-`T218_INSTALLED_EXT` also accepted). No configuration is explicit `SKIP / UNCHECKED`, not
+`T218_INSTALLED_EXT` also accepted), with private repo-local `agentrelay.extensionInstall`
+as a persistent fallback for independent developer processes. No configuration is explicit
+`SKIP / UNCHECKED`, not
 agreement. Drift reports `source updated, installed outdated; needs explicit sync + human
 Chrome Reload` as `WARN` by default; `--require-install` fails unless configured install
 files match. A configured invalid/unreadable directory fails even without that flag.

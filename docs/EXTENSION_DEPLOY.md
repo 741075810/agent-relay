@@ -16,7 +16,26 @@ Configuration precedence:
 1. Standalone `--preflight --target "<INSTALL_DIR>"` overrides environment values.
 2. `DSH_EXTENSION_INSTALL`, if nonblank.
 3. Existing `T218_INSTALLED_EXT`, if nonblank (compatibility with the old opt-in).
-4. No configured value: **UNCHECKED**, never disk agreement.
+4. For the release gate only: private `git config --local agentrelay.extensionInstall`, if set.
+5. No configured value: **UNCHECKED**, never disk agreement.
+
+T242 closes the independent-task configuration gap with the existing local Git configuration:
+
+```powershell
+# One explicit setup in this checkout; value lives in .git/config, never in tracked source.
+git config --local --replace-all agentrelay.extensionInstall '<INSTALL_DIR>'
+# Normal future DSH/tool processes need no environment injection or service restart:
+python -B tools/release_gate.py --clean-clone
+# Roll back only this private setting:
+git config --local --unset-all agentrelay.extensionInstall
+```
+
+The gate reads only the local key (`--local --no-includes`), not global Windows/Git settings.
+Environment overrides retain precedence. Local configuration read failures are explicit FAIL/UNCHECKED.
+The key does not travel in commits, pushes or clean clones: repeat setup only for another explicitly
+chosen checkout. Standalone deploy-sync CLI remains explicit-target/environment based; no automatic
+apply or browser operation is added. Gate children use Windows `CREATE_NO_WINDOW`.
+
 
 A present but invalid primary value is reported as invalid; it does not silently fall back.
 No path is guessed from Chrome's private Profile, process arguments or runtime state. Use the
@@ -25,8 +44,9 @@ Only ordinary directories/files are accepted: symlinks and Windows reparse point
 ancestors, are rejected. Source and install directories must not overlap. Manifest/read errors
 remain `UNCHECKED` with a machine-readable reason code.
 
-The examples set process-local configuration only. Do not commit a machine path or add it to a
-shared workflow, and do not run `setx` or alter service environments as part of a development round.
+The environment examples below are process-local alternatives to the private Git-local setting.
+Do not commit a machine path or add it to a shared workflow, and do not run `setx` or alter service
+environments as part of a development round.
 
 ```powershell
 # Windows: in the developer shell, after replacing the placeholder with your known install directory.

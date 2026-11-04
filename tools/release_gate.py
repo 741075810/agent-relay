@@ -238,7 +238,7 @@ def run(command, cwd, timeout=None):
     started = time.time()
     options = {}
     if os.name == 'nt':
-        options['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
+        options['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
     else:
         options['start_new_session'] = True
     proc = subprocess.Popen(command, cwd=cwd, stdin=subprocess.DEVNULL,
@@ -458,8 +458,20 @@ def extension_install(root, require=False):
     configured_by, target = next(((key, os.environ[key].strip())
                                  for key in ('DSH_EXTENSION_INSTALL', 'T218_INSTALLED_EXT')
                                  if os.environ.get(key, '').strip()), (None, None))
+    config_failed = False
+    if not target and os.path.exists(os.path.join(root, '.git')):
+        local = run(['git', 'config', '--local', '--no-includes', '--get',
+                     'agentrelay.extensionInstall'], root)
+        if local['returncode'] == 0 and local['output'].strip():
+            configured_by, target = 'git-local:agentrelay.extensionInstall', local['output'].strip()
+        elif local['returncode'] not in (0, 1):
+            config_failed = True
     tool = os.path.join(root, 'tools', 'extension_deploy_sync.py')
-    if not os.path.exists(tool):
+    if config_failed:
+        detail = {'state': 'unchecked', 'checked': False, 'code': 'local_config_failed',
+                  'marker': 'installed files NOT compared: local Git configuration could not be read',
+                  'loaded_runtime': 'unknown'}
+    elif not os.path.exists(tool):
         detail = {'state': 'unchecked', 'checked': False, 'code': 'missing_tool',
                   'marker': 'installed files NOT compared: no deploy tool in this repository',
                   'loaded_runtime': 'unknown'}
