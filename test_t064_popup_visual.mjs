@@ -68,8 +68,10 @@ console.log('== T064: no new control can send ==');
     JSON.stringify(bad) + ')');
   // The count is a tripwire, not a design rule -- when it moves, say here which controls were
   // added and why: T122 added the send grant's phrase box and button (+2), T123 added the
-  // trigger grant's phrase box and button (+2).
-  check(controls.length === 34,
+  // trigger grant's phrase box and button (+2), T233 added the diagnostic export button (+1; the
+  // manual-copy textarea does not count as a control because the scan skips hidden elements, and it
+  // starts hidden).
+  check(controls.length === 35,
     'the control count is 30 plus two T122 and two T123 restricted controls ('
     + controls.length + ')');
 }
@@ -93,7 +95,7 @@ console.log('== T064: the anchor bar points at sections that exist ==');
 console.log('== T064: numbered titles are visible and bold ==');
 {
   const badges = [...html.matchAll(/class="mod-no">([^<]+)</g)].map((m) => m[1]);
-  check(badges.length === 8, 'eight number badges (' + badges.length + ')');
+  check(badges.length === 9, 'nine number badges (' + badges.length + ')');
   for (const wanted of ['T053', 'T054', 'T055', 'T058/T059', 'T059', 'T067',
     'T068']) {
     check(badges.includes(wanted), 'badge present: ' + wanted);
@@ -118,7 +120,7 @@ console.log('== T064: the tinted rail is on the module sections ==');
   // giving it a header would imply it is one.
   const modules = [...html.matchAll(/<section class="module"/g)].length;
   const plain = [...html.matchAll(/<section>/g)].length;
-  check(modules === 8, 'eight sections carry the module styling (' + modules + ')');
+  check(modules === 9, 'nine sections carry the module styling (' + modules + ')');
   check(plain === 1,
     'and only the button toolbar is left plain (' + plain + ')');
   check(/section\.module\s*\{[^}]*border-left:\s*3px solid var\(--mod-line\)/.test(html),
