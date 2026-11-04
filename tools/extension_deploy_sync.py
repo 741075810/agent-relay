@@ -252,38 +252,52 @@ def restore_backup(target, backup_dir, rows):
     return restored, removed
 
 
-def render(report, stream=sys.stdout):
+def emit(stream, text):
+    """Write one line, degrading glyphs the target encoding cannot represent.
+
+    A CJK install directory on a cp1252 console must produce a readable line with a replaced
+    character, not a UnicodeEncodeError from inside the report of a check that already ran.
+    """
+    try:
+        stream.write(text)
+    except UnicodeEncodeError:
+        encoding = getattr(stream, 'encoding', None) or 'ascii'
+        stream.write(text.encode(encoding, 'backslashreplace').decode(encoding, 'replace'))
+
+
+def render(report, stream=None):
+    # Late-bound on purpose: a default of `sys.stdout` is resolved at import time, so a caller that
+    # redirects stdout (a test, a caller capturing output) would still print to the real console.
+    stream = stream if stream is not None else sys.stdout
     rows = report['files']
     counts = {}
     for row in rows:
         counts[row['state']] = counts.get(row['state'], 0) + 1
-    stream.write('source   %s\n' % report['source'])
-    stream.write('install  %s\n' % report['target'])
-    stream.write('files    source %d  install %d\n' % (report['source_files'], report['target_files']))
-    stream.write('stamp    source %s  install %s  %s\n'
-                 % (report['stamp']['source'], report['stamp']['target'],
-                    'in sync' if report['stamp']['match'] else 'DRIFT -- the install is another build'))
+    emit(stream, 'source   %s\n' % report['source'])
+    emit(stream, 'install  %s\n' % report['target'])
+    emit(stream, 'files    source %d  install %d\n' % (report['source_files'], report['target_files']))
+    emit(stream, 'stamp    source %s  install %s  %s\n'
+         % (report['stamp']['source'], report['stamp']['target'],
+            'in sync' if report['stamp']['match'] else 'DRIFT -- the install is another build'))
     for row in rows:
         if row['state'] == IDENTICAL:
             continue
-        stream.write('  %-16s %-44s %s -> %s\n'
-                     % (row['state'], row['path'], row['source'] or '(absent)', row['target'] or '(absent)'))
-    stream.write('summary  %s\n' % ', '.join('%s=%d' % (key, counts[key]) for key in sorted(counts)))
+        emit(stream, '  %-16s %-44s %s -> %s\n'
+             % (row['state'], row['path'], row['source'] or '(absent)', row['target'] or '(absent)'))
+    emit(stream, 'summary  %s\n' % ', '.join('%s=%d' % (key, counts[key]) for key in sorted(counts)))
     for note in report['manifest']:
-        stream.write('manifest %s\n' % note)
+        emit(stream, 'manifest %s\n' % note)
     if report.get('backup'):
-        stream.write('backup   %s\n' % report['backup'])
+        emit(stream, 'backup   %s\n' % report['backup'])
     if report.get('written'):
-        stream.write('written  %s\n' % ', '.join(report['written']))
-    if report.get('skipped'):
-        for item in report['skipped']:
-            stream.write('skipped  %-44s %s\n' % (item['path'], item['why']))
-    if report.get('refusals'):
-        for item in report['refusals']:
-            stream.write('refused  %s\n' % item)
+        emit(stream, 'written  %s\n' % ', '.join(report['written']))
+    for item in report.get('skipped') or []:
+        emit(stream, 'skipped  %-44s %s\n' % (item['path'], item['why']))
+    for item in report.get('refusals') or []:
+        emit(stream, 'refused  %s\n' % item)
     if report.get('rollback'):
-        stream.write('rollback %s\n' % report['rollback'])
-    stream.write('verdict  %s\n' % report['verdict'])
+        emit(stream, 'rollback %s\n' % report['rollback'])
+    emit(stream, 'verdict  %s\n' % report['verdict'])
 
 
 def main(argv=None):
@@ -300,6 +314,15 @@ def main(argv=None):
                         help='where the rollback copy goes (default: <target>.backup-<utc> beside it)')
     parser.add_argument('--json', action='store_true', help='machine-readable output')
     args = parser.parse_args(argv)
+
+    # A path may contain characters the console codepage cannot draw (a CJK install directory on a
+    # cp1252 terminal). Degrade those glyphs instead of failing the check that just ran.
+    reconfigure = getattr(sys.stdout, 'reconfigure', None)
+    if reconfigure is not None:
+        try:
+            reconfigure(errors='replace')
+        except (ValueError, OSError):
+            pass
 
     source = os.path.abspath(args.source)
     target = os.path.abspath(args.target)

@@ -244,6 +244,26 @@ class Safety(Fixture):
         self.assertEqual(len(self.backups()), 1)
 
 
+class Console(Fixture):
+    def test_a_console_that_cannot_draw_cjk_does_not_crash_the_report(self):
+        # This is the Windows CI runner: cp1252 console, CJK install directory. The report must
+        # degrade the glyphs, not raise from inside a check that already ran.
+        write(os.path.join(self.source, '背景 脚本.js'), 'const 中文 = 1;\n')
+        rows = deploy.compare(self.source, self.target)
+        report = _report(rows, self.source, self.target)
+        stream = _io.TextIOWrapper(_io.BytesIO(), encoding='cp1252', errors='strict')
+        deploy.render(report, stream)
+        stream.flush()
+        written = stream.buffer.getvalue().decode('cp1252')
+        self.assertIn('summary', written)
+        self.assertIn('verdict', written)
+
+    def test_render_writes_to_the_stream_it_was_given(self):
+        stream = _Capture()
+        deploy.render(_report(deploy.compare(self.source, self.target), self.source, self.target), stream)
+        self.assertTrue(stream.text.startswith('source'))
+
+
 class Paths(Fixture):
     def test_chinese_and_space_paths_work_end_to_end(self):
         base = os.path.join(self.tmp, '中文 路径 with spaces')
