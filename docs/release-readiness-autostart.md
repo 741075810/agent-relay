@@ -324,3 +324,25 @@ T227 查过：除 Bridge 台账之外没有可证实的独立来源，relay 是�
 
 沙箱化：`test_support_chrome.mjs` 提供带真实监听器的 `chrome.*` 假实现，`connectNative` 只记录不建端口；
 没有浏览器、没有页面、没有 native host。
+
+## 14. `received` 去重窗口与 ACK 长期失败（T230）
+
+风险链：ACK 长期失败 → 宿主反复提供同一事件 → `received` 只保留最近 100 条且**以它为去重集** → 该事件被移出
+窗口后被再次接收。
+
+实测（`test_t095b230_dedupe_capacity.mjs`，30 断言，全离线）：
+
+* **会重复的是"存储/展示"**：窗口滑动后重新接收，`received` 里同一 `eventId` 以新的 `receivedAt` 重新出现，
+  徽标 +1、received-review 再列一次。判定条件是可确定的：**两次被提供之间进了 ≥100 条新事件**。
+* **不会重复的是"页面投递"**：写屏障是 `terminalTrigger.seen`（键 `runId|status`），与展示列表无关：
+  - `admit()` 同状态回 `duplicate_event`、换状态回 `duplicate_run`；
+  - 日志容量 1024 且**到顶是拒绝不是修剪**（`journal_over_capacity`，`enabled=false`），所以体量无法把已发过的
+    run "忘掉"再放进来；
+  - `queue_delivery.onAdded` 只做徽标，`autosend_controller.js:70` 明确这些记录从不用于发送。
+
+因此**不满足"一次性投递被破坏"**，本轮不改生产代码。若将来要消除展示层的重复，正确方向是让去重键跟随
+cursor/ack 账本而不是展示窗口——那是协议层改动，需要在有真实发生样本后单独评估。
+
+未受影响的语义（同批断言覆盖）：跨 worker 重启沿用 cursor 与 consumer、窗口滑出后旧记录被新记录取代、
+`completionAfterArm` 的三种拒绝码、`optInUsable` 的 `opt_in_after_terminal`/`terminal_time_unknown`/
+`opt_in_run_mismatch`。
