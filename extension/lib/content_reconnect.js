@@ -133,6 +133,21 @@ export async function reconnectTabById(api, tabId, options = {}) {
  * injected script still does not answer, the problem is not a missing script, and
  * repeating the injection would only re-run the file.
  */
+/**
+ * The repair a *probe* should use.
+ *
+ * A probe target is not a binding: `probeSpecificTab` only needs `{tabId, windowId}`, and the autosend path passes
+ * exactly that. Handing such a target to `ensureContentScript` asked it to parse a `url` that was never there, so every
+ * automatic repair answered `reconnect_not_a_conversation` without touching the tab -- twelve times in one hour on
+ * 2026-11-04, each costing a probe round and each leaving the run deferred. The tab's url is therefore read here, from
+ * Chrome, and the conversation check inside `reconnectTabById` runs against that live value.
+ */
+export async function reconnectForProbe(api, target, options = {}) {
+  const tabId = target && target.tabId;
+  if (!Number.isSafeInteger(tabId)) return code(RECONNECT_CODES.badTab);
+  return reconnectTabById(api, tabId, options);
+}
+
 export function createResilientProbe(deps = {}) {
   const probeSpecificTab = deps.probeSpecificTab;
   const reconnect = deps.reconnect;

@@ -33,7 +33,7 @@ import { createChromeAutoSend } from './lib/autosend_chrome_wiring.js';
 // session-scoped binding. The first is repaired by re-injecting the read-only
 // observer, the second by mirroring the binding into `local`. Neither widens what a
 // notice may do: every send still re-probes the tab and re-checks the document.
-import { createResilientProbe, ensureContentScript, reconnectTabById }
+import { createResilientProbe, reconnectForProbe, reconnectTabById }
   from './lib/content_reconnect.js';
 import { createMirroredSession, BINDING_RESTORED_AT_KEY } from './lib/binding_mirror.js';
 // The limits themselves (defaults and hard bounds), so the popup reports the
@@ -70,7 +70,9 @@ const bindingSession = createMirroredSession(
 // not a new way to type into it.
 const resilientProbe = createResilientProbe({
   probeSpecificTab,
-  reconnect: (api, target) => ensureContentScript(api, target, { file: 'content.js' }),
+  // T236: `target` here is a probe target (`{tabId, windowId}`), not a binding, so it carries no url. The wrapper reads
+  // the tab and re-checks the conversation against the live value before injecting anything.
+  reconnect: (api, target) => reconnectForProbe(api, target, { file: 'content.js' }),
   onEvent: (event) => {
     const attempt = event.attempt || {};
     note({ kind: attempt.ok ? 'content-reconnected' : 'content-reconnect-failed',
