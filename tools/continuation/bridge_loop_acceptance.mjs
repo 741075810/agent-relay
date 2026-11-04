@@ -233,11 +233,17 @@ export function judgeRecord(record) {
   }
 
   // A re-dispatch must point at a task that did not exist yet, and the next round must be that task.
+  const completedTasks = new Set();
   for (let i = 0; i < rounds.length; i += 1) {
+    if (rounds[i] && rounds[i].taskId) completedTasks.add(rounds[i].taskId);
     const next = rounds[i + 1];
     const dispatched = rounds[i] && rounds[i].states && rounds[i].states.redispatched;
-    if (!next || !dispatched || !dispatched.taskId) continue;
-    if (dispatched.taskId !== next.taskId) problems.push(`redispatch:does_not_lead_to_round_${next.round}`);
+    if (!dispatched || !dispatched.taskId) continue;
+    // The last round has no successor record, but still must not loop back into old work.
+    if (completedTasks.has(dispatched.taskId)) {
+      problems.push(`redispatch:reuses_completed_task:${dispatched.taskId}`);
+    }
+    if (next && dispatched.taskId !== next.taskId) problems.push(`redispatch:does_not_lead_to_round_${next.round}`);
   }
 
   // T190R: nothing in this judgement requires a person. A round whose notice was observed inside the target

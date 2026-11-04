@@ -206,6 +206,32 @@ test('T191: four rounds pass -- three is a sample size, not a cap', () => {
   assert.equal(report.rounds.length, 4);
 });
 
+test('T248: the final redispatch cannot reuse any task already completed in the record', () => {
+  const rounds = [191, 192, 193, 194].map((n, i) => round({
+    round: n, runId: `run-${n}`, taskId: `tsk-${n}`,
+    startedAt: `2026-11-02T1${i}:00:00Z`, completedAt: `2026-11-02T1${i}:30:00Z`,
+    states: {
+      taskCompleted: { observed: true, source: 'bridge_ledger', at: `2026-11-02T1${i}:30:00Z`,
+        status: 'completed', taskId: `tsk-${n}`, runId: `run-${n}` },
+      extensionSubmitted: { observed: true, source: 'extension_diagnostic', at: `2026-11-02T1${i}:30:05Z`, runId: `run-${n}` },
+      noticeVisible: { observed: true, source: 'chatgpt_conversation_message', at: `2026-11-02T1${i}:30:30Z`,
+        messageId: `msg-${n}`, conversationId: 'conv-55', runId: `run-${n}` },
+      reviewed: { observed: true, source: 'chatgpt_review', at: `2026-11-02T1${i}:35:00Z`,
+        reviewId: `rev-${n}`, taskId: `tsk-${n}`, runId: `run-${n}` },
+      redispatched: { observed: true, source: 'bridge_ledger', at: `2026-11-02T1${i}:36:00Z`, taskId: `tsk-${n + 1}` },
+    },
+  }));
+  assert.equal(judge(rounds).verdict, 'PASS', 'a genuinely new final task remains accepted');
+  for (const prior of rounds) {
+    const mutated = structuredClone(rounds);
+    mutated.at(-1).states.redispatched.taskId = prior.taskId;
+    const report = judge(mutated);
+    assert.equal(report.verdict, 'FAIL', `final redispatch back to ${prior.taskId}`);
+    assert.ok(report.problems.includes(`redispatch:reuses_completed_task:${prior.taskId}`));
+    assert.equal(report.unattended, null, 'a cycle into old work is never credited as unattended');
+  }
+});
+
 test('T191: the report never claims this program observed the loop', () => {
   const report = judge([round()]);
   assert.match(report.note, /not that the loop was observed by this program/);

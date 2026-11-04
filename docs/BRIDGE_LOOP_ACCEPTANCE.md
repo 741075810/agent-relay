@@ -90,6 +90,7 @@ node tools/continuation/bridge_loop_acceptance.mjs record.json --json   # 机器
   `UNKNOWN`（`session:absent`）——缺证据和自相矛盾不是一回事，不许合并。
 - `runId` / `taskId` 重复 → FAIL（`duplicate_run:` / `duplicate_task:`）。
 - 两轮时间窗重叠 → FAIL（`overlap:190/191`）：闭环一次只应有一条在跑。
+- `redispatched.taskId` 指向本轮或此前任一轮已完成任务 → FAIL（`redispatch:reuses_completed_task:<taskId>`），**末轮没有下一条记录也必须检查**。
 - `redispatched.taskId` 不指向下一轮的实际 `taskId` → FAIL（`redispatch:does_not_lead_to_round_N`）。
 - 任一阶段 `observed` 缺失/`null` → `UNKNOWN`（`<stage>:not_observed`）。
 - 阶段缺"点名"字段 → `UNKNOWN`，绝不填默认值：`taskCompleted:status_absent` / `task_id_absent` /
