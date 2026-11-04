@@ -34,7 +34,8 @@ The gate reads only the local key (`--local --no-includes`), not global Windows/
 Environment overrides retain precedence. Local configuration read failures are explicit FAIL/UNCHECKED.
 The key does not travel in commits, pushes or clean clones: repeat setup only for another explicitly
 chosen checkout. Standalone deploy-sync CLI remains explicit-target/environment based; no automatic
-apply or browser operation is added. Gate children use Windows `CREATE_NO_WINDOW`.
+apply or browser operation is added. Gate children use Windows hidden STARTUPINFO (`SW_HIDE`),
+retaining inherited console semantics without displaying a window.
 
 
 A present but invalid primary value is reported as invalid; it does not silently fall back.

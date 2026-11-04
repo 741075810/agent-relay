@@ -133,7 +133,16 @@ class LocalInstallConfig(unittest.TestCase):
                 '"visible":bool(h and u.IsWindowVisible(h))}))')
         result = self.gate.run([sys.executable, '-B', '-c', code], str(self.root))
         self.assertEqual(result['returncode'], 0)
-        self.assertEqual(json.loads(result['output']), {'console': False, 'visible': False})
+        self.assertFalse(json.loads(result['output'])['visible'])
+        windows_call = []
+        real = subprocess.Popen
+        def capture(*args, **kwargs):
+            windows_call.append(kwargs['startupinfo'])
+            return real(*args, **kwargs)
+        with mock.patch.object(subprocess, 'Popen', side_effect=capture):
+            self.gate.run([sys.executable, '-B', '-c', 'print("hidden")'], str(self.root))
+        self.assertTrue(windows_call[0].dwFlags & subprocess.STARTF_USESHOWWINDOW)
+        self.assertEqual(windows_call[0].wShowWindow, subprocess.SW_HIDE)
 
 
 if __name__ == '__main__':

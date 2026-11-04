@@ -238,7 +238,11 @@ def run(command, cwd, timeout=None):
     started = time.time()
     options = {}
     if os.name == 'nt':
-        options['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+        options['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
+        hidden = subprocess.STARTUPINFO()
+        hidden.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        hidden.wShowWindow = subprocess.SW_HIDE
+        options['startupinfo'] = hidden
     else:
         options['start_new_session'] = True
     proc = subprocess.Popen(command, cwd=cwd, stdin=subprocess.DEVNULL,
