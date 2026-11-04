@@ -90,6 +90,14 @@ That runs the checks below in order and prints one verdict. It also runs in CI o
 push (`.github/workflows/gate.yml`), so nobody has to remember the sequence.
 `docs/PUBLISHING.md` explains the output and why prose was not enough.
 
+**Development handoff:** quote the gate's actual `install` status and committed HEAD.
+Opt in with `DSH_EXTENSION_INSTALL` (or legacy `T218_INSTALLED_EXT`); absent configuration
+is `SKIP / UNCHECKED`, never an installed-version pass. On drift preserve the marker
+`source updated, installed outdated; needs explicit sync + human Chrome Reload`.
+Even `PASS` proves configured disk bytes only, not Chrome's loaded runtime. Do not install,
+Reload, change persistent environment or edit browser state as part of this preflight.
+`docs/EXTENSION_DEPLOY.md` defines the read-only workflow and strict optional acceptance.
+
 The individual checks, for when the tool itself is what is broken:
 
 ```powershell

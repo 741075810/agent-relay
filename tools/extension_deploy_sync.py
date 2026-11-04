@@ -1,4 +1,4 @@
-"""Is the extension Chrome is running the one this repository ships?
+"""Do unpacked install files match the extension this repository ships?
 
 `tools/extension_stamp.py` answers a narrower question -- "does this tree's declared stamp match
 its own files" -- and says outright that it cannot see what Chrome loaded. The gap that kept
@@ -11,6 +11,7 @@ This tool closes that gap without touching a browser:
 
     check (default, read-only)   per-file SHA256 of source vs install, with the stamp of each side
     --apply                      back up, copy whitelisted static files, verify, roll back on failure
+    --preflight                  opt-in strict raw-SHA256 disk status; Chrome loaded runtime unknown
 
 What it deliberately does not do: it never reloads an extension, never writes a Chrome profile,
 never reads one, never starts or stops a browser or a host process. The install directory is a
@@ -42,6 +43,131 @@ TEXT_SUFFIXES = ('.js', '.mjs', '.html', '.htm', '.css', '.json', '.txt', '.md',
 PROFILE_MARKERS = ('user data', 'local extension settings', 'sync extension settings')
 
 IDENTICAL, DIFFERS, TEXT_EQUIV, MISSING, EXTRA = 'identical', 'differs', 'text_equivalent', 'missing', 'extra'
+
+# Explicit opt-in only: never discover a directory through Chrome's private profile.
+INSTALL_ENV = ('DSH_EXTENSION_INSTALL', 'T218_INSTALLED_EXT')
+DRIFT_MARKER = 'source updated, installed outdated; needs explicit sync + human Chrome Reload'
+UNCONFIGURED_MARKER = ('installed files NOT compared: set DSH_EXTENSION_INSTALL to the '
+                       'unpacked install directory; Chrome loaded runtime UNKNOWN')
+IN_SYNC_MARKER = ('installed files match source bytes; Chrome loaded runtime UNKNOWN '
+                  '(disk equality does not prove human Chrome Reload)')
+
+
+def configured_target(environ=None):
+    """Explicit environment configuration; no discovery or persistent environment edits."""
+    environ = os.environ if environ is None else environ
+    return next(((environ.get(name) or '').strip() for name in INSTALL_ENV
+                 if (environ.get(name) or '').strip()), None)
+
+
+class PreflightError(ValueError):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def _ordinary_path(path):
+    """Reject links/reparse points, including ancestors, before reading their contents."""
+    import stat
+    current = os.path.abspath(path)
+    while True:
+        info = os.lstat(current)
+        if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400:
+            raise PreflightError('unsafe_link', 'symlink/reparse point: %s' % current)
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+
+
+def _preflight_snapshot(root):
+    """Full SHA256 inventory; scandir failures must not become silently missing files."""
+    import stat
+    _ordinary_path(root)
+    result = {}
+
+    def visit(directory):
+        with os.scandir(directory) as scan:
+            entries = sorted(scan, key=lambda item: item.name)
+        for entry in entries:
+            info = entry.stat(follow_symlinks=False)
+            if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400:
+                raise PreflightError('unsafe_link', 'symlink/reparse point: %s' % entry.path)
+            if stat.S_ISDIR(info.st_mode):
+                visit(entry.path)
+            elif stat.S_ISREG(info.st_mode):
+                rel = os.path.relpath(entry.path, root).replace('\\', '/')
+                result[rel] = sha256_file(entry.path)
+            else:
+                raise PreflightError('unsafe_file', 'not a regular file: %s' % entry.path)
+    visit(root)
+    return result
+
+
+def preflight(source=None, target=None, environ=None):
+    """Read-only disk comparison; never a statement about Chrome's loaded generation.
+
+    Raw SHA256 equality is stricter than T240's CRLF-equivalent default check. Stamps are
+    supplemental: changing build_stamp.js is drift even if tree_digest excludes that file.
+    Files are inventoried twice to notice ordinary concurrent updates; this is not an atomic
+    filesystem snapshot. All failures have a distinct code and remain UNCHECKED, not IN_SYNC.
+    """
+    source = os.path.abspath(source or REPO_EXTENSION)
+    target = target or configured_target(environ)
+    report = {'state': 'unchecked', 'checked': False, 'code': 'missing_config',
+              'marker': UNCONFIGURED_MARKER, 'source': source, 'target': None,
+              'loaded_runtime': 'unknown', 'comparison': 'raw_sha256'}
+    if not target:
+        return report
+    target = os.path.abspath(target)
+    report['target'] = target
+    try:
+        for label, root in (('source', source), ('install', target)):
+            if looks_like_profile(root):
+                raise PreflightError('profile_path', '%s looks like a Chrome profile' % label)
+            _ordinary_path(root)
+            if not os.path.isdir(root):
+                raise PreflightError('invalid_directory', '%s is not a directory' % label)
+        src, dst = os.path.normcase(source), os.path.normcase(target)
+        try:
+            common = os.path.commonpath([src, dst])
+        except ValueError:  # Different Windows drives are fine.
+            common = None
+        if common in (src, dst):
+            raise PreflightError('overlapping_directories', 'source/install directories overlap')
+        source_files = _preflight_snapshot(source)
+        target_files = _preflight_snapshot(target)
+        for label, root, files in (('source', source, source_files), ('install', target, target_files)):
+            if 'manifest.json' not in files:
+                raise PreflightError('missing_manifest', '%s has no manifest.json' % label)
+            with open(os.path.join(root, 'manifest.json'), encoding='utf-8') as handle:
+                manifest = json.load(handle)
+            if not isinstance(manifest, dict) or manifest.get('manifest_version') not in (2, 3):
+                raise PreflightError('invalid_manifest', '%s has an invalid extension manifest' % label)
+        source_stamp, source_digest, _count = stamp_of(source)
+        target_stamp, target_digest, _count = stamp_of(target)
+        if (source_files != _preflight_snapshot(source)
+                or target_files != _preflight_snapshot(target)):
+            raise PreflightError('files_changed_during_check', 'files changed during comparison; retry explicitly')
+        rows = []
+        for rel in sorted(set(source_files) | set(target_files)):
+            source_hash, target_hash = source_files.get(rel), target_files.get(rel)
+            if source_hash != target_hash:
+                state = MISSING if target_hash is None else EXTRA if source_hash is None else DIFFERS
+                rows.append({'path': rel, 'state': state, 'source': source_hash, 'target': target_hash})
+        state = 'drift' if rows else 'in_sync'
+        report.update(state=state, checked=True, code=state,
+                      marker=DRIFT_MARKER if rows else IN_SYNC_MARKER,
+                      source_stamp=source_stamp, install_stamp=target_stamp,
+                      stamp_match=bool(source_digest and source_digest == target_digest),
+                      source_files=len(source_files), target_files=len(target_files),
+                      differing=[row['path'] for row in rows][:10], differing_count=len(rows),
+                      differences=rows)
+    except PreflightError as err:
+        report.update(code=err.code, marker='installed files NOT compared: %s; Chrome loaded runtime UNKNOWN' % err)
+    except (OSError, ValueError, RecursionError) as err:
+        report.update(code='read_failed', marker='installed files NOT compared: %s; Chrome loaded runtime UNKNOWN' % err)
+    return report
 
 
 def sha256_file(path):
@@ -304,8 +430,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--source', default=REPO_EXTENSION,
                         help='the repository copy of extension/ (default: the one beside this tool)')
-    parser.add_argument('--target', required=True,
-                        help='the unpacked install directory Chrome loads')
+    parser.add_argument('--target', default=None,
+                        help='the unpacked install directory Chrome loads; with --preflight, defaults to DSH_EXTENSION_INSTALL')
     parser.add_argument('--apply', action='store_true',
                         help='write the reviewed change set into the install directory (default: read-only)')
     parser.add_argument('--sync-manifest', action='store_true',
@@ -313,6 +439,9 @@ def main(argv=None):
     parser.add_argument('--backup-dir', default=None,
                         help='where the rollback copy goes (default: <target>.backup-<utc> beside it)')
     parser.add_argument('--json', action='store_true', help='machine-readable output')
+    parser.add_argument('--preflight', action='store_true',
+                        help='one status line for the loaded extension, using DSH_EXTENSION_INSTALL; '
+                             'exit 0 in sync, 1 drift, 2 not compared')
     args = parser.parse_args(argv)
 
     # A path may contain characters the console codepage cannot draw (a CJK install directory on a
@@ -324,6 +453,28 @@ def main(argv=None):
         except (ValueError, OSError):
             pass
 
+    if args.preflight:
+        if args.apply or args.sync_manifest or args.backup_dir:
+            parser.error('--preflight is read-only; no apply/manifest/backup options')
+        verdict = preflight(args.source, args.target)
+        if args.json:
+            json.dump(verdict, sys.stdout, indent=2, sort_keys=True)
+            sys.stdout.write('\n')
+        else:
+            emit(sys.stdout, 'install  %s: %s\n'
+                 % (verdict['state'].upper(), verdict['marker']))
+            if verdict.get('target'):
+                emit(sys.stdout, 'target   %s\n' % verdict['target'])
+            if verdict['state'] == 'drift':
+                emit(sys.stdout, 'files    %d differ: %s\n'
+                     % (verdict['differing_count'], ', '.join(verdict['differing'])))
+                emit(sys.stdout, 'stamp    source %s  install %s\n'
+                     % (verdict.get('source_stamp'), verdict.get('install_stamp')))
+        return {'in_sync': 0, 'drift': 1}.get(verdict['state'], 2)
+
+    if not args.target:
+        print('--target is required for check/apply; environment config is used only with --preflight')
+        return 2
     source = os.path.abspath(args.source)
     target = os.path.abspath(args.target)
     for label, path in (('source', source), ('target', target)):

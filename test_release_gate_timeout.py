@@ -59,8 +59,11 @@ class Tree(unittest.TestCase):
 
     def gate(self, *extra, timeout=180):
         started = time.time()
+        env = dict(os.environ)
+        env.pop('DSH_EXTENSION_INSTALL', None)
+        env.pop('T218_INSTALLED_EXT', None)
         done = subprocess.run([sys.executable, '-B', GATE, '--root', self.root,
-                               '--skip-worktree'] + list(extra),
+                               '--skip-worktree'] + list(extra), env=env,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               timeout=timeout)
         return (done.returncode, done.stdout.decode('utf-8', 'replace'),

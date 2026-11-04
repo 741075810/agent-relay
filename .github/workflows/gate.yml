@@ -123,6 +123,8 @@ jobs:
           test_t095b95_tree_kill_edges
           test_t095b96_upgrade_drill
           test_t095b97_host_process_drill
+          test_t095b240_extension_deploy_sync
+          test_t095b241_install_preflight
 
       - name: hygiene, verbose
         if: always()

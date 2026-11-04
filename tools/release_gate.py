@@ -6,9 +6,9 @@ a number someone has to copy correctly. T095B77 found three real identifiers in 
 published tree while the prose gate printed nothing, so the mechanism is the problem,
 not the list.
 
-This runs every check in that list and prints one verdict. It writes nothing outside a
-temporary directory, opens no network connection, and never touches the running
-extension, the native host registration or the host queue.
+This runs every check in that list and prints one code-publishability verdict. Its optional
+install preflight reads only an explicitly configured unpacked directory. It never writes
+that extension, queries Chrome's private profile, or changes host registration/queues.
 
 Usage
 -----
@@ -108,6 +108,10 @@ def child_env():
     env = dict(os.environ)
     env['PYTHON'] = sys.executable
     env.pop('PYTHONDONTWRITEBYTECODE', None)
+    # Install preflight is the only live-file reader. Never leak its opt-in into
+    # hermetic suites or clean clones (including T218's legacy live-tree tests).
+    env.pop('DSH_EXTENSION_INSTALL', None)
+    env.pop('T218_INSTALLED_EXT', None)
     return env
 
 
@@ -449,9 +453,63 @@ def extension_stamp(root):
     return {'name': 'stamp', 'ok': detail['ok'], 'detail': detail}
 
 
-def gate(root, clean_clone=False):
+def extension_install(root, require=False):
+    """Opt-in read-only disk preflight, separate from code publishability and Chrome runtime."""
+    configured_by, target = next(((key, os.environ[key].strip())
+                                 for key in ('DSH_EXTENSION_INSTALL', 'T218_INSTALLED_EXT')
+                                 if os.environ.get(key, '').strip()), (None, None))
+    tool = os.path.join(root, 'tools', 'extension_deploy_sync.py')
+    if not os.path.exists(tool):
+        detail = {'state': 'unchecked', 'checked': False, 'code': 'missing_tool',
+                  'marker': 'installed files NOT compared: no deploy tool in this repository',
+                  'loaded_runtime': 'unknown'}
+    else:
+        command = [sys.executable, '-B', tool, '--preflight', '--json',
+                   '--source', os.path.join(root, 'extension')]
+        if target:
+            command += ['--target', target]
+        proc = run(command, root)
+        try:
+            detail = json.loads(proc.get('output') or '')
+            expected = {'in_sync': 0, 'drift': 1, 'unchecked': 2}
+            if (not isinstance(detail, dict) or detail.get('state') not in expected
+                    or proc.get('timeout') or proc.get('returncode') != expected[detail['state']]
+                    or detail.get('checked') != (detail['state'] in ('in_sync', 'drift'))
+                    or not isinstance(detail.get('code'), str)
+                    or not isinstance(detail.get('marker'), str)
+                    or detail.get('loaded_runtime') != 'unknown'
+                    or (detail['state'] != 'unchecked' and
+                        not isinstance(detail.get('differing_count'), int))):
+                raise ValueError('preflight state/exit mismatch')
+        except (ValueError, TypeError):
+            detail = {'state': 'unchecked', 'checked': False, 'code': 'preflight_failed',
+                      'marker': 'installed files NOT compared: preflight failed or returned invalid output',
+                      'loaded_runtime': 'unknown'}
+    detail['checked'] = detail.get('state') in ('in_sync', 'drift')
+    detail['configured_by'] = configured_by
+    # Clean extension bytes are HEAD; an uncommitted standalone check is only working-tree evidence.
+    head = run(['git', 'rev-parse', 'HEAD'], root)
+    status = run(['git', 'status', '--porcelain', '--untracked-files=all', '--ignored', '--', 'extension'], root)
+    detail['source_head'] = head['output'].strip() if head['returncode'] == 0 else None
+    detail['source_matches_head'] = (bool(detail['source_head']) and status['returncode'] == 0
+                                     and not status['output'].strip())
+    detail['source_reference'] = 'HEAD' if detail['source_matches_head'] else 'working_tree'
+    state = detail['state']
+    if state == 'in_sync':
+        mark, ok = 'PASS', True
+    elif state == 'drift':
+        mark, ok = ('FAIL', False) if require else ('WARN', True)
+    elif not require and not target and detail['code'] in ('missing_config', 'missing_tool'):
+        mark, ok = 'SKIP', True
+    else:
+        mark, ok = 'FAIL', False
+    return {'name': 'install', 'ok': ok, 'mark': mark, 'detail': detail,
+            'required': require, 'drift': state == 'drift'}
+
+
+def gate(root, clean_clone=False, require_install=False):
     parts = [worktree_state(root), dependencies(root), hygiene(root), extension_stamp(root),
-             python_suite(root), js_suites(root)]
+             extension_install(root, require_install), python_suite(root), js_suites(root)]
     result = {
         'root': root,
         'ok': all(part['ok'] for part in parts),
@@ -517,6 +575,16 @@ def summarise(result):
         elif part['name'] == 'dependencies':
             extra = ('ok' if part['ok']
                      else '; '.join(part.get('problems') or ['missing']))
+        elif part['name'] == 'install':
+            detail = part.get('detail') or {}
+            mark = part['mark']
+            extra = detail.get('marker') or 'installed files NOT compared'
+            if detail.get('checked'):
+                extra += ' -- %s, %d differing file(s)' % (detail['source_reference'], detail['differing_count'])
+            if detail.get('target'):
+                extra += '\n         target: ' + detail['target']
+            if detail.get('source_head'):
+                extra += '\n         source HEAD: ' + detail['source_head']
         elif part['name'] == 'stamp':
             detail = part.get('detail') or {}
             extra = (detail.get('skipped') or '%s (%s files)'
@@ -541,6 +609,9 @@ def summarise(result):
         for problem in clone.get('problems') or []:
             print('         ' + problem)
     print('')
+    if any(part['name'] == 'install' for part in result['parts']):
+        print('note: gate/CI green is code publishability, NOT a browser upgrade; '
+              'Chrome loaded runtime remains UNKNOWN even when installed files match.')
     print('VERDICT: %s' % ('may be pushed' if result['ok'] else 'DO NOT PUSH'))
     return 0 if result['ok'] else 1
 
@@ -619,6 +690,8 @@ def headline(part):
         detail = part.get('detail') or {}
         return '%s: %s unexplained, %s stale' % (name, detail.get('unexplained'),
                                                  detail.get('stale'))
+    if name == 'install':
+        return 'install: ' + (part.get('detail') or {}).get('code', 'unchecked')
     if name == 'dependencies':
         return name + ': ' + ', '.join(part.get('problems') or ['ok'])
     return name
@@ -626,6 +699,10 @@ def headline(part):
 
 def detail_lines(part, limit=8):
     """The few lines of a part's output that explain the failure, most telling first."""
+    if part.get('name') == 'install':
+        detail = part.get('detail') or {}
+        return ['installed files: %s; Chrome loaded runtime UNKNOWN'
+                % detail.get('code', 'unchecked')][:limit]
     if part.get('problem'):
         return [scrub(str(part['problem']))][:limit]
     text = text_of(part)
@@ -657,6 +734,16 @@ def github_report(result):
     part of the public check-run record, so a failure that explains itself here can be
     read with an unauthenticated API call. That is how the first red run was diagnosed.
     """
+    for part in result['parts']:
+        if part['name'] != 'install':
+            continue
+        detail = part.get('detail') or {}
+        # Do not publish a configured private path, even in a malformed-directory error.
+        message = ('source updated, installed outdated; needs explicit sync + human Chrome Reload'
+                   if detail.get('state') == 'drift' else
+                   'installed files %s; Chrome loaded runtime UNKNOWN' % detail.get('code', 'unchecked'))
+        level = 'warning' if part.get('mark') == 'WARN' else 'notice'
+        print('::%s title=gate install::%s' % (level, github_escape(message)))
     emitted = 0
     for part in result['parts']:
         if part['ok']:
@@ -719,6 +806,9 @@ def main(argv=None):
                         help='emit ::error::/::notice:: workflow commands so the reason '
                              'survives in the check-run annotations, which unlike job '
                              'logs need no token to read')
+    parser.add_argument('--require-install', action='store_true',
+                        help='require a configured, readable install directory matching source bytes '
+                             '(default: drift is WARN, because a lagging local install is not a code defect)')
     parser.add_argument('--skip-worktree', action='store_true',
                         help='run the checks but do not require a clean worktree; use '
                              'before committing, not before pushing')
@@ -730,10 +820,14 @@ def main(argv=None):
                              % STEP_TIMEOUT)
     args = parser.parse_args(argv)
 
+    reconfigure = getattr(sys.stdout, 'reconfigure', None)
+    if reconfigure is not None:
+        reconfigure(errors='backslashreplace')
+
     if args.step_timeout:
         STEP_TIMEOUT = args.step_timeout
     root = os.path.abspath(args.root)
-    result = gate(root, clean_clone=args.clean_clone)
+    result = gate(root, clean_clone=args.clean_clone, require_install=args.require_install)
     if args.skip_worktree:
         for part in result['parts']:
             if part['name'] == 'worktree':
@@ -745,7 +839,7 @@ def main(argv=None):
         slim = {'ok': result['ok'], 'clean_clone': result['clean_clone'],
                 'parts': [{'name': p['name'], 'ok': p['ok'],
                            **{k: p[k] for k in ('tests', 'skips', 'count',
-                                                'assertions', 'failed')
+                                                'assertions', 'failed', 'mark', 'detail', 'required', 'drift')
                               if k in p}} for p in result['parts']]}
         print(json.dumps(slim, indent=2))
         return 0 if result['ok'] else 1

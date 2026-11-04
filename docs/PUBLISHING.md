@@ -12,12 +12,15 @@ context you have.
 python -B tools/release_gate.py --clean-clone
 ```
 
-Four checks, one verdict:
+Checks, one code-publishability verdict (not a browser-upgrade verdict):
 
 | check | what it answers |
 |---|---|
 | `worktree` | is there anything uncommitted that would be pushed by accident |
+| `dependencies` | are the required Python/Node dependencies present |
 | `hygiene` | does the tree hold an identifier, path or key that must not be published |
+| `stamp` | does the source tree's declared extension stamp describe its own files |
+| `install` | configured unpacked install files vs source: `PASS`, `WARN` drift or explicitly `SKIP`/unchecked; Chrome loaded runtime stays UNKNOWN |
 | `python suite` | `unittest discover` — the AGENTS.md contract, with its skip count |
 | `js suites` | every `test_*.mjs`, each in its own node process |
 | `clean clone` | run it again in a checkout of `HEAD`, because a working tree carries things a push does not |
@@ -27,8 +30,17 @@ for the wrong reason: T069's precision suite resolved its files through an absol
 into the working copy, so it verified the live tree rather than the tree under test and
 would have failed on any other machine.
 
-Exit code 0 means may be pushed. Anything else prints which check disagreed and the last
-few lines of its output.
+Exit code 0 means source may be pushed, **not** that Chrome has upgraded. Anything else
+prints which check disagreed and the last few lines of its output.
+
+The `install` stage is read-only and opt-in via `DSH_EXTENSION_INSTALL` (legacy
+`T218_INSTALLED_EXT` also accepted). No configuration is explicit `SKIP / UNCHECKED`, not
+agreement. Drift reports `source updated, installed outdated; needs explicit sync + human
+Chrome Reload` as `WARN` by default; `--require-install` fails unless configured install
+files match. A configured invalid/unreadable directory fails even without that flag.
+Quote this row in the development handoff; disk equality never proves Chrome Reload.
+See [Extension deployment preflight](EXTENSION_DEPLOY.md) for configuration, CI behavior,
+strict-byte comparison, manual maintenance and rollback. No background copy or Reload runs.
 
 ## The hygiene scan
 
