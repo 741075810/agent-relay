@@ -204,7 +204,8 @@ def diagnose(state, now_ms=None, stale_ms=DEFAULT_STALE_MINUTES * 60 * 1000):
               'stages': {},
               'findings': [],
               'limitations': ['extension_store_not_read',
-                              'bridge_ledger_not_read']}
+                              'bridge_ledger_not_read',
+                              'relay_page_delivery_not_read']}
 
     def note(code, detail, severity='blocker'):
         """`blocker` means the chain broke; `expected` means silence is correct here;
@@ -258,6 +259,30 @@ def diagnose(state, now_ms=None, stale_ms=DEFAULT_STALE_MINUTES * 60 * 1000):
         'pending': len(pending), 'acked': len(acked),
         'baseline_ids': len(id_set(source, 'baselineIds')),
         'baseline_count': baseline_count, 'baseline_dropped': baseline_dropped}
+
+    # T231: the relay is a second transport of the same ledger, so it must be reported as a *mirror* and never as a
+    # second source. What the artifacts can prove is narrower than it looks: `relayOfferedIds` says a run was offered on
+    # that channel, and nothing on disk says whether a page showed it -- that is the extension store, which is not read.
+    # Without the source artifact the relay fields are absent, and absent is *unknown*, not "never activated". Writing
+    # `activated: false` there would assert something no file said -- the same mistake as calling a relay offer a
+    # delivery, one step earlier.
+    relay_known = source_code is None
+    relay_activated_at, relay_unit = to_ms((source or {}).get('relayActivatedAt'))
+    relay_offered = id_set(source, 'relayOfferedIds')
+    relay_deferred = id_set(source, 'relayDeferredIds')
+    relay_baseline = id_set(source, 'relayBaselineIds')
+    report['stages']['relay'] = {
+        'known': relay_known,
+        'activated': (relay_activated_at is not None) if relay_known else None,
+        'activated_at': beijing(relay_activated_at), 'unit_read': relay_unit,
+        'activation': (source or {}).get('relayActivation')
+        if isinstance((source or {}).get('relayActivation'), str) else None,
+        'offered': len(relay_offered) if relay_known else None,
+        'deferred': len(relay_deferred) if relay_known else None,
+        'baseline_ids': len(relay_baseline) if relay_known else None,
+        # Constant, and written down rather than inferred: this is the reason a relay offer is not independent
+        # evidence of completion, and the reason "relay only" can never be reported as delivered.
+        'mirrors': 'bridge_service_task_events'}
 
     armed = id_set(arm, 'ids')
     taken_ms, taken_unit = to_ms((arm or {}).get('takenAt'))
@@ -359,6 +384,14 @@ def diagnose(state, now_ms=None, stale_ms=DEFAULT_STALE_MINUTES * 60 * 1000):
         # pending turn that arrived after the snapshot has no reason to be there yet.
         note('armed_but_not_enqueued', '%d armed turn(s) produced no queue event: the '
                                        'fire happened without an enqueue' % len(missed))
+    # Deliberately not a finding: "the relay was never activated" is a state the [relay] stage already states, and
+    # emitting it as `expected` pushed the more useful headline (`consumer_polled`) behind `expected_silence`, which
+    # two of the existing doctor tests caught. A finding is for something a reader has to act on or rule out.
+    if relay_offered:
+        note('relay_candidate_offered',
+             '%d run(s) were offered on the relay channel; whether a page showed one needs the extension '
+             'journal, which this tool does not read, so it is neither a delivery nor a failure' % len(relay_offered),
+             'unknown')
     if claimed:
         note('delivery_claimed_without_timestamp',
              '%d event(s) are marked delivered with no timestamp on either side: not a '
@@ -400,6 +433,20 @@ def diagnose(state, now_ms=None, stale_ms=DEFAULT_STALE_MINUTES * 60 * 1000):
         report['primary'] = 'consumer_polled'
     else:
         report['primary'] = 'no_reason_found'
+    # T231: one row per layer, and the last row is the only one about a page. `pages` is a constant so a reader cannot
+    # mistake the relay mirror for independent evidence: the relay reads the same Bridge table the native path reads.
+    report['attribution'] = {
+        'upstream_completion': 'read' if origin_ids else 'not_read',
+        'native_consume': ('acked' if acked else 'pending' if pending else 'nothing_pending'),
+        'relay_mirror': ('unknown' if not relay_known else
+                         'offered' if relay_offered else
+                         'idle' if relay_activated_at is not None else 'never_activated'),
+        'ack': ('current_events_acknowledged' if acknowledged else 'no_current_ack'),
+        'page_visible': 'unknown',
+        'undeterminable': ['page_visible', 'relay_only_delivery'],
+        'pages_read_by': 'extension_store_not_read',
+        'relay_is': 'second_transport_of_the_same_bridge_ledger',
+    }
     report['chain_intact'] = not blockers
     return report
 
@@ -446,7 +493,7 @@ def stats_only(report):
 def render(report):
     print('state : %s' % report['state'])
     print('now   : %s (Beijing)' % report['now'])
-    for name in ('origin', 'source', 'arm', 'queue'):
+    for name in ('origin', 'source', 'relay', 'arm', 'queue'):
         stage = report['stages'].get(name)
         if stage is None:
             continue
@@ -461,6 +508,15 @@ def render(report):
     for finding in report['findings']:
         print('  %-9s %-24s %s' % (finding['severity'], finding['code'],
                                    finding['detail']))
+    print('')
+    attribution = report.get('attribution') or {}
+    if attribution:
+        print('')
+        print('attribution:')
+        for key in ('upstream_completion', 'native_consume', 'relay_mirror', 'ack',
+                    'page_visible'):
+            print('  %-20s %s' % (key, attribution.get(key)))
+        print('  %-20s %s' % ('undeterminable', ', '.join(attribution.get('undeterminable') or [])))
     print('')
     print('not visible to this tool: %s' % ', '.join(report['limitations']))
     print('delivery      : %s' % report.get('delivery'))
