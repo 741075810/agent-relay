@@ -133,6 +133,18 @@
     <ul id="received"><li class="ok">尚无</li></ul>
   </section>
 
+  <section class="module" id="sec-t233">
+    <h2 class="mod-title"><span class="mod-no">T233</span>交付诊断导出（只读）</h2>
+    <div class="mod-note">点一次按钮，从本机存储生成一份 JSON，
+      供 <code>notify_doctor.py --state</code> 读取。字段白名单、最多 20 条、
+      32 KB 上限；不含消息正文、页面地址、会话 id 或任何
+      凭据。本导出只证明“页面接受了消息”，页面是否
+      被人看到始终是 unknown，且不会被上传。</div>
+    <button id="diagExport">导出交付诊断 JSON</button>
+    <div id="diagExportResult">尚未导出。</div>
+    <textarea id="diagExportText" rows="8" spellcheck="false" hidden></textarea>
+  </section>
+
   <section class="module" id="sec-t053">
     <h2 class="mod-title"><span class="mod-no">T053</span>ChatGPT 目标对话（只读绑定）</h2>
     <div class="mod-note">绑定仅记录人工选择的页面，不验证账号；不读正文、不发送、不自动切换目标。</div>
@@ -289,9 +301,11 @@
   <script src="lib/build_stamp.js"></script>
 <script src="lib/queue_error_view.js"></script>
 <script src="lib/single_shot_view.js"></script>\n    <script src="lib/readiness_queue_view.js"></script>
-    <script src="lib/diagnostic_view.js"></script>
+    <script src="lib/diagnostic_export.js"></script>
+  <script src="lib/diagnostic_view.js"></script>
     <script src="lib/run_history_view.js"></script>
     <script src="lib/notice_runtime_view.js"></script>
+<script src="diag_export.js"></script>
 <script src="popup.js"></script>
 </body>
 </html>
