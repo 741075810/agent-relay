@@ -187,6 +187,52 @@ def load(state, name):
     return document, None
 
 
+# T232: the extension already records a structured, three-class delivery outcome (`submitted` -- the click landed and
+# exactly one exact-template message appeared; `unconfirmed` -- clicked, page never proved it; `refused` -- nothing was
+# written) in `chrome.storage.local`, together with its reason code and receipt facts. That is the only layer between
+# "the host acknowledged an event" and "a person saw a message", and no tool can read Chrome storage. So this reads an
+# operator-provided copy if one exists, and otherwise says it does not know.
+DIAGNOSTIC_FILE = 'delivery-diagnostic.json'
+SUBMIT_STATES = ('submitted', 'unconfirmed', 'refused')
+
+
+def diagnostic_records(document, code=None):
+    """(records, code). Accepts one record or a list wrapped in `records`/`history`.
+
+    `code` is what `load()` already decided. Passing it through matters: a file that exists but cannot be parsed is
+    `artifact_unreadable`, and collapsing every absence into `artifact_absent` would tell the operator to export
+    something they already exported.
+    """
+    if document is None:
+        return [], code or 'artifact_absent'
+    if not isinstance(document, dict):
+        return [], 'schema_unexpected'
+    candidates = []
+    for key in ('records', 'history'):
+        values = document.get(key)
+        if isinstance(values, list):
+            candidates = values
+            break
+    else:
+        candidates = [document]
+    records = []
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        fields = item.get('fields') if isinstance(item.get('fields'), dict) else {}
+        status = fields.get('status') if isinstance(fields.get('status'), str) else None
+        records.append({
+            'runId': item.get('runId') if isinstance(item.get('runId'), str) else None,
+            'status': status if status in SUBMIT_STATES else None,
+            'appeared': fields.get('appeared'),
+            'exact': fields.get('exactTemplateMatched'),
+            'clicked': fields.get('clickPerformed'),
+            'delivered': item.get('delivered') is True,
+            'why': item.get('deliveredWhy') if isinstance(item.get('deliveredWhy'), str) else None,
+        })
+    return records, None
+
+
 def id_set(document, key):
     if not isinstance(document, dict):
         return set()
@@ -231,6 +277,7 @@ def diagnose(state, now_ms=None, stale_ms=DEFAULT_STALE_MINUTES * 60 * 1000):
     source, source_code = load(state, 'terminal-source.json')
     arm, arm_code = load(state, 'terminal-arm.json')
     queue, queue_code = load(state, 'queue.json')
+    diagnostic, diagnostic_code = load(state, DIAGNOSTIC_FILE)
 
     for name, code in (('terminal-origin', origin_code), ('terminal-source', source_code),
                        ('terminal-arm', arm_code), ('queue', queue_code)):
@@ -283,6 +330,23 @@ def diagnose(state, now_ms=None, stale_ms=DEFAULT_STALE_MINUTES * 60 * 1000):
         # Constant, and written down rather than inferred: this is the reason a relay offer is not independent
         # evidence of completion, and the reason "relay only" can never be reported as delivered.
         'mirrors': 'bridge_service_task_events'}
+
+    records, records_code = diagnostic_records(diagnostic, diagnostic_code)
+    counts = {'submitted': 0, 'unconfirmed': 0, 'refused': 0, 'status_unknown': 0}
+    inconsistent = 0
+    for record in records:
+        counts[record['status'] or 'status_unknown'] += 1
+        # A record that says `delivered: true` while its own receipt facts are incomplete is not evidence of
+        # anything. Re-checking the claim here is the whole reason this file is parsed rather than trusted.
+        if record['delivered'] and not (record['appeared'] is True and record['exact'] is True):
+            inconsistent += 1
+    report['stages']['diagnostic'] = {
+        'exported': records_code is None,
+        'records': len(records),
+        'submitted': counts['submitted'], 'unconfirmed': counts['unconfirmed'],
+        'refused': counts['refused'], 'status_unknown': counts['status_unknown'],
+        'delivered_flagged': sum(1 for r in records if r['delivered']),
+        'inconsistent': inconsistent}
 
     armed = id_set(arm, 'ids')
     taken_ms, taken_unit = to_ms((arm or {}).get('takenAt'))
@@ -392,6 +456,16 @@ def diagnose(state, now_ms=None, stale_ms=DEFAULT_STALE_MINUTES * 60 * 1000):
              '%d run(s) were offered on the relay channel; whether a page showed one needs the extension '
              'journal, which this tool does not read, so it is neither a delivery nor a failure' % len(relay_offered),
              'unknown')
+    # The absence of an export is a statement about this tool's reach, not a finding about the chain -- the same
+    # category as `extension_store_not_read`, and it belongs in `limitations`. Emitting it as a finding put it ahead of
+    # the real headline (`consumer_polled`) in four existing tests, which is the second time a "cannot read" note has
+    # collided with precedence. A readable-but-broken export *is* a finding.
+    if records_code and records_code != 'artifact_absent':
+        note(records_code, '%s' % DIAGNOSTIC_FILE)
+    if inconsistent:
+        note('diagnostic_self_inconsistent',
+             '%d record(s) claim delivery while their own receipt facts are incomplete: the claim is discarded, '
+             'the facts are kept' % inconsistent, 'unknown')
     if claimed:
         note('delivery_claimed_without_timestamp',
              '%d event(s) are marked delivered with no timestamp on either side: not a '
@@ -442,11 +516,21 @@ def diagnose(state, now_ms=None, stale_ms=DEFAULT_STALE_MINUTES * 60 * 1000):
                          'offered' if relay_offered else
                          'idle' if relay_activated_at is not None else 'never_activated'),
         'ack': ('current_events_acknowledged' if acknowledged else 'no_current_ack'),
+        'submit_confirmed': ('unknown' if records_code else
+                             'submitted' if counts['submitted'] and not
+                             (counts['unconfirmed'] or counts['refused'] or counts['status_unknown']) else
+                             'unconfirmed' if counts['unconfirmed'] and not
+                             (counts['submitted'] or counts['refused'] or counts['status_unknown']) else
+                             'refused' if counts['refused'] and not
+                             (counts['submitted'] or counts['unconfirmed'] or counts['status_unknown']) else
+                             'mixed' if records else 'none'),
         'page_visible': 'unknown',
         'undeterminable': ['page_visible', 'relay_only_delivery'],
         'pages_read_by': 'extension_store_not_read',
         'relay_is': 'second_transport_of_the_same_bridge_ledger',
     }
+    if records_code == 'artifact_absent':
+        report['limitations'].append('delivery_diagnostic_not_exported')
     report['chain_intact'] = not blockers
     return report
 
@@ -514,7 +598,7 @@ def render(report):
         print('')
         print('attribution:')
         for key in ('upstream_completion', 'native_consume', 'relay_mirror', 'ack',
-                    'page_visible'):
+                    'submit_confirmed', 'page_visible'):
             print('  %-20s %s' % (key, attribution.get(key)))
         print('  %-20s %s' % ('undeterminable', ', '.join(attribution.get('undeterminable') or [])))
     print('')
