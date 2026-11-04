@@ -137,9 +137,10 @@ class PassiveObservation(unittest.TestCase):
         out=self.root/'out'; cfg=self.root/'config.json'; cfg.write_text(json.dumps(self.config))
         before=hashlib.sha256(self.db.read_bytes()).hexdigest()
         self.assertEqual(L.main(['--config',str(cfg),'--out',str(out),'--seconds','2','--interval','1']),0)
-        self.assertTrue((out/'T0.json').is_file()); self.assertTrue((out/'exit-witness.json').is_file())
-        cycles=[json.loads(p.read_text()) for p in out.glob('cycles-*/*.json')]
-        self.assertTrue(cycles[-1]['final_sample'])
+        self.assertTrue((out/'T0.json').is_file(),'T0 snapshot absent')
+        self.assertTrue((out/'exit-witness.json').is_file(),'exit witness absent')
+        cycles=sorted((json.loads(p.read_text()) for p in out.glob('cycles-*/*.json')),key=lambda row:row['seq'])
+        self.assertTrue(cycles[-1]['final_sample'],'highest sequence is not final sample')
         self.assertEqual(before,hashlib.sha256(self.db.read_bytes()).hexdigest())
         self.assertNotIn('PRIVATE_BODY',''.join(p.read_text() for p in out.rglob('*.json')))
     def test_sources_no_network_host_or_page_api(self):
