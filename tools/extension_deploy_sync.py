@@ -87,6 +87,8 @@ def _preflight_snapshot(root):
     result = {}
 
     def visit(directory):
+        if looks_like_profile(directory):
+            raise PreflightError('profile_path', 'nested Chrome profile directory')
         with os.scandir(directory) as scan:
             entries = sorted(scan, key=lambda item: item.name)
         for entry in entries:
@@ -135,15 +137,19 @@ def preflight(source=None, target=None, environ=None):
             common = None
         if common in (src, dst):
             raise PreflightError('overlapping_directories', 'source/install directories overlap')
-        source_files = _preflight_snapshot(source)
-        target_files = _preflight_snapshot(target)
-        for label, root, files in (('source', source, source_files), ('install', target, target_files)):
-            if 'manifest.json' not in files:
+        for label, root in (('source', source), ('install', target)):
+            manifest_path = os.path.join(root, 'manifest.json')
+            if not os.path.lexists(manifest_path):
                 raise PreflightError('missing_manifest', '%s has no manifest.json' % label)
-            with open(os.path.join(root, 'manifest.json'), encoding='utf-8') as handle:
+            _ordinary_path(manifest_path)
+            if not os.path.isfile(manifest_path):
+                raise PreflightError('invalid_manifest', '%s manifest is not a regular file' % label)
+            with open(manifest_path, encoding='utf-8') as handle:
                 manifest = json.load(handle)
             if not isinstance(manifest, dict) or manifest.get('manifest_version') not in (2, 3):
                 raise PreflightError('invalid_manifest', '%s has an invalid extension manifest' % label)
+        source_files = _preflight_snapshot(source)
+        target_files = _preflight_snapshot(target)
         source_stamp, source_digest, _count = stamp_of(source)
         target_stamp, target_digest, _count = stamp_of(target)
         if (source_files != _preflight_snapshot(source)

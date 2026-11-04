@@ -129,6 +129,27 @@ class PreflightCase(unittest.TestCase):
                 report = deploy.preflight(str(self.source), str(target), {})
             self.assertEqual(report['code'], 'profile_path')
 
+    def test_nested_profile_is_rejected_before_hashing_its_contents(self):
+        sentinel = self.target / 'User Data' / 'Default' / 'sentinel'
+        write(str(sentinel), 'private fixture\n')
+        original_hash = deploy.sha256_file
+        def guarded_hash(path):
+            if os.path.abspath(path) == str(sentinel):
+                raise AssertionError('private profile contents read')
+            return original_hash(path)
+        with mock.patch.object(deploy, 'sha256_file', side_effect=guarded_hash):
+            report = self.report()
+        self.assertEqual((report['state'], report['code']), ('unchecked', 'profile_path'))
+        self.assertFalse(report['checked'])
+
+    def test_wrong_parent_without_root_manifest_is_rejected_before_traversal(self):
+        parent = Path(self.temp.name) / 'wrong browser parent'
+        write(str(parent / 'User Data' / 'Default' / 'sentinel'), 'private fixture\n')
+        with mock.patch.object(deploy, '_preflight_snapshot', side_effect=AssertionError('parent traversed')):
+            report = deploy.preflight(str(self.source), str(parent), {})
+        self.assertEqual(report['code'], 'missing_manifest')
+        self.assertFalse(report['checked'])
+
     def test_same_directory_and_nested_directory_are_unchecked(self):
         for target in (self.source, self.source / 'child'):
             target.mkdir(exist_ok=True)
@@ -174,6 +195,7 @@ class PreflightCase(unittest.TestCase):
     def test_malformed_manifest_and_scan_errors_remain_unchecked(self):
         write(str(self.target / 'manifest.json'), '[]')
         self.assertEqual(self.report()['code'], 'invalid_manifest')
+        make_extension(str(self.target))
         with mock.patch.object(os, 'scandir', side_effect=PermissionError('denied')):
             report = self.report()
         self.assertEqual((report['state'], report['code']), ('unchecked', 'read_failed'))
