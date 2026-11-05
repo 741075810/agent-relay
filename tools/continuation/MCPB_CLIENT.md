@@ -81,8 +81,12 @@ session. The inspected public `list_tasks` contract has no exact request-ID look
 Git preflight copies only named OS/runtime environment fields; it never enumerates or forwards
 internal credential variables. It sets `GIT_TERMINAL_PROMPT=0`, `GIT_OPTIONAL_LOCKS=0`, and uses
 `--no-optional-locks`, `core.fsmonitor=false`, and `core.untrackedCache=false`.
-Git status includes tracked/staged/untracked changes. Canonical paths are compared with platform
-path semantics, so a Windows drive-letter case alias is the same physical repository root.
+Git status includes tracked/staged/untracked changes. Paths use native OS canonicalization;
+repository-root equality requires directory device/inode identities (BigInt, nonzero inode).
+Unavailable identity fails closed; a different directory remains rejected. A changed canonical
+binding rejects an existing journal without reset or migration. Existing state-path symlinks are
+checked before resolving targets; an absent state path's existing parent is canonicalized before
+creation so a parent alias into the repository is rejected.
 It is checked before networking and again
 immediately before the write-ahead submit reservation; dirty/unreadable workspaces send no task.
 No reset, clean, checkout, stash, auto-commit, or file discard occurs. Read-only owned-task queries

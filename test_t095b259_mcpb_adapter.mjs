@@ -148,6 +148,18 @@ await test('Windows drive-letter alias is the same repository root', { skip: pro
   assert.equal(result.ok, true);
 });
 
+await test('matched grant on repository child is rejected before networking', async (t) => {
+  const f = await fixture(t), child = path.join(f.root, 'child'); mkdirSync(child);
+  const result = await f.client({ workspaceRoot: child, grant: { ...f.options.grant, workspaceRoot: child } }).submitTask(INPUT);
+  assert.equal(result.code, 'workspace_not_repository_root'); assert.equal(f.requests.length, 0); assert.equal(existsSync(f.state), false);
+});
+await test('junction parent into repo is refused before creating state directory', async (t) => {
+  const f = await fixture(t), link = path.join(path.dirname(f.root), 'parent-alias');
+  try { symlinkSync(f.root, link, 'junction'); } catch { t.skip('directory symlink unavailable'); return; }
+  const result = await f.client({ stateDir: path.join(link, 'hidden-journal') }).submitTask(INPUT);
+  assert.equal(result.code, 'journal_inside_workspace'); assert.equal(f.requests.length, 0); assert.equal(existsSync(path.join(f.root, 'hidden-journal')), false);
+});
+
 await test('real JSON POST framing, fixed binding, write-ahead, durable idempotence and total three', async (t) => {
   const f = await fixture(t);
   const result = await f.client().submitTask(INPUT);

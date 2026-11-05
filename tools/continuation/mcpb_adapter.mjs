@@ -8,6 +8,7 @@ import { createChannel, endpointFrom, toolObject } from './mcpb_http.mjs';
 
 export const LIMITS = Object.freeze({ maxTasks: 3, maxInFlight: 1, submitRetries: 0,
   readTimeoutMs: 10000, submitTimeoutMs: 15000 });
+const canonical = (value) => realpathSync.native(value);
 const TERMINAL = new Set(['completed', 'failed', 'interrupted', 'cancelled']);
 const STATES = new Set([...TERMINAL, 'received', 'queued', 'waiting_approval',
   'awaiting_local_approval', 'running', 'starting', 'waiting_user_input']);
@@ -41,7 +42,9 @@ function cleanWorkspace(root) {
       env: gitPreflightEnvironment(process.env) };
     const base = ['--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', '-C', root];
     const top = execFileSync('git', [...base, 'rev-parse', '--show-toplevel'], options).trim();
-    if (path.relative(root, realpathSync(top)) !== '') return 'workspace_not_repository_root';
+    const actual = lstatSync(canonical(root), { bigint: true }), reported = lstatSync(canonical(top), { bigint: true });
+    if (!actual.isDirectory() || !reported.isDirectory() || actual.ino <= 0n || reported.ino <= 0n) return 'workspace_unavailable';
+    if (actual.dev !== reported.dev || actual.ino !== reported.ino) return 'workspace_not_repository_root';
     const status = execFileSync('git', [...base, 'status', '--porcelain=v1', '--untracked-files=all'], options);
     return status.trim() ? 'dirty_workspace' : null;
   } catch { return 'workspace_unavailable'; }
@@ -120,9 +123,10 @@ export function createMcpbAdapter(options = {}) {
     const token = env.CODEX_BRIDGE_MCP_TOKEN;
     if (typeof token !== 'string' || !/^[\x21-\x7e]{16,4096}$/.test(token)) fail('credentials_missing');
     if (!path.isAbsolute(rootPath || '') || !path.isAbsolute(statePath || '')) fail('configuration_invalid');
-    const root = realpathSync(rootPath);
+    const root = canonical(rootPath);
     if (grant.workspaceRoot !== rootPath) fail('not_authorised');
-    if (!outside(root, path.resolve(statePath))) fail('journal_inside_workspace');
+    const stateCandidate = path.join(canonical(path.dirname(statePath)), path.basename(statePath));
+    if (!outside(root, stateCandidate)) fail('journal_inside_workspace');
     if ([projectId, installationId, sessionId, rootPath, statePath].some((value) => value.includes(token)))
       fail('configuration_invalid');
     return { endpoint, token, root,
@@ -140,7 +144,7 @@ export function createMcpbAdapter(options = {}) {
       const fresh = !existsSync(statePath);
       if (fresh) mkdirSync(statePath, { mode: 0o700 });
       if (lstatSync(statePath).isSymbolicLink() || !lstatSync(statePath).isDirectory()
-        || !outside(config.root, realpathSync(statePath))) fail('journal_inside_workspace');
+        || !outside(config.root, canonical(statePath))) fail('journal_inside_workspace');
       const lockPath = path.join(statePath, '.mcpb-lock');
       try { mkdirSync(lockPath, { mode: 0o700 }); lock = lockPath; } catch { fail('journal_busy'); }
       const file = path.join(statePath, 'mcpb-intents.json');
