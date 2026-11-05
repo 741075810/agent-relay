@@ -148,6 +148,20 @@ test('T155: task order and count are preserved exactly, with no implicit continu
     'a restart disarms the goal; the handoff says so rather than implying otherwise');
 });
 
+test('T251: the handoff forbids asking the operator for facts, while still stopping for authority', () => {
+  const out = N.buildGoalHandoff(PLAN, { sessionId: 's', now: 1793450000000 });
+  assert.match(out.objective, /never ask the operator to supply facts, identifiers or choices/i,
+    'a round must not block the operator for a run id, a path or a yes/no technical choice');
+  assert.match(out.objective, /record\s+UNKNOWN and carry on/i,
+    'the rule names what to do instead, so an unanswered question is not a silent stall');
+  assert.match(out.objective, /destructive action, a credential decision or an out-of-scope/i,
+    'a destructive, credential or out-of-scope step still stops for the operator');
+  assert.match(out.objective, /stop and report if a task needs a scope outside the/,
+    'the pre-existing scope stop is unchanged');
+  assert.equal(/autoApprove|submit_task|daemon|unattended|--yes/i.test(out.objective), false,
+    'the new rule adds no auto-approval, submit tool or daemon');
+});
+
 test('T155: a missing runtime manifest is unavailable, never an empty capability set', () => {
   const probe = N.probeRuntime({ manifestPath: MANIFEST, readFile: () => { throw new Error('ENOENT'); },
     profileBundles: [], toolNames: [] });

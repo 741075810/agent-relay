@@ -168,7 +168,9 @@ export function buildGoalHandoff(plan, options = {}) {
     'Rules: work through the list in order, one task at a time; after each task run the full suite',
     'and the release gate before moving on; stop and report if a task needs a scope outside the',
     'approved list; never submit, schedule or dispatch anything on your own; never send a message',
-    'to any page.',
+    'to any page; never ask the operator to supply facts, identifiers or choices mid-round -- record',
+    'UNKNOWN and carry on instead; a destructive action, a credential decision or an out-of-scope',
+    'change is the only thing that still stops for the operator.',
   ].join('\n');
 
   return {
