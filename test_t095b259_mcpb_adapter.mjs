@@ -1,5 +1,5 @@
 // T259: ONLY temporary Git repos, fictional credentials, and an in-process mock MCP server.
-import test from 'node:test';
+import runTest from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { execFileSync } from 'node:child_process';
@@ -9,6 +9,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { createMcpbAdapter, gitPreflightEnvironment } from './tools/continuation/mcpb_adapter.mjs';
 
+const test = (name, options, fn) => runTest(name,
+  { timeout: 120000, ...(typeof options === 'object' ? options : {}) }, typeof options === 'function' ? options : fn);
 const TOKEN = 'fixture-token-AAAAAAAAAAAAAAAA';
 const PROJECT = 'project-11111111-1111-4111-8111-111111111111';
 const SESSION = 'session-22222222-2222-4222-8222-222222222222';
@@ -29,7 +31,7 @@ async function fixture(t, mode = '', hook = null) {
   const temp = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'mcpb-fixture-')));
   const root = path.join(temp, 'repo'), state = path.join(temp, 'private-journal');
   mkdirSync(root);
-  const git = (...args) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  const git = (...args) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', timeout: 10000, env: gitPreflightEnvironment(process.env), stdio: ['ignore', 'pipe', 'pipe'] });
   git('init', '-q'); git('config', 'user.name', 'Fixture'); git('config', 'user.email', 'fixture@example.invalid');
   writeFileSync(path.join(root, 'source.txt'), 'baseline\n'); git('add', '.'); git('commit', '-qm', 'fixture');
   const f = { root, state, git, requests: [], now: 12345678, journal: () => JSON.parse(readFileSync(path.join(state, 'mcpb-intents.json'), 'utf8')) };
@@ -95,7 +97,7 @@ async function fixture(t, mode = '', hook = null) {
       workspaceRoot: root, approvedAt: 10000000, expiresAt: 20000000, maxTasks: 3 }, now: () => f.now,
     readTimeoutMs: 2000, submitTimeoutMs: mode === 'timeout' ? 100 : 2000 };
   f.client = (changes = {}) => createMcpbAdapter({ ...f.options, ...changes });
-  t.after(async () => { server.closeAllConnections(); await new Promise((resolve) => server.close(resolve)); rmSync(temp, { recursive: true, force: true }); });
+  t.after(async () => { const closed = new Promise((resolve) => server.close(resolve)); server.closeAllConnections(); await closed; rmSync(temp, { recursive: true, force: true }); });
   return f;
 }
 
@@ -139,6 +141,12 @@ for (const url of ['http://example.invalid/mcp', 'http://localhost/mcp', 'http:/
     assert.equal((await f.client({ env: { ...f.options.env, CODEX_BRIDGE_MCP_URL: url } }).submitTask(INPUT)).code, 'configuration_invalid');
     assert.equal(f.requests.length, 0);
   });
+
+await test('Windows drive-letter alias is the same repository root', { skip: process.platform !== 'win32' }, async (t) => {
+  const f = await fixture(t), alias = f.root[0].toLowerCase() + f.root.slice(1);
+  const result = await f.client({ workspaceRoot: alias, grant: { ...f.options.grant, workspaceRoot: alias } }).submitTask(INPUT);
+  assert.equal(result.ok, true);
+});
 
 await test('real JSON POST framing, fixed binding, write-ahead, durable idempotence and total three', async (t) => {
   const f = await fixture(t);
@@ -269,10 +277,14 @@ await test('journal binding change refuses instead of resetting quota', async (t
 await test('directory lock stops second instance and never removes stale contents', async (t) => {
   let arrived, release; const received = new Promise((r) => { arrived = r; }); const gate = new Promise((r) => { release = r; });
   const f = await fixture(t, '', async (f, packet) => { if (packet.params?.name === 'submit_task') { arrived(); await gate; } return false; });
-  const first = f.client(), pending = first.submitTask(INPUT); await received;
-  assert.equal((await first.submitTask(INPUT)).code, 'busy');
-  assert.equal((await f.client().submitTask(INPUT)).code, 'journal_busy');
-  release(); assert.equal((await pending).ok, true);
+  const first = f.client(), pending = first.submitTask(INPUT); let timer;
+  try {
+    await Promise.race([received, pending.then((result) => { throw new Error('submit ended before mock: ' + result.code); }),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('mock submit packet timeout')), 30000); })]);
+    assert.equal((await first.submitTask(INPUT)).code, 'busy');
+    assert.equal((await f.client().submitTask(INPUT)).code, 'journal_busy');
+  } finally { clearTimeout(timer); release(); }
+  assert.equal((await pending).ok, true);
   mkdirSync(path.join(f.state, '.mcpb-lock')); writeFileSync(path.join(f.state, '.mcpb-lock', 'preserve.txt'), 'owner');
   assert.equal((await f.client().submitTask(INPUT)).code, 'journal_busy');
   assert.equal(readFileSync(path.join(f.state, '.mcpb-lock', 'preserve.txt'), 'utf8'), 'owner');

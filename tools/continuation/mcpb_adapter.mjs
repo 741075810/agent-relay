@@ -41,7 +41,7 @@ function cleanWorkspace(root) {
       env: gitPreflightEnvironment(process.env) };
     const base = ['--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', '-C', root];
     const top = execFileSync('git', [...base, 'rev-parse', '--show-toplevel'], options).trim();
-    if (realpathSync(top) !== root) return 'workspace_not_repository_root';
+    if (path.relative(root, realpathSync(top)) !== '') return 'workspace_not_repository_root';
     const status = execFileSync('git', [...base, 'status', '--porcelain=v1', '--untracked-files=all'], options);
     return status.trim() ? 'dirty_workspace' : null;
   } catch { return 'workspace_unavailable'; }

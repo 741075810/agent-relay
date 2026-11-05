@@ -81,7 +81,9 @@ session. The inspected public `list_tasks` contract has no exact request-ID look
 Git preflight copies only named OS/runtime environment fields; it never enumerates or forwards
 internal credential variables. It sets `GIT_TERMINAL_PROMPT=0`, `GIT_OPTIONAL_LOCKS=0`, and uses
 `--no-optional-locks`, `core.fsmonitor=false`, and `core.untrackedCache=false`.
-Git status includes tracked/staged/untracked changes. It is checked before networking and again
+Git status includes tracked/staged/untracked changes. Canonical paths are compared with platform
+path semantics, so a Windows drive-letter case alias is the same physical repository root.
+It is checked before networking and again
 immediately before the write-ahead submit reservation; dirty/unreadable workspaces send no task.
 No reset, clean, checkout, stash, auto-commit, or file discard occurs. Read-only owned-task queries
 remain possible while the model's worktree is dirty. The scan is a preflight, **not an atomic Git
@@ -96,8 +98,11 @@ node test_t095b259_mcpb_adapter.mjs
 ```
 
 The suite starts its own random-port loopback server, temporary Git repositories, and fictional
-credentials; it never inherits a real endpoint/token. Windows full gate and Ubuntu's explicit
-MCPB step execute it. Passing proves protocol packets and application guards against the mock,
+credentials; it never inherits a real endpoint/token. Windows and Ubuntu execute it explicitly;
+Windows full gate also includes it. Fixture Git commands, test deadlines, and waiting for the first
+mock packet are bounded; early submit failure is reported instead of waiting forever. Windows
+fail-fast annotations publish only synthetic-fixture assertion/timeout diagnostics, with no auth
+header or internal-token lookup. Passing proves protocol packets and application guards against the mock,
 **not live authorization, installed Bridge compatibility, actual model behavior, or production
 readiness**. No simulated production terminal event or notification is sent.
 
