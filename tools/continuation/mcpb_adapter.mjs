@@ -26,11 +26,12 @@ const outside = (parent, child) => {
 };
 
 export function gitPreflightEnvironment(source) {
-  const env = { ...source };
-  for (const key of Object.keys(env)) {
-    if (['CODEX_BRIDGE_MCP_URL', 'CODEX_BRIDGE_MCP_TOKEN', 'GIT_OPTIONAL_LOCKS'].includes(key.toUpperCase())) delete env[key];
+  const env = { GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0' };
+  // Read named OS/runtime fields only: never enumerate/copy internal credential variables.
+  for (const key of ['PATH', 'Path', 'SystemRoot', 'SYSTEMROOT', 'WINDIR', 'windir', 'COMSPEC',
+    'ComSpec', 'PATHEXT', 'HOME', 'USERPROFILE', 'TEMP', 'TMP', 'TMPDIR', 'LANG', 'LC_ALL', 'LC_CTYPE']) {
+    if (typeof source[key] === 'string') env[key] = source[key];
   }
-  env.GIT_OPTIONAL_LOCKS = '0';
   return env;
 }
 

@@ -78,7 +78,8 @@ terminal status. **This nested binding projection has not been verified against 
 Bridge.** Missing/different fields deliberately produce sticky UNKNOWN, not inference or a fresh
 session. The inspected public `list_tasks` contract has no exact request-ID lookup.
 
-Git preflight strips both MCP configuration variables from its subprocess environment and uses
+Git preflight copies only named OS/runtime environment fields; it never enumerates or forwards
+internal credential variables. It sets `GIT_TERMINAL_PROMPT=0`, `GIT_OPTIONAL_LOCKS=0`, and uses
 `--no-optional-locks`, `core.fsmonitor=false`, and `core.untrackedCache=false`.
 Git status includes tracked/staged/untracked changes. It is checked before networking and again
 immediately before the write-ahead submit reservation; dirty/unreadable workspaces send no task.

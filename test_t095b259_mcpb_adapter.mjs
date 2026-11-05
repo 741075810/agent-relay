@@ -99,10 +99,11 @@ async function fixture(t, mode = '', hook = null) {
   return f;
 }
 
-await test('Git child environment removes only explicit MCP credential inputs, including case variants', () => {
+await test('Git child environment reads system whitelist only, never internal credential getters', () => {
   const fake = { PATH: 'fixture-path', CODEX_BRIDGE_MCP_TOKEN: TOKEN, codex_bridge_mcp_token: TOKEN,
     CODEX_BRIDGE_MCP_URL: 'http://fixture.invalid/mcp', codex_bridge_mcp_url: 'fixture', GIT_OPTIONAL_LOCKS: '1' };
-  assert.deepEqual(gitPreflightEnvironment(fake), { PATH: 'fixture-path', GIT_OPTIONAL_LOCKS: '0' });
+  Object.defineProperty(fake, 'INTERNAL_TEST_TOKEN', { enumerable: true, get() { throw new Error('internal getter forbidden'); } });
+  assert.deepEqual(gitPreflightEnvironment(fake), { PATH: 'fixture-path', GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0' });
   assert.equal(fake.CODEX_BRIDGE_MCP_TOKEN, TOKEN);
 });
 
