@@ -58,11 +58,25 @@ jobs:
           $code = $LASTEXITCODE
           $lines | ForEach-Object { Write-Output $_ }
           if ($code -ne 0) {
-            $lines | Where-Object { [string]$_ -match 'not ok|error:|actual:|expected:|timeout|before mock|ERR_ASSERTION|code:|ok:|status:|^\s*[+-]' } |
-              Select-Object -First 40 | ForEach-Object {
-                $msg = ([string]$_).Replace('%','%25').Replace("`r",'%0D').Replace("`n",'%0A')
-                Write-Output "::error title=T259 MCPB mock::$msg"
+            $blocks = @(); $current = @()
+            foreach ($line in $lines) {
+              $text = [string]$line
+              if ($text -match '^\s*not ok \d+ -') {
+                if ($current.Count -gt 0) { $blocks += ($current -join "`n") }
+                $current = @($text)
+              } elseif ($current.Count -gt 0) {
+                $current += $text
+                if ($text -match '^\s+\.\.\.\s*$') { $blocks += ($current -join "`n"); $current = @() }
               }
+            }
+            if ($current.Count -gt 0) { $blocks += ($current -join "`n") }
+            if ($blocks.Count -eq 0) { $blocks = @("MCPB mock exited $code without a failed TAP block") }
+            $blocks | Select-Object -First 5 | ForEach-Object {
+              $msg = [string]$_
+              if ($msg.Length -gt 4096) { $msg = $msg.Substring(0,4096) }
+              $msg = $msg.Replace('%','%25').Replace("`r",'%0D').Replace("`n",'%0A')
+              Write-Output "::error title=T259 MCPB mock::$msg"
+            }
             exit $code
           }
 
