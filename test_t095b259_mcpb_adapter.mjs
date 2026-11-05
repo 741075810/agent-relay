@@ -95,7 +95,7 @@ async function fixture(t, mode = '', hook = null) {
     workspaceRoot: root, stateDir: state, env: { CODEX_BRIDGE_MCP_URL: `http://127.0.0.1:${server.address().port}/mcp`, CODEX_BRIDGE_MCP_TOKEN: TOKEN },
     grant: { kind: 'continuation', projectId: PROJECT, installationId: INSTALL, sessionId: SESSION,
       workspaceRoot: root, approvedAt: 10000000, expiresAt: 20000000, maxTasks: 3 }, now: () => f.now,
-    readTimeoutMs: 2000, submitTimeoutMs: mode === 'timeout' ? 100 : 2000 };
+    readTimeoutMs: 2000, submitTimeoutMs: mode === 'timeout' ? 1000 : 2000 };
   f.client = (changes = {}) => createMcpbAdapter({ ...f.options, ...changes });
   t.after(async () => { const closed = new Promise((resolve) => server.close(resolve)); server.closeAllConnections(); await closed; rmSync(temp, { recursive: true, force: true }); });
   return f;
