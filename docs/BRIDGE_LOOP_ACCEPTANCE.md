@@ -89,6 +89,7 @@ node tools/continuation/bridge_loop_acceptance.mjs record.json --json   # 机器
 - `providerSessionId` 与记录头不一致 → FAIL（`session:mismatch(...)`）；**缺失**则是
   `UNKNOWN`（`session:absent`）——缺证据和自相矛盾不是一回事，不许合并。
 - `runId` / `taskId` 重复 → FAIL（`duplicate_run:` / `duplicate_task:`）。
+- 同一条 `noticeVisible.messageId` 出现在两轮 → FAIL（`duplicate_notice:<messageId>`）；同一个 `reviewId`（或 `reviewId` 缺失时的 `turnId`）出现在两轮 → FAIL（`duplicate_review:<id>`）。一条页面消息只能是一次完成的通知，一次复核只能复核一个 run；重复记账等于把同一个环节算给两轮。
 - 两轮时间窗重叠 → FAIL（`overlap:190/191`）：闭环一次只应有一条在跑。
 - `redispatched.taskId` 指向本轮或此前任一轮已完成任务 → FAIL（`redispatch:reuses_completed_task:<taskId>`），**末轮没有下一条记录也必须检查**。
 - `redispatched.taskId` 不指向下一轮的实际 `taskId` → FAIL（`redispatch:does_not_lead_to_round_N`）。

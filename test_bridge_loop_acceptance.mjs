@@ -232,6 +232,44 @@ test('T248: the final redispatch cannot reuse any task already completed in the 
   }
 });
 
+test('T248: one notice and one review cannot be credited to two rounds', () => {
+  const first = round({ states: { redispatched: { observed: true, source: 'bridge_ledger',
+    at: '2026-11-02T10:36:00Z', taskId: 'tsk-192' } } });
+  const secondRound = (notice = {}, review = {}) => round({
+    round: 192, runId: 'run-192', taskId: 'tsk-192',
+    startedAt: '2026-11-02T11:00:00Z', completedAt: '2026-11-02T11:30:00Z',
+    states: {
+      taskCompleted: { observed: true, source: 'bridge_ledger', at: '2026-11-02T11:30:00Z',
+        status: 'completed', taskId: 'tsk-192', runId: 'run-192' },
+      extensionSubmitted: { observed: true, source: 'extension_diagnostic', at: '2026-11-02T11:30:05Z',
+        runId: 'run-192' },
+      noticeVisible: { observed: true, source: 'chatgpt_conversation_message', at: '2026-11-02T11:30:30Z',
+        messageId: 'msg-192', conversationId: 'conv-55', runId: 'run-192', ...notice },
+      reviewed: { observed: true, source: 'chatgpt_review', at: '2026-11-02T11:35:00Z',
+        reviewId: 'rev-192', taskId: 'tsk-192', runId: 'run-192', ...review },
+      redispatched: { observed: true, source: 'bridge_ledger', at: '2026-11-02T11:36:00Z', taskId: 'tsk-193' },
+    },
+  });
+
+  const clean = judge([first, secondRound()]);
+  assert.equal(clean.verdict, 'PASS', 'two notices in one conversation, each with its own message, still pass');
+
+  const reusedNotice = judge([first, secondRound({ messageId: 'msg-777' })]);
+  assert.equal(reusedNotice.verdict, 'FAIL', 'the same page message cannot be round 192\'s notice too');
+  assert.ok(reusedNotice.problems.includes('duplicate_notice:msg-777'));
+  assert.equal(reusedNotice.unattended, null);
+
+  const reusedReview = judge([first, secondRound({}, { reviewId: 'rev-1' })]);
+  assert.equal(reusedReview.verdict, 'FAIL', 'the same review turn cannot review two runs');
+  assert.ok(reusedReview.problems.includes('duplicate_review:rev-1'));
+  assert.equal(reusedReview.unattended, null);
+
+  const both = judge([first, secondRound({ messageId: 'msg-777' }, { reviewId: 'rev-1' })]);
+  assert.equal(both.verdict, 'FAIL');
+  assert.deepEqual(both.problems.filter((p) => p.startsWith('duplicate_')).sort(),
+    ['duplicate_notice:msg-777', 'duplicate_review:rev-1']);
+});
+
 test('T191: the report never claims this program observed the loop', () => {
   const report = judge([round()]);
   assert.match(report.note, /not that the loop was observed by this program/);

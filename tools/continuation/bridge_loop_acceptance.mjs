@@ -232,6 +232,26 @@ export function judgeRecord(record) {
     if (windows[i].start < windows[i - 1].end) problems.push(`overlap:${windows[i - 1].round}/${windows[i].round}`);
   }
 
+  // One page message is one notice, and one review turn reviews one run. The same id credited to two
+  // rounds would let a single notice (or a single review) pay for two links of the chain, which is the
+  // duplicate-notice failure this repository has been chasing -- so it is a FAIL, not missing evidence.
+  const seenNotice = new Map();
+  const seenReview = new Map();
+  for (const round of rounds) {
+    const states = (round && round.states) || {};
+    const messageId = text(states.noticeVisible && states.noticeVisible.messageId);
+    if (messageId) {
+      if (seenNotice.has(messageId)) problems.push(`duplicate_notice:${messageId}`);
+      else seenNotice.set(messageId, round && round.round);
+    }
+    const reviewed = states.reviewed || {};
+    const reviewId = text(reviewed.reviewId) || text(reviewed.turnId);
+    if (reviewId) {
+      if (seenReview.has(reviewId)) problems.push(`duplicate_review:${reviewId}`);
+      else seenReview.set(reviewId, round && round.round);
+    }
+  }
+
   // A re-dispatch must point at a task that did not exist yet, and the next round must be that task.
   const completedTasks = new Set();
   for (let i = 0; i < rounds.length; i += 1) {
