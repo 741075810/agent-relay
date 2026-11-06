@@ -1,4 +1,4 @@
-// T095B152: the continuation coordinator. Offline, default-disabled, one dispatch per completion.
+// T095B152/T262: offline, default-disabled, at most one accepted handoff per completion.
 //
 // What it does, in one paragraph: it reads completed tasks from the durable mirror
 // (`eventsource.mjs`), claims one at a time against a *continuation* grant, picks the next
@@ -25,6 +25,7 @@
 // process's own stop condition, `grant.maxTasks` is what the operator authorised. Reaching either
 // disables the coordinator (`disabled`) rather than silently continuing.
 
+import { createHash } from 'node:crypto';
 import {
   MAX_ATTEMPTS,
   admit,
@@ -121,9 +122,8 @@ export function createCoordinator(deps = {}) {
     };
   }
 
-  // The durable record is what *was written*, not what is in memory. `persist()` is the only way it
-  // changes, and the write-ahead call below is what makes a crash recoverable: without a persisted
-  // lease, a restart would see the event as untouched and dispatch it a second time.
+  // The latest serialized bytes, not an actual disk transaction. The caller owns atomic storage
+  // before any real handoff. This offline owner snapshots the lease/intent before invoking its seam.
   function serialise() {
     return JSON.stringify({
       version: 1,
@@ -208,11 +208,24 @@ export function createCoordinator(deps = {}) {
     }
   }
 
-  function pickTask() {
+  const taskText = (value, bytes) => typeof value === 'string' && value.length > 0
+    && Buffer.byteLength(value, 'utf8') <= bytes && !value.includes('\0');
+  const taskDigest = task => createHash('sha256').update(JSON.stringify([task.id, task.scope, task.title])).digest('hex');
+  function resolveTask(job) {
     const grant = co.state.grant;
-    if (!grant) return null;
-    return co.tasks.find((task) => !co.state.used.includes(task.id)
-      && grant.scopes.includes(task.scope)) || null;
+    if (job.sessionId !== grant.sessionId || job.epoch !== grant.epoch) return { code: 'task_binding_changed' };
+    const reserved = job.attempts > 0 || job.taskId !== undefined || job.taskDigest !== undefined;
+    if (reserved && (!taskText(job.taskId, 512) || typeof job.taskDigest !== 'string'
+      || !/^[0-9a-f]{64}$/.test(job.taskDigest))) return { code: 'reservation_unverified' };
+    const task = reserved ? co.tasks.find(item => item?.id === job.taskId)
+      : co.tasks.find(item => item && !co.state.used.includes(item.id) && grant.scopes.includes(item.scope));
+    if (!task) return { code: reserved ? 'reserved_task_unavailable' : 'no_approved_task' };
+    if (![taskText(task.id, 512), taskText(task.scope, 512), taskText(task.title, 32768)].every(Boolean)) return { code: 'task_invalid' };
+    if (co.tasks.filter(item => item?.id === task.id).length !== 1) return { code: 'task_identity_ambiguous' };
+    if (!grant.scopes.includes(task.scope) || co.state.used.includes(task.id)) return { code: 'task_binding_changed' };
+    const digest = taskDigest(task);
+    if (reserved && digest !== job.taskDigest) return { code: 'task_intent_changed' };
+    return { code: null, task: { id: task.id, title: task.title }, digest };
   }
 
   co.step = async function step(at = now()) {
@@ -220,6 +233,7 @@ export function createCoordinator(deps = {}) {
     if (state.stopped) return { code: 'stopped', reason: state.stopReason };
     if (!state.enabled) return { code: 'disabled' };
     if (state.gap) return { code: 'event_gap', gap: state.gap };
+    if (!Number.isFinite(at)) return { code: 'clock_unverified' };
     const problem = grantProblem(state.grant, co.sessionId, at);
     if (problem) {
       state.enabled = false;
@@ -231,39 +245,55 @@ export function createCoordinator(deps = {}) {
     }
 
     admitPending();
+    const entries = Object.entries(state.store.jobs);
+    const halted = entries.find(([, job]) => job.state === 'escalated');
+    if (halted) return { code: halted[1].lastError === 'unknown_outcome' ? 'unknown_outcome' : 'escalated', key: halted[0] };
+    const held = entries.find(([, job]) => job.state === 'leased');
+    if (held) return { code: 'in_flight', key: held[0] };
+    const retry = entries.find(([, job]) => job.state === 'failed' || (job.state === 'queued' && job.attempts > 0));
+    if (retry && !Number.isFinite(retry[1].nextRetryAt)) return { code: 'retry_time_unverified', key: retry[0] };
+    if (retry && retry[1].nextRetryAt > at) {
+      return { code: 'retry_wait', key: retry[0], nextRetryAt: retry[1].nextRetryAt };
+    }
     const ready = dispatchable(state.store, at);
     if (ready.length === 0) return { code: 'no_events' };
-
-    const task = pickTask();
-    if (!task) return { code: 'no_approved_task' };
-
-    const key = ready[0];
+    const key = retry ? retry[0] : ready[0];
+    const chosen = resolveTask(state.store.jobs[key]);
+    if (chosen.code) return { code: chosen.code, key };
     const leased = lease(state.store, key, at, co.config.leaseMs);
     state.store = leased.store;
-    if (leased.code !== null) return { code: leased.code };
+    if (leased.code !== null) { persist(); return { code: leased.code }; }
+    const job = state.store.jobs[key];
+    job.taskId = chosen.task.id; job.taskDigest = chosen.digest;
+    const request = Object.freeze({ sessionId: job.sessionId, taskId: job.taskId,
+      title: chosen.task.title, key, epoch: job.epoch, attempt: leased.attempt });
 
-    // Write-ahead: the lease hits durable storage before the request leaves the process, so a crash
-    // here is recoverable as "unknown", never as "try again".
+    // Single owner: lease + intent snapshot precedes await. Actual disk durability is caller-owned.
     persist();
-
     let reply;
     try {
-      reply = await co.bridge.request({ sessionId: state.grant.sessionId, taskId: task.id,
-        title: task.title, key, epoch: state.grant.epoch });
-    } catch (err) {
-      // Nothing conclusive: leave the lease in place and let `recover` escalate it.
+      reply = await co.bridge.request(request);
+    } catch {
       state.lastCode = 'in_flight';
-      return { code: 'in_flight', key, error: String(err && err.message ? err.message : err) };
+      persist();
+      return { code: 'in_flight', key, error: 'transport_error' };
     }
-
-    const outcome = reply && reply.outcome;
-    if (outcome === 'unknown') {
+    // Only an explicit known-nonacceptance callback may retry. RPC/quota/task failure is not that fact.
+    const outcome = reply && !Array.isArray(reply) && typeof reply === 'object' ? reply.outcome : null;
+    if (!['ack', 'failed'].includes(outcome)) {
       state.lastCode = 'in_flight';
+      persist();
       return { code: 'in_flight', key };
     }
+    const recordedAt = now();
+    const completionAt = Number.isFinite(recordedAt) ? Math.max(at, recordedAt) : NaN;
     if (outcome === 'ack') {
-      state.store = complete(state.store, key, { outcome: 'acked', at }).store;
-      state.used.push(task.id);
+      const acknowledged = complete(state.store, key, { outcome: 'acked', attempt: request.attempt, at: completionAt });
+      state.store = acknowledged.store;
+      if (acknowledged.code !== null) {
+        state.lastCode = acknowledged.code; persist(); return { code: acknowledged.code, key };
+      }
+      state.used.push(request.taskId);
       state.tasksDone += 1;
       state.lastCode = null;
       let stoppedBy = null;
@@ -274,16 +304,16 @@ export function createCoordinator(deps = {}) {
         state.lastCode = stoppedBy;
       }
       persist();
-      return { code: null, dispatch: { key, taskId: task.id, sessionId: state.grant.sessionId },
+      return { code: null, dispatch: { key, taskId: request.taskId, sessionId: request.sessionId },
         stoppedBy };
     }
 
-    const failed = complete(state.store, key, { outcome: 'failed',
-      code: (reply && reply.code) || 'dispatch_failed', at });
+    const failed = complete(state.store, key, { outcome: 'failed', attempt: request.attempt,
+      code: reply.code || 'dispatch_failed', at: completionAt });
     state.store = failed.store;
     state.lastCode = failed.code;
     persist();
-    return { code: failed.code, key, taskId: task.id };
+    return { code: failed.code, key, taskId: request.taskId };
   };
 
   co.recover = async function recoverAt(at = now()) {
@@ -315,6 +345,7 @@ export function restore(json, deps = {}) {
     mirror: createMirror(raw.mirror || raw.state && raw.state.mirror || {}),
   };
   co.state.enabled = raw.state && raw.state.enabled === true;
+  co.persist(); // checkpoint must reflect restored state even without poll/step/enable.
   return co;
 }
 

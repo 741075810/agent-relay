@@ -56,7 +56,7 @@ test('T151: one completed event dispatches at most once, and a repeat is a dupli
   store = lease.store;
   // A second lease while the first is live is refused: that is the second-dispatch guard.
   assert.equal(CS.lease(store, lease.key, T0 + 3000, 60 * 1000).code, 'lease_held');
-  store = CS.complete(store, lease.key, { outcome: 'acked', at: T0 + 4000 }).store;
+  store = CS.complete(store, lease.key, { outcome: 'acked', attempt: 1, at: T0 + 4000 }).store;
   assert.equal(CS.admit(store, { ...RUN, epoch: 'epoch-A', sessionId: SESSION,
     authorisation: GRANT, now: T0 + 5000, bridgeUp: true }).code, 'duplicate_event');
   const s = CS.summary(store);
@@ -132,7 +132,7 @@ test('T151: a failed continuation retries with backoff, then escalates and stays
     const lease = CS.lease(store, key, at, 60 * 1000);
     assert.equal(lease.code, null, 'attempt ' + attempt);
     store = lease.store;
-    const failed = CS.complete(store, key, { outcome: 'failed', code: 'dsh_busy', at });
+    const failed = CS.complete(store, key, { outcome: 'failed', attempt, code: 'dsh_busy', at });
     store = failed.store;
     if (attempt < CS.MAX_ATTEMPTS) {
       assert.equal(store.jobs[key].state, 'failed');
@@ -158,7 +158,7 @@ test('T151: a restarted process resumes from the record with no lost and no dupl
     authorisation: GRANT, now: T0, bridgeUp: true }).store;
   const key = CS.key({ ...RUN, epoch: 'epoch-A' });
   store = CS.lease(store, key, T0 + 1000, 60 * 1000).store;
-  store = CS.complete(store, key, { outcome: 'acked', at: T0 + 2000 }).store;
+  store = CS.complete(store, key, { outcome: 'acked', attempt: 1, at: T0 + 2000 }).store;
 
   // "Worker restart": persist to JSON, then rebuild from the string only.
   const durable = CS.snapshot(store);
@@ -189,5 +189,79 @@ test('T151: page state cannot influence the decision (the record has no page in 
   for (const field of Object.keys(record)) {
     assert.ok(!/tab|window|focus|visible|discard/i.test(field),
       'the durable record carries no page field: ' + field);
+  }
+});
+
+// T262: owned in-memory records only, never production completions.
+function seededLease() {
+  const out = CS.admit(fresh(), { ...RUN, epoch: 'epoch-A', sessionId: SESSION,
+    authorisation: GRANT, now: T0, bridgeUp: true });
+  const leased = CS.lease(out.store, out.key, T0 + 1000, 1000);
+  return { key: out.key, queued: out.store, store: leased.store, attempt: leased.store.jobs[out.key].attempts };
+}
+test('T262 state lease expiration is UNKNOWN without recover first', () => {
+  const f = seededLease(); const out = CS.lease(f.store, f.key, T0 + 2000, 1000);
+  assert.equal(out.code, 'unknown_outcome');
+  assert.equal(out.store.jobs[f.key].state, 'escalated');
+  assert.equal(out.store.jobs[f.key].attempts, 1);
+  assert.equal(out.store.jobs[f.key].lastError, 'unknown_outcome');
+  assert.deepEqual(CS.dispatchable(out.store, T0 + HOUR), []);
+});
+test('T262 state lease itself enforces known-rejection backoff', () => {
+  const f = seededLease();
+  const failed = CS.complete(f.store, f.key, { outcome: 'failed', attempt: f.attempt, at: T0 + 1100, code: 'busy-fixture' });
+  const due = failed.store.jobs[f.key].nextRetryAt;
+  const early = CS.lease(failed.store, f.key, due - 1);
+  assert.equal(early.code, 'retry_not_due');
+  assert.equal(CS.snapshot(early.store), CS.snapshot(failed.store));
+  assert.equal(CS.lease(failed.store, f.key, due).code, null);
+  const recovered = CS.recover(failed.store, due).store;
+  assert.equal(CS.lease(recovered, f.key, due - 1).code, 'retry_not_due');
+  assert.equal(CS.lease(recovered, f.key, due).code, null);
+});
+test('T262 state queued ACK never marks work consumed', () => {
+  const f = seededLease();
+  const out = CS.complete(f.queued, f.key, { outcome: 'acked', attempt: 0, at: T0 + 1000 });
+  assert.equal(out.code, 'not_leased'); assert.equal(CS.snapshot(out.store), CS.snapshot(f.queued));
+});
+test('T262 state acknowledged result is immutable under late callbacks', () => {
+  const f = seededLease();
+  const done = CS.complete(f.store, f.key, { outcome: 'acked', attempt: f.attempt, at: T0 + 1100 });
+  for (const outcome of ['acked', 'failed', 'unknown']) {
+    const out = CS.complete(done.store, f.key, { outcome, attempt: f.attempt, at: T0 + 1200 });
+    assert.equal(out.code, 'already_acked'); assert.equal(CS.snapshot(out.store), CS.snapshot(done.store));
+    assert.deepEqual(CS.dispatchable(out.store, T0 + HOUR), []);
+  }
+});
+test('T262 state recovered UNKNOWN cannot be resurrected by late ACK or failure', () => {
+  const f = seededLease(); const halted = CS.recover(f.store, T0 + 2000).store;
+  for (const outcome of ['acked', 'failed']) {
+    const out = CS.complete(halted, f.key, { outcome, attempt: f.attempt, at: T0 + 2001 });
+    assert.equal(out.code, 'not_dispatchable'); assert.equal(CS.snapshot(out.store), CS.snapshot(halted));
+  }
+});
+test('T262 state unsupported outcome is unresolved rather than retryable', () => {
+  const f = seededLease();
+  const out = CS.complete(f.store, f.key, { outcome: 'transport_error', attempt: f.attempt, at: T0 + 1100 });
+  assert.equal(out.code, 'unknown_outcome'); assert.equal(out.store.jobs[f.key].state, 'escalated');
+  assert.equal(out.store.jobs[f.key].nextRetryAt, null);
+});
+test('T262 state old or absent attempt never settles a later lease', () => {
+  const f = seededLease();
+  const failed = CS.complete(f.store, f.key, { outcome: 'failed', attempt: 1, at: T0 + 1100 });
+  const second = CS.lease(failed.store, f.key, failed.store.jobs[f.key].nextRetryAt).store;
+  assert.equal(second.jobs[f.key].attempts, 2);
+  for (const [attempt, code] of [[undefined, 'attempt_unverified'], [1, 'attempt_mismatch']]) {
+    for (const outcome of ['acked', 'failed']) {
+      const out = CS.complete(second, f.key, { outcome, attempt, at: T0 + HOUR });
+      assert.equal(out.code, code); assert.equal(CS.snapshot(out.store), CS.snapshot(second));
+    }
+  }
+});
+test('T262 state invalid lease clock or duration preserves the queued record', () => {
+  const f = seededLease();
+  for (const [at, ttl] of [[NaN, 1000], [T0, 0], [T0, Infinity], [T0, -1]]) {
+    const out = CS.lease(f.queued, f.key, at, ttl);
+    assert.equal(out.code, 'invalid_lease'); assert.equal(CS.snapshot(out.store), CS.snapshot(f.queued));
   }
 });

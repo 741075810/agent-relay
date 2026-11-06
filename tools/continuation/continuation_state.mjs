@@ -8,7 +8,7 @@
 //
 // The invariants, and how each one is enforced:
 //
-//   at most one dispatch per completion
+//   at most one accepted handoff per completion (known nonacceptance retries are bounded)
 //     the key is `runId|status|epoch`; `admit` refuses an existing key (`duplicate_event`), and
 //     `lease` is a write-ahead record: the attempt is persisted *before* the hand-off, so a second
 //     lease while one is live is refused (`lease_held`).
@@ -27,11 +27,12 @@
 //     when the Bridge is back the same completion is admitted normally.
 //
 //   failure retries a bounded number of times, then escalates
-//     `complete(..., {outcome: 'failed'})` schedules `nextRetryAt` with exponential backoff; after
+//     `complete(..., {outcome: 'failed', attempt})` means verified nonacceptance and schedules
+//     `nextRetryAt` with exponential backoff; after
 //     `MAX_ATTEMPTS` the job becomes `escalated` and stays on record with its last error.
 //
-// Persistence is `snapshot`/`restore` over JSON, because the only storage a service worker can rely
-// on across restarts is one it has written to disk itself.
+// Persistence is the caller-owned snapshot/restore JSON boundary. This module writes no disk;
+// callers must preserve the latest bytes atomically before any real handoff, with one state owner.
 
 export const MAX_ATTEMPTS = 3;
 export const BASE_BACKOFF_MS = 30 * 1000;
@@ -108,6 +109,14 @@ export function admit(store, event) {
   return { store: s, code: null, key: k };
 }
 
+function unresolved(job, at) {
+  job.state = 'escalated';
+  job.lastError = 'unknown_outcome';
+  job.leaseUntil = null;
+  job.nextRetryAt = null;
+  job.history.push({ at, what: 'escalated', code: 'unknown_outcome' });
+}
+
 export function lease(store, jobKey, now, ttlMs = 60 * 1000) {
   const s = clone(store);
   const job = s.jobs[jobKey];
@@ -116,23 +125,44 @@ export function lease(store, jobKey, now, ttlMs = 60 * 1000) {
   if (job.state === 'escalated' || job.state === 'abandoned') {
     return { store: s, code: 'not_dispatchable', state: job.state };
   }
-  if (job.state === 'leased' && Number.isFinite(job.leaseUntil) && now < job.leaseUntil) {
-    return { store: s, code: 'lease_held' };
+  if (!Number.isFinite(now) || !Number.isFinite(ttlMs) || ttlMs <= 0 || !Number.isFinite(now + ttlMs)) {
+    return { store: s, code: 'invalid_lease' };
+  }
+  if (job.state === 'leased') {
+    if (Number.isFinite(job.leaseUntil) && now < job.leaseUntil) return { store: s, code: 'lease_held' };
+    unresolved(job, now);
+    return { store: s, code: 'unknown_outcome' };
+  }
+  if (!['queued', 'failed'].includes(job.state) || !Number.isSafeInteger(job.attempts)
+    || job.attempts < 0 || job.attempts >= MAX_ATTEMPTS) return { store: s, code: 'not_dispatchable' };
+  if (job.state === 'failed' || job.attempts > 0) {
+    if (!Number.isFinite(job.nextRetryAt)) return { store: s, code: 'retry_time_unverified' };
+    if (now < job.nextRetryAt) return { store: s, code: 'retry_not_due', nextRetryAt: job.nextRetryAt };
   }
   job.state = 'leased';
   job.attempts += 1;
   job.leaseUntil = now + ttlMs;
   job.nextRetryAt = null;
   job.history.push({ at: now, what: 'leased', attempt: job.attempts });
-  return { store: s, code: null, key: jobKey };
+  return { store: s, code: null, key: jobKey, attempt: job.attempts };
 }
 
 export function complete(store, jobKey, outcome) {
   const s = clone(store);
   const job = s.jobs[jobKey];
-  const at = outcome && Number.isFinite(outcome.at) ? outcome.at : Date.now();
+  const at = outcome?.at;
   if (!job) return { store: s, code: 'unknown_job' };
-  if (outcome && outcome.outcome === 'acked') {
+  if (job.state === 'acked') return { store: s, code: 'already_acked' };
+  if (['escalated', 'abandoned'].includes(job.state)) return { store: s, code: 'not_dispatchable' };
+  if (job.state !== 'leased') return { store: s, code: 'not_leased' };
+  if (!Number.isSafeInteger(outcome?.attempt) || outcome.attempt < 1) return { store: s, code: 'attempt_unverified' };
+  if (outcome.attempt !== job.attempts) return { store: s, code: 'attempt_mismatch' };
+  if (!Number.isFinite(at)) return { store: s, code: 'outcome_time_unverified' };
+  if (!['acked', 'failed'].includes(outcome.outcome)) {
+    unresolved(job, at);
+    return { store: s, code: 'unknown_outcome' };
+  }
+  if (outcome.outcome === 'acked') {
     job.state = 'acked';
     job.leaseUntil = null;
     job.lastError = null;
@@ -160,10 +190,7 @@ export function recover(store, now) {
   for (const [k, job] of Object.entries(s.jobs)) {
     if (job.state === 'leased' && Number.isFinite(job.leaseUntil) && job.leaseUntil <= now) {
       // A hand-off whose outcome nobody recorded. Retrying would guess; escalate instead.
-      job.state = 'escalated';
-      job.lastError = 'unknown_outcome';
-      job.leaseUntil = null;
-      job.history.push({ at: now, what: 'escalated', code: 'unknown_outcome' });
+      unresolved(job, now);
       escalated.push(k);
       continue;
     }

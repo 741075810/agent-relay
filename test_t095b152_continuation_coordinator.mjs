@@ -252,3 +252,158 @@ test('T152: a Bridge outage loses no event and dispatches once when it returns',
   assert.equal(back.code, null, JSON.stringify(back));
   assert.equal(bridge.calls.length, 1);
 });
+
+// T262: fake transport + owned in-memory state only; no browser or live task service.
+test('T262 coordinator immediate checkpoint after restore preserves acknowledged work', async () => {
+  const { bridge, co } = boot(); await co.enable(grant());
+  co.poll(listReply([completion(1)]), T0 + 1000); await co.step(T0 + 2000);
+  const restored = CO.restore(co.checkpoint(), { bridge, tasks: tasks(), sessionId: SESSION, now: () => T0 });
+  assert.deepEqual(JSON.parse(restored.checkpoint()).store, JSON.parse(co.checkpoint()).store);
+  const twice = CO.restore(restored.checkpoint(), { bridge, tasks: tasks(), sessionId: SESSION, now: () => T0 });
+  await twice.enable(grant()); twice.poll(listReply([completion(1)]), T0 + 3000);
+  assert.equal((await twice.step(T0 + 4000)).code, 'no_events');
+  assert.equal(bridge.calls.length, 1);
+});
+for (const [name, reply] of [['absent', undefined], ['null', null], ['empty', {}], ['bad-case', { outcome: 'ACK' }],
+  ['error', { outcome: 'error', code: 'quota-fixture' }], ['unknown', { outcome: 'unknown' }]]) {
+  test(`T262 coordinator ${name} callback is sticky UNKNOWN even with backlog`, async () => {
+    const { co } = boot(); const calls = [];
+    co.bridge.request = async payload => { calls.push(payload); return reply; };
+    await co.enable(grant()); co.poll(listReply([completion(1), completion(2)]), T0 + 1000);
+    assert.equal((await co.step(T0 + 2000)).code, 'in_flight');
+    assert.equal(co.status().nextRetryAt, null);
+    assert.equal((await co.step(T0 + 3 * MIN)).code, 'in_flight');
+    assert.equal(calls.length, 1);
+    await co.recover(T0 + 3 * MIN);
+    const restored = CO.restore(co.checkpoint(), { bridge: co.bridge, tasks: tasks(), sessionId: SESSION, now: () => T0 });
+    assert.equal((await restored.step(T0 + 4 * MIN)).code, 'unknown_outcome');
+    assert.equal(calls.length, 1); assert.equal(restored.status().tasksDone, 0);
+  });
+}
+test('T262 coordinator concurrent calls preserve one in-flight slot and grant cap', async () => {
+  const { co } = boot(); const calls = [], resolvers = [];
+  co.bridge.request = payload => { calls.push(payload); return new Promise(resolve => resolvers.push(resolve)); };
+  await co.enable(grant({ maxTasks: 1 })); co.poll(listReply([completion(1), completion(2)]), T0 + 1000);
+  const first = co.step(T0 + 2000), second = co.step(T0 + 2001);
+  try { assert.equal(calls.length, 1); }
+  finally { for (const resolve of resolvers) resolve({ outcome: 'ack' }); await Promise.allSettled([first, second]); }
+  assert.equal((await second).code, 'in_flight'); assert.equal(co.status().tasksDone, 1);
+  assert.deepEqual(co.status().jobs[calls[0].key].taskId, calls[0].taskId);
+});
+test('T262 coordinator failed retry waits and backlog cannot reset the attempt budget', async () => {
+  const { co } = boot(); const calls = [];
+  co.bridge.request = async payload => { calls.push(payload); return { outcome: 'failed', code: 'busy-fixture' }; };
+  await co.enable(grant()); co.poll(listReply([completion(1), completion(2)]), T0 + 1000);
+  assert.equal((await co.step(T0 + 2000)).code, 'retry_scheduled');
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    if (attempt < 3) {
+      const due = co.status().nextRetryAt;
+      const waiting = await co.step(due - 1);
+      assert.equal(waiting.code, 'retry_wait'); assert.equal(waiting.nextRetryAt, due);
+      assert.equal(calls.length, attempt); await co.step(due);
+    }
+  }
+  assert.equal((await co.step(T0 + 10 * MIN)).code, 'escalated');
+  assert.equal(calls.length, 3); assert.equal(new Set(calls.map(x => x.key)).size, 1);
+  assert.equal(new Set(calls.map(x => x.taskId)).size, 1);
+  assert.deepEqual(calls.map(x => x.attempt), [1, 2, 3]);
+});
+test('T262 coordinator reservation survives snapshot and retry without copying task text', async () => {
+  const { co } = boot(); const calls = []; let active = co;
+  co.bridge.request = async payload => {
+    const saved = JSON.parse(active.checkpoint()).store.jobs[payload.key];
+    assert.equal(saved.taskId, payload.taskId); assert.match(saved.taskDigest, /^[0-9a-f]{64}$/);
+    assert.equal(saved.attempts, payload.attempt); assert.equal(saved.title, undefined);
+    calls.push(payload); return calls.length === 1 ? { outcome: 'failed', code: 'busy-fixture' } : { outcome: 'ack' };
+  };
+  await co.enable(grant()); co.poll(listReply([completion(1)]), T0 + 1000);
+  await co.step(T0 + 2000); const due = co.status().nextRetryAt;
+  const restored = CO.restore(co.checkpoint(), { bridge: co.bridge, tasks: tasks(), sessionId: SESSION, now: () => T0 });
+  active = restored;
+  assert.equal((await restored.step(due)).code, null);
+  assert.equal(calls.length, 2); assert.equal(calls[0].key, calls[1].key); assert.equal(calls[0].taskId, calls[1].taskId);
+});
+for (const mode of ['changed', 'missing']) {
+  test(`T262 coordinator reserved intent ${mode} stops without overwriting state`, async () => {
+    const { co } = boot(); const calls = [];
+    co.bridge.request = async payload => { calls.push(payload); return { outcome: 'failed', code: 'busy-fixture' }; };
+    await co.enable(grant()); co.poll(listReply([completion(1)]), T0 + 1000); await co.step(T0 + 2000);
+    const due = co.status().nextRetryAt, before = structuredClone(co.status().jobs);
+    const altered = tasks(); if (mode === 'changed') altered[0].title = 'unsubmitted edited work fixture'; else altered.shift();
+    const restored = CO.restore(co.checkpoint(), { bridge: co.bridge, tasks: altered, sessionId: SESSION, now: () => T0 });
+    assert.equal((await restored.step(due)).code, mode === 'changed' ? 'task_intent_changed' : 'reserved_task_unavailable');
+    assert.equal(calls.length, 1); assert.deepEqual(restored.status().jobs, before);
+    if (mode === 'changed') assert.equal(altered[0].title, 'unsubmitted edited work fixture');
+  });
+}
+test('T262 coordinator late ACK after recovery never reports successful handoff', async () => {
+  const { co } = boot(); let resolveReply;
+  co.bridge.request = () => new Promise(resolve => { resolveReply = resolve; });
+  await co.enable(grant()); co.poll(listReply([completion(1)]), T0 + 1000);
+  const pending = co.step(T0 + 2000);
+  await co.recover(T0 + 3 * MIN); resolveReply({ outcome: 'ack' });
+  assert.equal((await pending).code, 'not_dispatchable');
+  assert.equal(co.status().tasksDone, 0); assert.deepEqual(co.state.used, []);
+  assert.equal(Object.values(co.status().jobs)[0].lastError, 'unknown_outcome');
+});
+for (const mode of ['legacy', 'partial', 'bad-digest', 'duplicate', 'epoch-drift']) {
+  test(`T262 coordinator ${mode} reservation refuses without reset or inference`, async () => {
+    const { co } = boot(); const calls = [];
+    co.bridge.request = async payload => { calls.push(payload); return { outcome: 'failed', code: 'busy-fixture' }; };
+    await co.enable(grant()); co.poll(listReply([completion(1)]), T0 + 1000); await co.step(T0 + 2000);
+    const raw = JSON.parse(co.checkpoint()), job = Object.values(raw.store.jobs)[0], altered = tasks();
+    if (mode === 'legacy') { delete job.taskId; delete job.taskDigest; }
+    if (mode === 'partial') delete job.taskDigest;
+    if (mode === 'bad-digest') job.taskDigest = 'invalid-fixture';
+    if (mode === 'duplicate') altered.push({ ...altered[0] });
+    if (mode === 'epoch-drift') raw.state.grant.epoch = 'epoch-B';
+    const restored = CO.restore(raw, { bridge: co.bridge, tasks: altered, sessionId: SESSION, now: () => T0 });
+    const before = structuredClone(restored.status().jobs);
+    const expected = mode === 'duplicate' ? 'task_identity_ambiguous' : mode === 'epoch-drift' ? 'task_binding_changed' : 'reservation_unverified';
+    assert.equal((await restored.step(job.nextRetryAt)).code, expected);
+    assert.equal(calls.length, 1); assert.deepEqual(restored.status().jobs, before);
+  });
+}
+test('T262 coordinator failure backoff starts at injected reply-recording time', async () => {
+  let clock = T0, resolveReply;
+  const bridge = { request: () => new Promise(resolve => { resolveReply = resolve; }) };
+  const co = CO.createCoordinator({ bridge, tasks: tasks(), sessionId: SESSION, now: () => clock,
+    config: { leaseMs: 2 * MIN } });
+  await co.enable(grant()); co.poll(listReply([completion(1)]), T0);
+  const pending = co.step(T0 + 1000);
+  clock = T0 + MIN; resolveReply({ outcome: 'failed', code: 'busy-fixture' });
+  assert.equal((await pending).code, 'retry_scheduled');
+  assert.equal(co.status().nextRetryAt, clock + 30000);
+  assert.equal((await co.step(clock + 1)).code, 'retry_wait');
+});
+test('T262 coordinator captures task and session identity before awaited ACK', async () => {
+  const { co } = boot(); let resolveReply;
+  co.bridge.request = () => new Promise(resolve => { resolveReply = resolve; });
+  await co.enable(grant()); co.poll(listReply([completion(1)]), T0 + 1000);
+  const pending = co.step(T0 + 2000);
+  co.tasks[0].id = 'edited-unsubmitted-task-fixture'; co.state.grant.sessionId = 'edited-session-fixture';
+  resolveReply({ outcome: 'ack' }); const out = await pending;
+  assert.equal(out.dispatch.taskId, 'task-1'); assert.equal(out.dispatch.sessionId, SESSION);
+  assert.deepEqual(co.state.used, ['task-1']); assert.equal(co.tasks[0].id, 'edited-unsubmitted-task-fixture');
+});
+test('T262 coordinator invalid clock retains source without any request', async () => {
+  const { bridge, co } = boot(); await co.enable(grant()); co.poll(listReply([completion(1)]), T0);
+  const before = co.checkpoint(); assert.equal((await co.step(NaN)).code, 'clock_unverified');
+  assert.equal(co.checkpoint(), before); assert.equal(bridge.calls.length, 0);
+});
+test('T262 coordinator recovered queued retry retains priority across repeated restarts', async () => {
+  const { co } = boot(); const calls = [];
+  co.bridge.request = async payload => { calls.push(payload); return { outcome: 'failed', code: 'busy-fixture' }; };
+  await co.enable(grant()); co.poll(listReply([completion(2)]), T0 + 1000);
+  await co.step(T0 + 2000); const originalKey = calls[0].key;
+  co.poll(listReply([completion(1)]), T0 + 3000); let active = co;
+  for (let attempt = 2; attempt <= 3; attempt += 1) {
+    const due = active.status().nextRetryAt; await active.recover(due);
+    assert.equal(active.status().jobs[originalKey].state, 'queued');
+    active = CO.restore(active.checkpoint(), { bridge: co.bridge, tasks: tasks(), sessionId: SESSION, now: () => T0 });
+    await active.step(due);
+    assert.equal(calls.at(-1).key, originalKey); assert.equal(calls.at(-1).attempt, attempt);
+    assert.equal(calls.at(-1).taskId, 'task-1');
+  }
+  assert.equal((await active.step(T0 + 10 * MIN)).code, 'escalated'); assert.equal(calls.length, 3);
+});

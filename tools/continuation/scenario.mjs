@@ -39,9 +39,10 @@ const first = admit(store, { ...runs[0], epoch: 'epoch-A', sessionId: SESSION,
 store = first.store;
 show('1 admit run #1 (bridge up, grant ok)', store);
 const k1 = key({ ...runs[0], epoch: 'epoch-A' });
-store = lease(store, k1, T0 + 1000).store;
+const firstLease = lease(store, k1, T0 + 1000);
+store = firstLease.store;
 show('2 lease run #1 (write-ahead)', store);
-store = complete(store, k1, { outcome: 'acked', at: T0 + 2000 }).store;
+store = complete(store, k1, { outcome: 'acked', attempt: firstLease.attempt, at: T0 + 2000 }).store;
 show('3 ack run #1', store);
 
 // 2. Crash: leased, then the process disappears; recovery must escalate, not retry.
@@ -79,7 +80,7 @@ console.log('8 admit run #4 with an expired grant ->', expired.code,
 // 5. Restart: persist, rebuild from the string, and confirm nothing is lost or duplicated.
 const durable = snapshot(store);
 const revived = restore(JSON.parse(durable));
-show('9 restored from disk', revived);
+show('9 restored from provided JSON snapshot', revived);
 const dup = admit(revived, { ...runs[0], epoch: 'epoch-A', sessionId: SESSION,
   authorisation: GRANT, now: T0 + 80 * 1000, bridgeUp: true });
 console.log('10 re-admit the acknowledged run ->', dup.code,
