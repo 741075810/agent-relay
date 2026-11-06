@@ -62,6 +62,12 @@ const TERMINAL_STATUS_SOURCES = Object.freeze(['bridge.run_facts.status', 'bridg
 // terminal candidate on every round. Freezing the label at first ingest made it wrong for every run acknowledged
 // afterwards -- the live store still said `unseen` for a run the host had listed in `ackedIds`. The label therefore
 // moves forward only: a later round may raise it, never lower it, and a value outside the contract is not an upgrade.
+//
+// T270: but the label belongs to a *fact* (runId + status), not to the record. The Native Host ACKs per offered fact
+// since T268 (`ackedForms` / `pendingForms`), so a confirmation earned by a `failed` announcement says nothing about
+// the `completed` announcement that replaced it. Inside one status the label moves forward; across a status change it
+// is whatever the report said for the new status, and an absent or undefined label there means `unseen` -- never the
+// previous fact's confirmation.
 const HOST_ACK_RANK = Object.freeze({ unseen: 0, pending: 1, acked: 2 });
 
 function hostAckMerge(current, incoming) {
@@ -70,6 +76,11 @@ function hostAckMerge(current, incoming) {
   if (next === undefined) return typeof current === 'string' && current ? current : 'unseen';
   if (now === undefined) return incoming;
   return next > now ? incoming : current;
+}
+
+/** The label to store with a *new* fact: only what the report itself claimed, and `unseen` when it claimed nothing. */
+function hostAckForFact(incoming) {
+  return HOST_ACK_RANK[incoming] === undefined ? 'unseen' : incoming;
 }
 
 function loadState(dir) {
@@ -383,11 +394,12 @@ export function createRelay(config) {
           if (existing.terminalStatus !== terminalStatus) {
             // The status moved, so the instant must move with it: an instant that belonged to the previous status is
             // no longer evidence for this one. `null` means the new report had none, and unknown stays unknown.
+            // T270: the label is scoped to the fact too -- the previous status's confirmation is not this one's.
             existing.terminalStatus = terminalStatus;
             existing.statusSource = statusSource;
             existing.completedAt = incomingInstant;
             existing.completedAtSource = incomingInstant === null ? 'unknown' : incomingSource;
-            existing.hostAck = mergedAck;
+            existing.hostAck = hostAckForFact(incomingAck);
             existing.updatedAt = now();
             accepted.push({ runId, terminalStatus, duplicate: true, updated: true, seq: existing.seq });
           } else {
