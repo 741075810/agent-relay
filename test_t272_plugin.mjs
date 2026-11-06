@@ -86,7 +86,9 @@ function scene() {
   const dir = mkdtempSync(path.join(tmpdir(), 't272p-'));
   const tokenFile = path.join(dir, 'host.token');
   writeFileSync(tokenFile, TOKEN + '\n', 'utf8');
-  return { dir, tokenFile };
+  // T273 made a discoverable listener mandatory: with neither `port` nor `endpointFile` the plugin refuses to start,
+  // because a random port cannot be reached after a Desktop restart.
+  return { dir, tokenFile, endpointFile: path.join(dir, 'endpoint.json') };
 }
 
 async function health(base) {
@@ -105,7 +107,7 @@ test('T272: apply serves only the bound session and dispose releases the port', 
   const host = controller();
   const ctx = fakeCtx({ sessionController: host });
   try {
-    const dispose = apply(ctx, { tokenFile: sc.tokenFile, boundSessionIds: [SESSION] });
+    const dispose = apply(ctx, { tokenFile: sc.tokenFile, boundSessionIds: [SESSION], endpointFile: sc.endpointFile });
     assert.equal(typeof dispose, 'function', 'apply must hand back a disposer');
     const bridge = await ctx.dshDirect.ready;
     assert.ok(bridge && bridge.base, 'the bridge must be listening after apply');
@@ -153,7 +155,7 @@ test('T272: the dispose lifecycle event closes the bridge even if the disposer i
   const sc = scene();
   const ctx = fakeCtx({ sessionController: controller() });
   try {
-    apply(ctx, { tokenFile: sc.tokenFile, boundSessionIds: [SESSION] });
+    apply(ctx, { tokenFile: sc.tokenFile, boundSessionIds: [SESSION], endpointFile: sc.endpointFile });
     const bridge = await ctx.dshDirect.ready;
     assert.equal((await health(bridge.base)).status, 200);
     await ctx.emit('dispose');
@@ -168,7 +170,7 @@ test('T272: a Host without the rc.2 methods makes the plugin refuse to start', a
   const sc = scene();
   const ctx = fakeCtx({ sessionController: { listSessions() {}, getEvents() {}, prompt() {} } });
   try {
-    const dispose = apply(ctx, { tokenFile: sc.tokenFile, boundSessionIds: [SESSION] });
+    const dispose = apply(ctx, { tokenFile: sc.tokenFile, boundSessionIds: [SESSION], endpointFile: sc.endpointFile });
     assert.equal(dispose, null, 'apply must not hand back a disposer for a service it never started');
     assert.equal(openBridgeCount(), 0, 'nothing may be listening');
     const errors = ctx.logs.filter((entry) => entry[0] === 'error').map((entry) => entry[1]);
@@ -187,9 +189,11 @@ test('T272: missing token, missing binding and a short token all refuse to start
   writeFileSync(shortFile, 'too-short\n', 'utf8');
   const cases = [
     [{ boundSessionIds: [SESSION] }, /tokenFile is required/],
-    [{ tokenFile: sc.tokenFile }, /boundSessionIds is empty/],
-    [{ tokenFile: shortFile, boundSessionIds: [SESSION] }, /fewer than 32 characters/],
-    [{ tokenFile: path.join(sc.dir, 'absent.token'), boundSessionIds: [SESSION] }, /refusing to start/],
+    [{ tokenFile: sc.tokenFile, endpointFile: sc.endpointFile }, /boundSessionIds is empty/],
+    [{ tokenFile: shortFile, boundSessionIds: [SESSION], endpointFile: sc.endpointFile },
+      /fewer than 32 characters/],
+    [{ tokenFile: path.join(sc.dir, 'absent.token'), boundSessionIds: [SESSION], endpointFile: sc.endpointFile },
+      /refusing to start/],
   ];
   try {
     for (const [config, pattern] of cases) {

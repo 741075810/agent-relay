@@ -23,13 +23,43 @@ export const name = 'dsh-direct';
 // Only the Host service we actually read. `webServer` is not injected: this plugin brings its own loopback listener.
 export const inject = ['sessionController'];
 
-const DEFAULT_PORT = 0;
+const MIN_PORT = 1024;
+const MAX_PORT = 65535;
 
 function note(ctx, level, message) {
   const logger = ctx && ctx.logger;
   if (logger && typeof logger[level] === 'function') logger[level](message);
   else if (level === 'error') console.error('[dsh-direct] ' + message);
   else console.log('[dsh-direct] ' + message);
+}
+
+/**
+ * The listener has to be findable, so one of two things must be configured:
+ *   * `port`    -- a fixed loopback port the MCP side can name in `hostUrl`; or
+ *   * `endpointFile` -- a descriptor this plugin writes after binding, which the MCP side reads at call time.
+ * Neither is a valid configuration, and so is `port: 0` without a descriptor: T272 shipped exactly that, and after a
+ * Desktop restart the frozen URL pointed at a dead port while the plugin happily served a new one.
+ */
+export function describeListener(settings = {}) {
+  const hasPort = settings.port !== undefined && settings.port !== null;
+  const endpointFile = typeof settings.endpointFile === 'string' && settings.endpointFile ? settings.endpointFile : null;
+  if (!hasPort && !endpointFile) {
+    return { ok: false, reason: 'config.port or config.endpointFile is required; without one the MCP side cannot find '
+      + 'the bridge after a restart' };
+  }
+  let port = 0;
+  if (hasPort) {
+    if (settings.port === 0) {
+      return { ok: false, reason: 'config.port 0 picks a random port every start; set a fixed port or an endpointFile '
+        + 'so the MCP side can find the bridge after a restart' };
+    }
+    if (!Number.isInteger(settings.port) || settings.port < MIN_PORT || settings.port > MAX_PORT) {
+      return { ok: false, reason: 'config.port must be an integer in ' + MIN_PORT + '..' + MAX_PORT
+        + ' (a privileged or ephemeral port cannot be named in config.hostUrl)' };
+    }
+    port = settings.port;
+  }
+  return { ok: true, port, endpointFile };
 }
 
 /**
@@ -40,7 +70,7 @@ export function apply(ctx, config) {
   const settings = config || {};
   const boundSessionIds = Array.isArray(settings.boundSessionIds) ? settings.boundSessionIds.slice() : [];
   const tokenFile = typeof settings.tokenFile === 'string' ? settings.tokenFile : null;
-  const declaredPort = Number.isInteger(settings.port) ? settings.port : DEFAULT_PORT;
+  const listener = describeListener(settings);
 
   // Fail closed, in the order that produces the most useful message.
   const caps = describeCapabilities(ctx ? ctx.sessionController : undefined);
@@ -57,6 +87,10 @@ export function apply(ctx, config) {
   }
   if (!boundSessionIds.length) {
     note(ctx, 'error', 'refusing to start: config.boundSessionIds is empty, so no session could ever be prompted');
+    return null;
+  }
+  if (!listener.ok) {
+    note(ctx, 'error', 'refusing to start: ' + listener.reason);
     return null;
   }
   let token = null;
@@ -99,13 +133,16 @@ export function apply(ctx, config) {
 
   let bridge = null;
   let closed = false;
-  const ready = startHostBridge({ adapter: guarded, token, port: declaredPort }).then((started) => {
+  const ready = startHostBridge({ adapter: guarded, token, port: listener.port,
+    endpointFile: listener.endpointFile }).then((started) => {
     bridge = started;
     note(ctx, 'info', 'serving ' + started.base + ' for ' + boundSessionIds.length + ' bound session(s), protocol '
-      + String(started.protocol));
+      + String(started.protocol) + (started.endpointFile ? ', endpoint ' + started.endpointFile : ''));
     return started;
   }).catch((err) => {
-    note(ctx, 'error', 'bridge failed to start: ' + String(err && err.message));
+    // `bind_failed` is the one to look for when a fixed port is already taken: this is a rejection, not a crashed Host.
+    note(ctx, 'error', 'bridge failed to start: ' + String(err && err.code ? err.code + ': ' : '')
+      + String(err && err.message));
     return null;
   });
 
@@ -122,7 +159,8 @@ export function apply(ctx, config) {
   // merely asked to close. A host that ignores the return value still gets the teardown, just not synchronised.
   if (ctx && typeof ctx.on === 'function') ctx.on('dispose', () => dispose());
   // Exposed for a host that wants to report status; not read by anything in this package.
-  if (ctx) ctx.dshDirect = { ready, dispose, boundSessionIds: boundSessionIds.slice(), tokenFile };
+  if (ctx) ctx.dshDirect = { ready, dispose, boundSessionIds: boundSessionIds.slice(), tokenFile,
+    endpointFile: listener.endpointFile, port: listener.port };
 
   return dispose;
 }
@@ -130,10 +168,13 @@ export function apply(ctx, config) {
 /** Reported by the install check: does this Host expose what the plugin needs, and what would it bind? */
 export function inspectHost(ctx, config) {
   const settings = config || {};
+  const listener = describeListener(settings);
   return {
     name,
     capabilities: describeCapabilities(ctx ? ctx.sessionController : undefined),
     tokenFile: typeof settings.tokenFile === 'string' ? settings.tokenFile : null,
     boundSessionIds: Array.isArray(settings.boundSessionIds) ? settings.boundSessionIds.slice() : [],
+    listener: listener.ok ? { port: listener.port, endpointFile: listener.endpointFile, discoverable: true }
+      : { port: null, endpointFile: null, discoverable: false, reason: listener.reason },
   };
 }

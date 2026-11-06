@@ -44,6 +44,9 @@ async function startBridge(sceneRef, options = {}) {
 function writeConfig(sceneRef, bridge, extra = {}) {
   const config = Object.assign({
     hostUrl: bridge.base,
+    // The identity check defaults to the real `cordis_session_controller`; a suite that drives the offline fake says so
+    // on purpose, which is the only way a fake is allowed to pass.
+    expectKind: 'offline_fake',
     tokenFile: sceneRef.tokenFile,
     stateDir: path.join(sceneRef.dir, 'state'),
     boundSessionIds: [BOUND],

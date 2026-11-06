@@ -1,12 +1,10 @@
 {
-  "$comment": "dsh-direct MCP server config. Copy outside the repository, fill in real values, keep it private. Only a loopback hostUrl is accepted; the token file must hold at least 32 characters. 0.2.0-rc.2 sessions carry `cwd`, not a project id, so binding is by session id and/or cwd.",
-  "hostUrl": "http://127.0.0.1:PORT",
-  "tokenFile": "PATH_TO/host.token",
-  "stateDir": "PATH_TO/dsh-direct-state",
-  "worktreeRoot": "PATH_TO/target-checkout",
-  "allowDirtyWorktree": false,
+  "$comment": "dsh-direct MCP server config. Copy outside the repository, fill in real values, keep it private. Exactly one locator: endpointFile (preferred: the plugin writes it at bind time, so a Desktop restart does not break the client) or hostUrl (only for a plugin pinned to a fixed port). The token file must hold at least 32 characters.",
+  "endpointFile": "<USERPROFILE>/.dsh/dsh-direct/endpoint.json",
+  "tokenFile": "<USERPROFILE>/.dsh/dsh-direct/host.token",
+  "stateDir": "<USERPROFILE>/.dsh/dsh-direct/state",
   "boundSessionIds": ["session-11111111-2222-4333-8444-555566667777"],
-  "boundCwds": ["/workspace/project"],
+  "boundCwds": ["<WORKSPACE>/project"],
   "boundProjectIds": [],
   "maxPolls": 3
 }

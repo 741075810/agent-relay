@@ -1,6 +1,6 @@
 {
   "name": "dsh-direct",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Loopback session bridge: lets an external MCP client submit one prompt into a bound, existing DSH session",
   "license": "MIT",
   "type": "module",

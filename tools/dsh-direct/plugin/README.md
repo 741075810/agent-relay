@@ -23,7 +23,8 @@ sync.mjs            the copy step (idempotent; `--dry-run` reports only)
 
 `apply` returns a disposer and also registers the same teardown on the Cordis `dispose` event, so a host that ignores
 the return value still gets the socket closed. `dispose` returns a promise that resolves only after the listener is
-gone — a plugin that unloads must not leave a bound port behind.
+gone — a plugin that unloads must not leave a bound port behind, and `test_t273_plugin_config.mjs` proves it by binding
+the same port again immediately afterwards.
 
 ```js
 export const name = 'dsh-direct';
@@ -31,5 +32,19 @@ export const inject = ['sessionController'];
 export function apply(ctx, config) { /* ... */ }
 ```
 
-`inspectHost(ctx, config)` reports `capabilities`, `boundSessionIds` and `tokenFile` without binding anything, for a
-dry check before installing.
+`inspectHost(ctx, config)` reports `capabilities`, `boundSessionIds`, `tokenFile` and `listener` without binding
+anything, for a dry check before installing.
+
+## Config: the listener must be reachable
+
+| config | result |
+|---|---|
+| `endpointFile: '<path>'` | binds an OS-chosen port and writes the descriptor the MCP side reads at call time |
+| `port: 42731` | binds that fixed loopback port; the MCP side uses `hostUrl` |
+| both | fine: the descriptor records the fixed port as well |
+| neither | refused: a port nobody can address is not a deployment |
+| `port: 0` | refused by name, with the reason (`picks a random port every start`) |
+| `port` outside 1024..65535 | refused |
+| the port is taken | `bind_failed`, logged; the Host process survives and nothing is left half-open |
+
+`tokenFile` (32+ characters) and a non-empty `boundSessionIds` are required in every case.

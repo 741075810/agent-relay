@@ -33,8 +33,8 @@ function scene() {
 }
 
 function config(sc, bridge, extra = {}) {
-  const doc = Object.assign({ hostUrl: bridge.base, tokenFile: sc.tokenFile, stateDir: path.join(sc.dir, 'state'),
-    boundSessionIds: [SESSION], boundProjectIds: [], maxPolls: 3 }, extra);
+  const doc = Object.assign({ hostUrl: bridge.base, expectKind: 'offline_fake', tokenFile: sc.tokenFile,
+    stateDir: path.join(sc.dir, 'state'), boundSessionIds: [SESSION], boundProjectIds: [], maxPolls: 3 }, extra);
   writeFileSync(sc.configFile, JSON.stringify(doc, null, 2) + '\n', 'utf8');
   return doc;
 }

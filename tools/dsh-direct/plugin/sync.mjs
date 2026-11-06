@@ -13,7 +13,8 @@ import { copyFileSync, existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const SYNCED = Object.freeze(['protocol.mjs', 'session_api.mjs', 'adapters.mjs', 'host_bridge.mjs']);
+export const SYNCED = Object.freeze(['protocol.mjs', 'session_api.mjs', 'endpoint.mjs', 'adapters.mjs',
+  'host_bridge.mjs']);
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const sourceDir = path.resolve(here, '..');

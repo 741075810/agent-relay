@@ -13,11 +13,12 @@
 // an adapter without the rc.2 methods answers 503 `host_capability_missing` instead of half-working. An unanswered
 // Host call answers 504 `host_unanswered` -- the client must not read that as "the prompt was rejected".
 
-import { timingSafeEqual } from 'node:crypto';
+import { timingSafeEqual, randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
 import { readFileSync } from 'node:fs';
 
 import { CODES, DirectError } from './protocol.mjs';
+import { buildEndpoint, removeEndpointFile, writeEndpointFile } from './endpoint.mjs';
 import { createSessionControllerAdapter } from './adapters.mjs';
 
 const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
@@ -89,8 +90,13 @@ async function body(req, limitBytes = 1 << 20) {
 /**
  * Start the bridge. `adapter` is either the rc.2 adapter or the offline fake; the bridge records which, and reports it
  * on `/health` and in every successful response's `host` field, so a receipt can never confuse the two.
+ *
+ * `endpointFile` (optional) makes the chosen port discoverable: a plugin that lets the OS pick a port cannot be
+ * addressed by a frozen `hostUrl`, so it writes a descriptor the MCP side reads at call time. `endpointId` is echoed by
+ * `/health` so a stale descriptor pointing at somebody else's port is caught before a prompt is sent.
  */
-export function startHostBridge({ adapter, token, port = 0, host = '127.0.0.1' }) {
+export function startHostBridge({ adapter, token, port = 0, host = '127.0.0.1', endpointFile = null,
+  endpointId = null } = {}) {
   if (!LOOPBACK.has(host)) {
     throw new DirectError(CODES.internal, 'the Host bridge may only bind loopback', { host });
   }
@@ -102,6 +108,9 @@ export function startHostBridge({ adapter, token, port = 0, host = '127.0.0.1' }
     : createSessionControllerAdapter(adapter, { kind: (adapter && adapter.kind) || 'wrapped_controller' });
   const name = typeof target.kind === 'string' ? target.kind : 'unknown';
   const protocol = typeof target.protocol === 'string' ? target.protocol : null;
+  // Decided before the request handler is built: `/health` must echo the id the descriptor file carries, otherwise the
+  // staleness check the MCP side relies on would compare against null and pass for any bridge.
+  const id = typeof endpointId === 'string' && endpointId ? endpointId : randomUUID();
   const server = createServer(async (req, res) => {
     const peer = req.socket.remoteAddress;
     if (!LOOPBACK.has(peer)) {
@@ -110,7 +119,8 @@ export function startHostBridge({ adapter, token, port = 0, host = '127.0.0.1' }
     const url = new URL(req.url, 'http://127.0.0.1');
     if (url.pathname === '/health') {
       const caps = typeof target.capabilities === 'function' ? target.capabilities() : null;
-      return json(res, 200, { ok: true, kind: name, protocol, capabilities: caps, loopbackOnly: true });
+      return json(res, 200, { ok: true, kind: name, protocol, capabilities: caps, loopbackOnly: true,
+        endpointId: id });
     }
     const presented = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
     if (!tokenMatches(token, presented)) {
@@ -167,7 +177,7 @@ export function startHostBridge({ adapter, token, port = 0, host = '127.0.0.1' }
       return refusal(res, err);
     }
   });
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     // Track every accepted socket. `server.close()` alone waits for keep-alive sockets to drain, and a client that
     // died mid-request can leave one behind -- which keeps the listener alive and, in a test process, keeps it from
     // exiting. Destroying tracked sockets makes `close()` mean "closed", not "asked to close".
@@ -185,15 +195,41 @@ export function startHostBridge({ adapter, token, port = 0, host = '127.0.0.1' }
     server.on('close', () => {
       OPEN.delete(server);
     });
+    // A fixed port is the only way the MCP side can be handed a URL that survives a restart, and a fixed port collides.
+    // Before T273 `EADDRINUSE` was an unhandled 'error' event: the throw escaped `listen`, and inside the Desktop that is
+    // a dead Host process. It must be a rejection the plugin can log and fail closed on.
+    server.on('error', (err) => {
+      OPEN.delete(server);
+      destroyAll();
+      reject(new DirectError(CODES.bind_failed, 'the Host bridge could not bind ' + host + ':' + port,
+        { host, port, reason: err && err.code ? err.code : 'listen_failed' }));
+    });
     OPEN.add(server);
     server.listen(port, host, () => {
       const address = server.address();
+      const boundPort = address.port;
+      if (endpointFile) {
+        try {
+          writeEndpointFile(endpointFile, buildEndpoint({ host, port: boundPort, kind: name, protocol, endpointId: id,
+            tokenFile: null }));
+        } catch (err) {
+          // A descriptor the MCP side cannot read is a bridge nobody can find: close and report instead of serving.
+          try { server.close(); } catch { /* already closing */ }
+          OPEN.delete(server);
+          destroyAll();
+          reject(new DirectError(CODES.bind_failed, 'the Host bridge bound but could not publish its endpoint file',
+            { host, port: boundPort, endpointFile, reason: err && err.code ? err.code : 'write_failed' }));
+          return;
+        }
+      }
       resolve({
-        base: 'http://' + host + ':' + address.port,
+        base: 'http://' + host + ':' + boundPort,
         host,
-        port: address.port,
+        port: boundPort,
         kind: name,
         protocol,
+        endpointId: id,
+        endpointFile,
         listening: () => server.listening,
         // Resolves when the listener is gone. `server.listening` flips to false the instant close() is called, while
         // the handle survives until every connection ends -- and a client that died mid-request can leave one behind.
@@ -202,6 +238,7 @@ export function startHostBridge({ adapter, token, port = 0, host = '127.0.0.1' }
         close: () => {
           if (closed) return Promise.resolve();
           closed = true;
+          if (endpointFile) removeEndpointFile(endpointFile, id);
           return new Promise((done) => {
             let settled = false;
             const finish = () => {

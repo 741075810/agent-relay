@@ -18,6 +18,11 @@ export const CODES = Object.freeze({
   not_bound: 'not_bound',
   session_not_found: 'session_not_found',
   project_mismatch: 'project_mismatch',
+  // the port answered, but it is not the bridge we expect there (stale endpoint file, or another local program);
+  // nothing was sent, so this is a refusal and never a reason to keep the session locked
+  host_identity_mismatch: 'host_identity_mismatch',
+  // the plugin could not bind its loopback port at all (EADDRINUSE); also nothing sent
+  bind_failed: 'bind_failed',
   // lifecycle
   request_conflict: 'request_conflict',
   session_busy: 'session_busy',

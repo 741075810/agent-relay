@@ -37,7 +37,8 @@ async function bridgeFor(sc, options = {}) {
 }
 
 function config(sc, bridge, extra = {}) {
-  const doc = Object.assign({ hostUrl: bridge ? bridge.base : 'http://127.0.0.1:9', tokenFile: sc.tokenFile,
+  const doc = Object.assign({ hostUrl: bridge ? bridge.base : 'http://127.0.0.1:65123', expectKind: 'offline_fake',
+    tokenFile: sc.tokenFile,
     stateDir: path.join(sc.dir, 'state'), boundSessionIds: [SESSION], boundProjectIds: ['prj-alpha'],
     maxPolls: 3 }, extra);
   writeFileSync(sc.configFile, JSON.stringify(doc, null, 2) + '\n', 'utf8');
@@ -144,7 +145,9 @@ test('T271: an adapter over a complete session-controller works through the brid
   const adapter = createSessionControllerAdapter(controller);
   assert.deepEqual(adapter.capabilities().missing, []);
   const bridge = await startHostBridge({ adapter, token: TOKEN });
-  config(sc, bridge);
+  // This bridge wraps a controller in the real adapter, so it reports `cordis_session_controller`; the suite default
+  // declares the offline fake, which is the wrong expectation for this one case.
+  config(sc, bridge, { expectKind: 'cordis_session_controller' });
   const srv = server(sc.configFile);
   try {
     const answer = await call(srv, 'submit_task', { requestId: 't271-adapt-0001', sessionId: SESSION,
@@ -261,8 +264,9 @@ test('T272: a prompt that gets no answer stays unsettled and keeps the session l
   const flaky = createServer((req, res) => {
     if (req.url === '/health') {
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, kind: 'offline_partial', capabilities: { missing: [], available: [],
-        required: [] }, loopbackOnly: true }));
+      res.end(JSON.stringify({ ok: true, kind: 'offline_partial',
+        protocol: 'dsh-api-session-controller@0.2.0-rc.2', capabilities: { missing: [], available: [],
+          required: [] }, loopbackOnly: true }));
       return;
     }
     if (req.url === '/sessions') {
@@ -276,7 +280,9 @@ test('T272: a prompt that gets no answer stays unsettled and keeps the session l
   });
   await new Promise((resolve) => flaky.listen(0, '127.0.0.1', resolve));
   const base = 'http://127.0.0.1:' + flaky.address().port;
-  config(sc, { base });
+  // The identity check runs before the prompt, so the expectation has to match what this Host calls itself; the point
+  // of the test is what happens after a successful identity check and a dropped /prompt.
+  config(sc, { base }, { expectKind: 'offline_partial' });
   const srv = server(sc.configFile);
   try {
     const first = await call(srv, 'submit_task', { requestId: 't272-flaky-0001', sessionId: SESSION, prompt: 'one' });

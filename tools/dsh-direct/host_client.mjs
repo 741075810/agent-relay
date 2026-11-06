@@ -1,16 +1,23 @@
 // DSH Direct: the client the MCP server uses to reach the loopback Host bridge.
 //
-// The token is read from a file at call time (never from argv, so it does not land in a process list), and a
-// non-loopback base URL is refused. The important part of this file is the status mapping:
+// Two things matter here and neither is the HTTP plumbing.
 //
-//   401 -> unauthenticated            504 -> host_unanswered  (the Host never answered: outcome unknown)
-//   409 -> the Host said no           5xx -> host_error       (also unknown: we cannot read the reason)
+// 1. **Where the bridge is.** A plugin that lets the OS pick a port cannot be reached through a frozen URL: after every
+//    Desktop restart the old port is dead and the first submit answers 504, which the MCP server must treat as "unknown",
+//    leaving the task `unsettled` and the session locked. So the client can be given `endpointFile` and re-reads it on
+//    each resolve, which lets a long-lived MCP server follow a restarted Desktop.
 //
-// `host_unanswered` is deliberately *not* folded into a failure: the MCP server turns it into `unsettled`.
+// 2. **Whether the port is ours.** `/health` is unauthenticated and any local program can answer 200 on a port the file
+//    still names. Identity (kind, protocol, and the per-bind endpointId) is therefore verified before the first request,
+//    and a mismatch is a *refusal*: nothing was sent, so no session may stay locked.
+//
+// Status mapping: 401 -> unauthenticated, 409/4xx -> the Host said no, 504 -> host_unreachable (the Host never answered,
+// outcome unknown), 5xx -> host_error (also unknown: we cannot read the reason). Only 504/5xx become `unsettled`.
 
 import { readFileSync } from 'node:fs';
 
 import { CODES, DirectError, fail } from './protocol.mjs';
+import { assertHealthIdentity, resolveEndpoint, sameEndpointIdentity } from './endpoint.mjs';
 
 const LOOPBACK_BASE = /^http:\/\/(127\.0\.0\.1|\[::1\]):\d{1,5}$/;
 
@@ -22,20 +29,42 @@ const STATUS_CODES = Object.freeze({
 });
 
 export class HostClient {
-  constructor({ baseUrl, tokenFile, timeoutMs = 0, kind = 'host_bridge' } = {}) {
-    if (typeof baseUrl !== 'string' || !LOOPBACK_BASE.test(baseUrl)) {
-      fail(CODES.invalid_arguments, 'the Host base URL must be loopback http', { baseUrl });
-    }
+  /**
+   * Exactly one locator: `baseUrl` (a fixed port pinned by the operator) or `endpointFile` (a plugin that may rebind).
+   * `expectKind`/`expectProtocol` default to the real 0.2.0-rc.2 values; a test that uses the offline fake must say so
+   * explicitly, so a fake can never pass for a live Host by accident.
+   */
+  constructor({ baseUrl = null, endpointFile = null, tokenFile, timeoutMs = 0, kind = 'host_bridge',
+    expectKind = null, expectProtocol = null } = {}) {
     if (typeof tokenFile !== 'string' || !tokenFile) {
       fail(CODES.invalid_arguments, 'a token file is required', { field: 'tokenFile' });
     }
-    this.baseUrl = baseUrl.replace(/\/+$/, '');
+    if (!baseUrl && !endpointFile) {
+      fail(CODES.invalid_arguments, 'the client needs config.hostUrl or config.endpointFile', {});
+    }
+    const initial = resolveEndpoint({ hostUrl: baseUrl, endpointFile });
+    this.locator = endpointFile ? { endpointFile } : { hostUrl: baseUrl };
+    this.expected = { kind: expectKind || null, protocol: expectProtocol || null };
     this.tokenFile = tokenFile;
     // 0 means "no client-side deadline". A deadline here would manufacture the very ambiguity this module exists to
     // avoid: we cannot tell an accepted-then-slow prompt from a rejected one.
     this.timeoutMs = timeoutMs;
     this.kind = kind;
     this.protocol = null;
+    this.endpoint = initial;
+    this.baseUrl = initial.base.replace(/\/+$/, '');
+    this.verified = false;
+  }
+
+  /** Re-read the locator. A restarted Desktop writes a new descriptor; the old base is not reused. */
+  refresh() {
+    const next = resolveEndpoint(this.locator);
+    if (!sameEndpointIdentity(this.endpoint, next)) {
+      this.endpoint = next;
+      this.baseUrl = next.base.replace(/\/+$/, '');
+      this.verified = false;
+    }
+    return next;
   }
 
   #token() {
@@ -49,9 +78,50 @@ export class HostClient {
     return raw;
   }
 
-  async #request(method, pathname, payload) {
+  #abort() {
     const controller = this.timeoutMs > 0 ? new AbortController() : null;
     const timer = controller ? setTimeout(() => controller.abort(), this.timeoutMs) : null;
+    return { signal: controller ? controller.signal : undefined, clear: () => { if (timer) clearTimeout(timer); } };
+  }
+
+  /** Unauthenticated, and the only request allowed before identity is established for the current endpoint. */
+  async #probeHealth() {
+    const { signal, clear } = this.#abort();
+    let response = null;
+    try {
+      response = await fetch(this.baseUrl + '/health', { method: 'GET', signal });
+    } catch (err) {
+      fail(CODES.host_unreachable, 'the Host bridge did not answer', { pathname: '/health',
+        reason: err && err.name === 'AbortError' ? 'timeout' : String(err && err.message) });
+    } finally {
+      clear();
+    }
+    let body = null;
+    try {
+      body = await response.json();
+    } catch {
+      fail(CODES.host_identity_mismatch, 'the endpoint answered /health with something that is not JSON',
+        { status: response.status });
+    }
+    return body;
+  }
+
+  async #verify() {
+    if (this.verified) return;
+    const health = await this.#probeHealth();
+    assertHealthIdentity(health, { kind: this.expected.kind, protocol: this.expected.protocol,
+      endpointId: this.endpoint.endpointId });
+    if (typeof health.kind === 'string') this.kind = health.kind;
+    if (typeof health.protocol === 'string') this.protocol = health.protocol;
+    this.verified = true;
+  }
+
+  async #request(method, pathname, payload) {
+    // Re-resolve first: the Desktop may have restarted since the last call, and the descriptor is the only thing that
+    // knows the new port. An unchanged descriptor keeps the verification we already paid for.
+    this.refresh();
+    await this.#verify();
+    const { signal, clear } = this.#abort();
     let response = null;
     try {
       response = await fetch(this.baseUrl + pathname, {
@@ -59,13 +129,13 @@ export class HostClient {
         headers: Object.assign({ authorization: 'Bearer ' + this.#token() },
           payload === undefined ? {} : { 'content-type': 'application/json' }),
         body: payload === undefined ? undefined : JSON.stringify(payload),
-        signal: controller ? controller.signal : undefined,
+        signal,
       });
     } catch (err) {
       fail(CODES.host_unreachable, 'the Host bridge did not answer', { pathname,
         reason: err && err.name === 'AbortError' ? 'timeout' : String(err && err.message) });
     } finally {
-      if (timer) clearTimeout(timer);
+      clear();
     }
     let body = null;
     try {
@@ -120,8 +190,11 @@ export class HostClient {
     return body.admission || { found: false, seq: null, eventType: null };
   }
 
+  /** Verified identity report, for the tool surface and for the preflight. */
   async health() {
-    return this.#request('GET', '/health');
+    this.refresh();
+    const body = await this.#probeHealth();
+    return body;
   }
 }
 

@@ -29,24 +29,50 @@ import { precheckWorktree } from './worktree.mjs';
 /** Codes that mean "the Host answered, and the answer was no". Everything else is an unanswered call. */
 const REFUSAL_CODES = new Set([CODES.host_refused, CODES.session_busy, CODES.session_writer_held,
   CODES.session_not_found, CODES.invalid_arguments, CODES.unauthenticated, CODES.not_bound,
-  CODES.project_mismatch, CODES.host_capability_missing]);
+  CODES.project_mismatch, CODES.host_capability_missing, CODES.host_identity_mismatch, CODES.bind_failed]);
 const DEFAULT_MAX_POLLS = 3;
+
+/**
+ * The keys `loadConfig` understands. Exported so the preflight can prove that `config.example.json` and the install
+ * document only mention fields this server actually reads -- a doc that teaches a field nobody implements is the same
+ * class of defect as a frozen port nobody can reach.
+ */
+export const CONFIG_FIELDS = Object.freeze(['hostUrl', 'endpointFile', 'tokenFile', 'stateDir', 'worktreeRoot',
+  'allowDirtyWorktree', 'expectKind', 'expectProtocol', 'boundProjectIds', 'boundSessionIds', 'boundCwds',
+  'maxPolls']);
 
 export function loadConfig(configPath) {
   const raw = JSON.parse(readFileSync(configPath, 'utf8'));
   const config = {
     hostUrl: raw.hostUrl,
+    endpointFile: raw.endpointFile,
     tokenFile: raw.tokenFile,
     stateDir: raw.stateDir,
     worktreeRoot: raw.worktreeRoot || null,
     allowDirtyWorktree: raw.allowDirtyWorktree === true,
+    expectKind: typeof raw.expectKind === 'string' ? raw.expectKind : null,
+    expectProtocol: typeof raw.expectProtocol === 'string' ? raw.expectProtocol : null,
     boundProjectIds: Array.isArray(raw.boundProjectIds) ? raw.boundProjectIds.slice() : [],
     boundSessionIds: Array.isArray(raw.boundSessionIds) ? raw.boundSessionIds.slice() : [],
     boundCwds: Array.isArray(raw.boundCwds) ? raw.boundCwds.slice() : [],
     maxPolls: Number.isFinite(raw.maxPolls) ? raw.maxPolls : DEFAULT_MAX_POLLS,
   };
-  if (typeof config.hostUrl !== 'string' || !/^http:\/\/(127\.0\.0\.1|\[::1\]):\d{1,5}$/.test(config.hostUrl)) {
+  // Exactly one locator. A plugin that binds `port: 0` cannot be addressed by a frozen URL, so `endpointFile` is the
+  // supported shape there; a pinned port uses `hostUrl`. Both at once means the caller cannot say which wins.
+  const wantsUrl = typeof config.hostUrl === 'string' && config.hostUrl !== '';
+  const wantsFile = typeof config.endpointFile === 'string' && config.endpointFile !== '';
+  if (wantsUrl && wantsFile) {
+    fail(CODES.invalid_arguments, 'config.hostUrl and config.endpointFile are mutually exclusive',
+      { hostUrl: config.hostUrl, endpointFile: config.endpointFile });
+  }
+  if (!wantsUrl && !wantsFile) {
+    fail(CODES.invalid_arguments, 'config.hostUrl or config.endpointFile is required', {});
+  }
+  if (wantsUrl && !/^http:\/\/(127\.0\.0\.1|\[::1\]):\d{1,5}$/.test(config.hostUrl)) {
     fail(CODES.invalid_arguments, 'config.hostUrl must be a loopback http URL', { hostUrl: config.hostUrl });
+  }
+  if (config.endpointFile !== undefined && config.endpointFile !== null && !wantsFile) {
+    fail(CODES.invalid_arguments, 'config.endpointFile must be a non-empty path', { endpointFile: config.endpointFile });
   }
   for (const key of ['tokenFile', 'stateDir']) {
     if (typeof config[key] !== 'string' || !config[key]) {
@@ -72,7 +98,9 @@ export function assertBound(config, session) {
 export class DirectServer {
   constructor(config, { client, store, worktree = precheckWorktree } = {}) {
     this.config = config;
-    this.client = client || new HostClient({ baseUrl: config.hostUrl, tokenFile: config.tokenFile });
+    this.client = client || new HostClient({ baseUrl: config.hostUrl || null,
+      endpointFile: config.endpointFile || null, tokenFile: config.tokenFile,
+      expectKind: config.expectKind, expectProtocol: config.expectProtocol });
     this.store = store || new TaskStore(config.stateDir);
     this.worktree = worktree;
   }
