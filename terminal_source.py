@@ -1245,6 +1245,50 @@ def sample(state_dir, root=None, bridge_db=None, origin_fixture=None,
 MIRROR_SOURCE = 'native_host.terminal-mirror'
 
 
+def ack_forms_by_run(acked_forms, pending_forms):
+    """Which facts the sampler journal holds per run: `{runId: {status, ...}}`.
+
+    T270: `ackedIds` cannot answer "was *this* announcement consumed", because a run that was
+    announced `failed`, acknowledged, and later really completed has one bare id and two
+    facts. `ackedForms`/`pendingForms` are the journal that can, and any run present there is
+    answered from it alone.
+    """
+    seen = {}
+    for form in list(acked_forms or []) + list(pending_forms or []):
+        if not isinstance(form, str) or '|' not in form:
+            continue
+        run_id, status = form.split('|', 1)
+        seen.setdefault(run_id, set()).add(status)
+    return seen
+
+
+def ack_label(run_id, status, acked, pending, acked_forms, pending_forms):
+    """The host's own label for one *fact* (`acked` / `pending` / `unseen`).
+
+    T270: a confirmation belongs to the announcement it confirmed. A run whose `failed`
+    announcement was acknowledged and which has since completed must be reported `unseen` for
+    the completion -- otherwise the corrected outcome goes out already marked as consumed and
+    the service stores a completion nobody has been told about as `completed` + `acked`.
+
+    A run with no journal entry at all falls back to the bare id sets: that is a state file
+    from before the per-fact journal, and its single bare ack is the only record there is.
+    Anything else would turn an upgraded install's genuine ACK into `unseen`.
+    """
+    if status_key(run_id, status) in set(acked_forms or ()):
+        return 'acked'
+    if status_key(run_id, status) in set(pending_forms or ()):
+        return 'pending'
+    if run_id in ack_forms_by_run(acked_forms, pending_forms):
+        # Journalled per fact, and this fact is not among them: whatever was consumed belongs
+        # to a different announcement about this run.
+        return 'unseen'
+    if run_id in acked:
+        return 'acked'
+    if run_id in pending:
+        return 'pending'
+    return 'unseen'
+
+
 def mirror(state_dir, root=None, bridge_db=None, origin_fixture=None):
     """T203: read-only mirror of the terminal candidates, with the status the host resolved.
 
@@ -1287,6 +1331,8 @@ def mirror(state_dir, root=None, bridge_db=None, origin_fixture=None):
     times, times_error = run_origin.read_terminal_times(bridge_db)
     acked = set(state.get('ackedIds') or [])
     pending = set(state.get('pendingIds') or [])
+    acked_forms = list(state.get('ackedForms') or [])
+    pending_forms = list(state.get('pendingForms') or [])
     chosen = {}
     for run in runs:
         run_id = run.get('requestID')
@@ -1306,7 +1352,7 @@ def mirror(state_dir, root=None, bridge_db=None, origin_fixture=None):
             'status': status,
             'startedAt': int(run.get('createdAt') or 0) // 1000,
             'origin': run_origin.origin_for(run_id, origin),
-            'hostAck': 'acked' if run_id in acked else ('pending' if run_id in pending else 'unseen'),
+            'hostAck': ack_label(run_id, status, acked, pending, acked_forms, pending_forms),
             'statusSource': 'bridge.run_facts.status' if fact else 'bridge_ledger.status',
             # `None` is a statement, not a gap: this run has no terminal event, so when it finished is unknown and
             # nothing downstream may compute it from `startedAt`.
