@@ -1,0 +1,11 @@
+{
+  "$comment": "dsh-direct MCP server config. Copy outside the repository, fill in real values, keep it private. Only loopback hostUrl is accepted; the token file must hold at least 32 characters.",
+  "hostUrl": "http://127.0.0.1:PORT",
+  "tokenFile": "PATH_TO/host.token",
+  "stateDir": "PATH_TO/dsh-direct-state",
+  "worktreeRoot": "PATH_TO/target-checkout",
+  "allowDirtyWorktree": false,
+  "boundProjectIds": ["prj-alpha"],
+  "boundSessionIds": ["session-11111111-2222-4333-8444-555566667777"],
+  "maxPolls": 3
+}
