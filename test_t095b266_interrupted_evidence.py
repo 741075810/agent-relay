@@ -97,7 +97,7 @@ class MirrorReportsIt(unittest.TestCase):
         with open(self.ledger, 'w', encoding='utf-8') as handle:
             json.dump([{
                 'requestID': RUN, 'createdAt': OLD_START_MS, 'status': 'completed',
-                'turn': 4, 'sessionID': 'session-644cd4ce-7fe7-432e-b48e-33eef537214b',
+                'turn': 4, 'sessionID': 'session-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
             }], handle)
 
     def report(self):
