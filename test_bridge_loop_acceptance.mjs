@@ -14,6 +14,7 @@ import { judgeRecord } from './tools/continuation/bridge_loop_acceptance.mjs';
 const SESSION = 'session-11111111-1111-4111-8111-111111111111';
 const RUN = '0266f468-20c6-458e-9da4-07e172efbb75';
 const TASK = 'tsk-15e55a61-6197-4ebc-8a04-e613066982fc';
+const EPOCH = '11111111-1111-4111-8111-111111111111';
 
 function round(over = {}) {
   const base = {
@@ -27,25 +28,26 @@ function round(over = {}) {
       taskCompleted: { observed: true, source: 'bridge_ledger', at: '2026-11-02T10:30:00Z',
         status: 'completed', taskId: TASK, runId: RUN },
       extensionSubmitted: { observed: true, source: 'extension_diagnostic', at: '2026-11-02T10:30:05Z',
-        runId: RUN, status: 'submitted' },
+        runId: RUN, status: 'submitted', bindingEpoch: EPOCH },
       noticeVisible: { observed: true, source: 'chatgpt_visible_message', at: '2026-11-02T10:30:30Z',
         messageId: 'msg-777', conversationId: 'conv-55', runId: RUN },
       reviewed: { observed: true, source: 'chatgpt_review', at: '2026-11-02T10:35:00Z',
-        reviewId: 'rev-1', taskId: TASK, runId: RUN },
+        reviewId: 'rev-1', taskId: TASK, runId: RUN, messageId: 'msg-777', conversationId: 'conv-55' },
       redispatched: { observed: true, source: 'bridge_ledger', at: '2026-11-02T10:36:00Z',
-        taskId: 'tsk-192-next' },
+        taskId: 'tsk-192-next', reviewId: 'rev-1' },
     },
   };
   return { ...base, ...over, states: { ...base.states, ...(over.states || {}) } };
 }
 
-const judge = (rounds, extra = {}) => judgeRecord({ providerSessionId: SESSION, rounds, ...extra });
+const judge = (rounds, extra = {}) => judgeRecord({ providerSessionId: SESSION, conversationId: 'conv-55', bindingEpoch: EPOCH, rounds, ...extra });
 const withStage = (stage, patch) => round({ states: { [stage]: { ...round().states[stage], ...patch } } });
 
 test('T191: a fully credentialed unattended round passes', () => {
   const report = judge([round()]);
   assert.equal(report.verdict, 'PASS', JSON.stringify(report.rounds[0]));
-  assert.equal(report.unattended, true);
+  assert.equal(report.recordSupportsUnattended, true);
+  assert.equal(report.unattended, null);
 });
 
 test('T191: a failed completion never passes, even when everything else is credited', () => {
@@ -77,7 +79,9 @@ test('T191: arrival must name a message, a conversation and the run', () => {
 });
 
 test('T191: an arrival bound by event id instead of run id is accepted', () => {
-  const report = judge([withStage('noticeVisible', { runId: undefined, eventId: 'evt-9' })]);
+  const candidate = withStage('noticeVisible', { runId: undefined, eventId: 'evt-9' });
+  candidate.states.extensionSubmitted.eventId = 'evt-9';
+  const report = judge([candidate]);
   assert.equal(report.verdict, 'PASS', JSON.stringify(report.rounds[0]));
 });
 
@@ -94,7 +98,10 @@ test('T191: a review must name itself and the task/run it reviewed', () => {
   assert.equal(wrongRun.verdict, 'FAIL');
   assert.match(wrongRun.rounds[0].problems.join(','), /reviewed:run_mismatch\(run-other\)/);
 
-  const viaTurn = judge([withStage('reviewed', { reviewId: undefined, turnId: 'turn-4' })]);
+  const turnCandidate = withStage('reviewed', { reviewId: undefined, turnId: 'turn-4' });
+  turnCandidate.states.redispatched.reviewId = undefined;
+  turnCandidate.states.redispatched.reviewTurnId = 'turn-4';
+  const viaTurn = judge([turnCandidate]);
   assert.equal(viaTurn.verdict, 'PASS');
 });
 
@@ -133,7 +140,7 @@ test('T191: a legacy record without the new credentials is UNKNOWN, not quietly 
       noticeVisible: { observed: true, source: 'chatgpt_operator_confirmation', at: '2026-11-02T10:30:30Z' },
       reviewed: { observed: true, source: 'chatgpt_review', at: '2026-11-02T10:35:00Z' },
       redispatched: { observed: true, source: 'bridge_ledger', at: '2026-11-02T10:36:00Z',
-        taskId: 'tsk-192-next' },
+        taskId: 'tsk-192-next', reviewId: 'rev-1' },
     },
   });
   const report = judge([legacy]);
@@ -192,13 +199,13 @@ test('T191: four rounds pass -- three is a sample size, not a cap', () => {
       taskCompleted: { observed: true, source: 'bridge_ledger', at: `2026-11-02T1${i}:30:00Z`,
         status: 'completed', taskId: `tsk-${n}`, runId: `run-${n}` },
       extensionSubmitted: { observed: true, source: 'extension_diagnostic', at: `2026-11-02T1${i}:30:05Z`,
-        runId: `run-${n}` },
+        runId: `run-${n}`, status: 'submitted', bindingEpoch: EPOCH },
       noticeVisible: { observed: true, source: 'chatgpt_conversation_message',
         at: `2026-11-02T1${i}:30:30Z`, messageId: `msg-${n}`, conversationId: 'conv-55', runId: `run-${n}` },
       reviewed: { observed: true, source: 'chatgpt_review', at: `2026-11-02T1${i}:35:00Z`,
-        reviewId: `rev-${n}`, taskId: `tsk-${n}`, runId: `run-${n}` },
+        reviewId: `rev-${n}`, taskId: `tsk-${n}`, runId: `run-${n}`, messageId: `msg-${n}`, conversationId: 'conv-55' },
       redispatched: { observed: true, source: 'bridge_ledger', at: `2026-11-02T1${i}:36:00Z`,
-        taskId: `tsk-${n + 1}` },
+        taskId: `tsk-${n + 1}`, reviewId: `rev-${n}` },
     },
   }));
   const report = judge(rounds);
@@ -213,12 +220,12 @@ test('T248: the final redispatch cannot reuse any task already completed in the 
     states: {
       taskCompleted: { observed: true, source: 'bridge_ledger', at: `2026-11-02T1${i}:30:00Z`,
         status: 'completed', taskId: `tsk-${n}`, runId: `run-${n}` },
-      extensionSubmitted: { observed: true, source: 'extension_diagnostic', at: `2026-11-02T1${i}:30:05Z`, runId: `run-${n}` },
+      extensionSubmitted: { observed: true, source: 'extension_diagnostic', at: `2026-11-02T1${i}:30:05Z`, runId: `run-${n}`, status: 'submitted', bindingEpoch: EPOCH },
       noticeVisible: { observed: true, source: 'chatgpt_conversation_message', at: `2026-11-02T1${i}:30:30Z`,
         messageId: `msg-${n}`, conversationId: 'conv-55', runId: `run-${n}` },
       reviewed: { observed: true, source: 'chatgpt_review', at: `2026-11-02T1${i}:35:00Z`,
-        reviewId: `rev-${n}`, taskId: `tsk-${n}`, runId: `run-${n}` },
-      redispatched: { observed: true, source: 'bridge_ledger', at: `2026-11-02T1${i}:36:00Z`, taskId: `tsk-${n + 1}` },
+        reviewId: `rev-${n}`, taskId: `tsk-${n}`, runId: `run-${n}`, messageId: `msg-${n}`, conversationId: 'conv-55' },
+      redispatched: { observed: true, source: 'bridge_ledger', at: `2026-11-02T1${i}:36:00Z`, taskId: `tsk-${n + 1}`, reviewId: `rev-${n}` },
     },
   }));
   assert.equal(judge(rounds).verdict, 'PASS', 'a genuinely new final task remains accepted');
@@ -234,7 +241,7 @@ test('T248: the final redispatch cannot reuse any task already completed in the 
 
 test('T248: one notice and one review cannot be credited to two rounds', () => {
   const first = round({ states: { redispatched: { observed: true, source: 'bridge_ledger',
-    at: '2026-11-02T10:36:00Z', taskId: 'tsk-192' } } });
+    at: '2026-11-02T10:36:00Z', taskId: 'tsk-192', reviewId: 'rev-1' } } });
   const secondRound = (notice = {}, review = {}) => round({
     round: 192, runId: 'run-192', taskId: 'tsk-192',
     startedAt: '2026-11-02T11:00:00Z', completedAt: '2026-11-02T11:30:00Z',
@@ -242,12 +249,12 @@ test('T248: one notice and one review cannot be credited to two rounds', () => {
       taskCompleted: { observed: true, source: 'bridge_ledger', at: '2026-11-02T11:30:00Z',
         status: 'completed', taskId: 'tsk-192', runId: 'run-192' },
       extensionSubmitted: { observed: true, source: 'extension_diagnostic', at: '2026-11-02T11:30:05Z',
-        runId: 'run-192' },
+        runId: 'run-192', status: 'submitted', bindingEpoch: EPOCH },
       noticeVisible: { observed: true, source: 'chatgpt_conversation_message', at: '2026-11-02T11:30:30Z',
         messageId: 'msg-192', conversationId: 'conv-55', runId: 'run-192', ...notice },
       reviewed: { observed: true, source: 'chatgpt_review', at: '2026-11-02T11:35:00Z',
-        reviewId: 'rev-192', taskId: 'tsk-192', runId: 'run-192', ...review },
-      redispatched: { observed: true, source: 'bridge_ledger', at: '2026-11-02T11:36:00Z', taskId: 'tsk-193' },
+        reviewId: 'rev-192', taskId: 'tsk-192', runId: 'run-192', messageId: 'msg-192', conversationId: 'conv-55', ...review },
+      redispatched: { observed: true, source: 'bridge_ledger', at: '2026-11-02T11:36:00Z', taskId: 'tsk-193', reviewId: 'rev-192' },
     },
   });
 
@@ -270,9 +277,173 @@ test('T248: one notice and one review cannot be credited to two rounds', () => {
     ['duplicate_notice:msg-777', 'duplicate_review:rev-1']);
 });
 
+// T261: expanded offline contract; all IDs and source labels below are fabricated test inputs.
+for (const [status, verdict] of [['blocked', 'FAIL'], ['refused', 'FAIL'], ['stopped', 'FAIL'],
+  ['unconfirmed', 'UNKNOWN'], ['ambiguous', 'UNKNOWN'], ['UNKNOWN', 'UNKNOWN'], [undefined, 'UNKNOWN']]) {
+  test(`T261 sender status ${status} is ${verdict}`, () => {
+    const report = judge([withStage('extensionSubmitted', { status })]);
+    assert.equal(report.verdict, verdict);
+    assert.equal(report.rounds[0].stages.extensionSubmitted, verdict);
+    assert.equal(report.unattended, null);
+  });
+}
+for (const reason of ['binding_invalidated', 'binding_changed', 'grant_expired']) {
+  test(`T261 submitted cannot hide ${reason}`, () => {
+    const report = judge([withStage('extensionSubmitted', { reason })]);
+    assert.equal(report.verdict, 'FAIL');
+    assert.ok(report.rounds[0].problems.includes(`extensionSubmitted:blocked(${reason})`));
+  });
+}
+test('T261 submitted plus blocked state is contradictory', () => {
+  assert.equal(judge([withStage('extensionSubmitted', { state: 'blocked' })]).verdict, 'FAIL');
+});
+for (const [name, patch, extra, verdict] of [
+  ['missing context', {}, { bindingEpoch: undefined }, 'UNKNOWN'],
+  ['missing actual', { bindingEpoch: undefined }, {}, 'UNKNOWN'],
+  ['invalid actual', { bindingEpoch: 'UNKNOWN' }, {}, 'UNKNOWN'],
+  ['mismatch', { bindingEpoch: '22222222-2222-4222-8222-222222222222' }, {}, 'FAIL'],
+  ['undeclared alias scope', { armEpoch: EPOCH }, {}, 'UNKNOWN'],
+  ['scoped agreeing aliases', { epochScope: 'sender_attempt', armEpoch: EPOCH, postArmEpoch: EPOCH }, {}, 'PASS'],
+  ['scoped conflicting aliases', { epochScope: 'sender_attempt', armEpoch: EPOCH,
+    postArmEpoch: '22222222-2222-4222-8222-222222222222' }, {}, 'FAIL'],
+  ['scoped invalid alias', { epochScope: 'sender_attempt', armEpoch: null }, {}, 'UNKNOWN'],
+]) {
+  test(`T261 epoch ${name}`, () => {
+    const report = judge([withStage('extensionSubmitted', patch)], extra);
+    assert.equal(report.verdict, verdict, JSON.stringify(report));
+  });
+}
+for (const key of ['eventId', 'bindingId']) {
+  test(`T261 ${key} requires same-key sender binding`, () => {
+    const candidate = withStage('noticeVisible', { runId: undefined, [key]: 'notice-other' });
+    assert.equal(judge([candidate]).verdict, 'UNKNOWN');
+    candidate.states.extensionSubmitted[key] = 'notice-correct';
+    assert.equal(judge([candidate]).verdict, 'FAIL');
+    candidate.states.extensionSubmitted[key] = 'notice-other';
+    assert.equal(judge([candidate]).verdict, 'PASS');
+    candidate.states.noticeVisible.runId = RUN;
+    candidate.states.extensionSubmitted[key] = 'notice-correct';
+    assert.equal(judge([candidate]).verdict, 'FAIL', 'a matching run cannot conceal a conflicting reference');
+  });
+}
+test('T261 event and binding namespaces may differ but each must match', () => {
+  const candidate = withStage('noticeVisible', { eventId: 'event-1', bindingId: 'binding-2' });
+  Object.assign(candidate.states.extensionSubmitted, { eventId: 'event-1', bindingId: 'binding-2' });
+  assert.equal(judge([candidate]).verdict, 'PASS');
+});
+test('T261 absent or different target conversation is not a pass', () => {
+  assert.equal(judge([round()], { conversationId: undefined }).verdict, 'UNKNOWN');
+  assert.equal(judge([withStage('noticeVisible', { conversationId: 'other-conversation' })]).verdict, 'FAIL');
+});
+for (const key of ['messageId', 'conversationId']) {
+  test(`T261 review must link exact page ${key}`, () => {
+    assert.equal(judge([withStage('reviewed', { [key]: undefined })]).verdict, 'UNKNOWN');
+    assert.equal(judge([withStage('reviewed', { [key]: 'unrelated' })]).verdict, 'FAIL');
+  });
+}
+test('T261 every populated review run alias must join', () => {
+  assert.equal(judge([withStage('reviewed', { reviewRunId: 'other-run' })]).verdict, 'FAIL');
+  assert.equal(judge([withStage('reviewed', { reviewRunId: RUN })]).verdict, 'PASS');
+});
+test('T261 redispatch needs an exact independently supplied review reference', () => {
+  assert.equal(judge([withStage('redispatched', { reviewId: undefined })]).verdict, 'UNKNOWN');
+  assert.equal(judge([withStage('redispatched', { reviewId: 'other-review' })]).verdict, 'FAIL');
+});
+test('T261 reviewId and turnId are separate reference namespaces', () => {
+  const candidate = withStage('reviewed', { turnId: 'turn-different' });
+  candidate.states.redispatched.reviewTurnId = 'turn-different';
+  assert.equal(judge([candidate]).verdict, 'PASS');
+  candidate.states.redispatched.reviewId = 'turn-different';
+  assert.equal(judge([candidate]).verdict, 'FAIL');
+});
+test('T261 earlier completed event cannot pay for the current window', () => {
+  const candidate = withStage('taskCompleted', { at: '2026-11-02T10:29:00Z' });
+  assert.equal(judge([candidate]).verdict, 'FAIL');
+  for (const value of Object.values(candidate.states)) value.at = value.at.replace('2026-11-02', '2026-11-01');
+  assert.equal(judge([candidate]).verdict, 'FAIL');
+});
+test('T261 missing evidence remains UNKNOWN after later review and dispatch', () => {
+  const candidate = withStage('extensionSubmitted', { status: 'unconfirmed' });
+  const report = judge([candidate]);
+  assert.equal(report.verdict, 'UNKNOWN');
+  assert.equal(report.rounds[0].stages.reviewed, 'PASS');
+  assert.equal(report.rounds[0].stages.redispatched, 'PASS');
+  assert.equal(report.unattended, null);
+});
+test('T261 excluded fixture completion status and timestamps do not become failures', () => {
+  const candidate = withStage('taskCompleted', { source: 'fixture', status: 'failed', at: '2050-01-01T00:00:00Z' });
+  assert.equal(judge([candidate]).verdict, 'UNKNOWN');
+});
+
+function twoRounds() {
+  const first = round();
+  const next = structuredClone(round());
+  next.round = 192; next.runId = 'run-192'; next.taskId = first.states.redispatched.taskId;
+  next.startedAt = '2026-11-02T11:00:00Z'; next.completedAt = '2026-11-02T11:30:00Z';
+  for (const value of Object.values(next.states)) {
+    value.at = value.at.replace('T10:', 'T11:');
+    if (Object.hasOwn(value, 'runId')) value.runId = next.runId;
+  }
+  next.states.taskCompleted.taskId = next.taskId;
+  Object.assign(next.states.noticeVisible, { messageId: 'msg-next' });
+  Object.assign(next.states.reviewed, { taskId: next.taskId, reviewId: 'rev-next', messageId: 'msg-next' });
+  Object.assign(next.states.redispatched, { taskId: 'tsk-193-next', reviewId: 'rev-next' });
+  return [first, next];
+}
+for (const stage of ['noticeVisible', 'reviewed', 'redispatched']) {
+  test(`T261 excluded ${stage} identities cannot produce cross-round failures`, () => {
+    for (const patch of [{ source: 'fixture' }, { observed: undefined }]) {
+      const rounds = twoRounds();
+      const first = rounds[0].states[stage];
+      Object.assign(first, patch);
+      if (stage === 'noticeVisible') first.messageId = rounds[1].states.noticeVisible.messageId;
+      if (stage === 'reviewed') first.reviewId = rounds[1].states.reviewed.reviewId;
+      if (stage === 'redispatched') first.taskId = rounds[0].taskId;
+      const report = judge(rounds);
+      assert.equal(report.verdict, 'UNKNOWN', JSON.stringify(report));
+      assert.deepEqual(report.problems, []);
+    }
+  });
+}
+test('T261 genuine duplicate facts fail even with unrelated timestamp missing', () => {
+  const rounds = twoRounds();
+  rounds[0].states.noticeVisible.messageId = rounds[1].states.noticeVisible.messageId;
+  rounds[0].states.noticeVisible.at = undefined;
+  const report = judge(rounds);
+  assert.equal(report.verdict, 'FAIL');
+  assert.ok(report.problems.includes('duplicate_notice:msg-next'));
+});
+test('T261 shared grant epoch across sequential runs is not duplicate evidence', () => {
+  const report = judge(twoRounds());
+  assert.equal(report.verdict, 'PASS', JSON.stringify(report));
+  assert.equal(report.evidenceScope, 'supplied_record_only');
+  assert.equal(report.liveObserved, false);
+});
+test('T261 epoch absence, unavailability and invalidity remain distinct diagnostics', () => {
+  for (const [bindingEpoch, code] of [[undefined, 'epoch_absent'], ['UNKNOWN', 'epoch_unavailable'], ['bad-epoch', 'epoch_invalid']]) {
+    const report = judge([withStage('extensionSubmitted', { bindingEpoch })]);
+    assert.equal(report.verdict, 'UNKNOWN');
+    assert.ok(report.rounds[0].unknowns.includes(`extensionSubmitted:${code}`));
+  }
+});
+
+test('T261 populated record and round contexts cannot silently override', () => {
+  const candidate = round({ bindingEpoch: '22222222-2222-4222-8222-222222222222' });
+  candidate.states.extensionSubmitted.bindingEpoch = candidate.bindingEpoch;
+  assert.equal(judge([candidate]).verdict, 'FAIL');
+  assert.equal(judge([round({ conversationId: 'other-conversation' })]).verdict, 'FAIL');
+  const perRound = round({ bindingEpoch: EPOCH, conversationId: 'conv-55' });
+  assert.equal(judge([perRound], { bindingEpoch: undefined, conversationId: undefined }).verdict, 'PASS');
+});
+
+test('T261 malformed round fails closed rather than throwing', () => {
+  assert.equal(judge([null]).verdict, 'FAIL');
+});
+
 test('T191: the report never claims this program observed the loop', () => {
   const report = judge([round()]);
   assert.match(report.note, /not that the loop was observed by this program/);
-  assert.match(report.note, /no human/);
+  assert.match(report.note, /recordSupportsUnattended/);
+  assert.equal(report.unattended, null);
   assert.equal(judge([]).verdict, 'UNKNOWN');
 });

@@ -1,4 +1,6 @@
-# Bridge 连续闭环验收（T190 → T191 → T192）
+# Bridge 连续闭环验收（T261 离线证据契约）
+
+**T261 扩展的是离线输入契约，不是生产导出接口。** 目标会话、适用的发送尝试 epoch、精确页面消息审核引用和审核到新任务引用均是 required-for-PASS；旧收据缺失时判 UNKNOWN。本轮没有新增任何连接器、采集器、页面读取、生产字段或通知。
 
 这份文档规定一件事：**怎样才算"没有人手动敲完成了"的自动循环真的跑过一轮。**
 它不描述愿景，只规定可核对的证据字段，以及缺了哪个字段时结论必须是什么。
@@ -18,10 +20,10 @@ node tools/continuation/bridge_loop_acceptance.mjs record.json --json   # 机器
 | 阶段 | 含义 | 唯一合格的证据来源 |
 |---|---|---|
 | `taskCompleted` | Bridge 台账记录 DSH 任务**成功**完成 | `bridge_ledger`，且**必须**带 `status`（须为 `completed`）、`taskId`、`runId` |
-| `extensionSubmitted` | 适配器接受通知（写入 + 点击 + 提交） | `extension_diagnostic`，且 `runId` 与本轮一致 |
-| `noticeVisible` | **通知确实进入了目标 ChatGPT 会话** | `chatgpt_visible_message` / `chatgpt_conversation_message`（人确认 `chatgpt_operator_confirmation` 也算，但不是必需） |
-| `reviewed` | ChatGPT 独立复核该任务结果 | `chatgpt_review`，且**必须**带 `reviewId`（或 `turnId`）、`taskId`、`runId`/`reviewRunId` 且与本轮一致 |
-| `redispatched` | 从这次复核里创建了**新**任务 | `bridge_ledger`，`taskId` **必需**、不得等于本轮 `taskId`，且必须等于下一轮实际的 `taskId` |
+| `extensionSubmitted` | 适配器接受通知（写入 + 点击 + 提交） | `extension_diagnostic`，`status:submitted`、本轮 `runId`、适用 `bindingEpoch`；已知 blocked/refused/binding_invalidated 等为 FAIL，unconfirmed/ambiguous 为 UNKNOWN |
+| `noticeVisible` | **通知确实进入了目标 ChatGPT 会话** | `chatgpt_visible_message` / `chatgpt_conversation_message`（人确认也接受），message/conversation/run 关联；目标 `conversationId` 由记录头提供 |
+| `reviewed` | ChatGPT 独立复核该任务结果 | `chatgpt_review`，`reviewId` 或 `turnId`、task/run；`messageId`/`conversationId` 必须指向本轮页面消息 |
+| `redispatched` | 从这次复核里创建了**新**任务 | `bridge_ledger`，新 `taskId` 与下一轮一致；`reviewId`→审核的 `reviewId` 或 `reviewTurnId`→审核的 `turnId`，两个命名空间分开比较 |
 
 **目标状态是无人值守，所以 `noticeVisible` 不要求有人在场。** 可接受的到达证据是"该消息出现在目标会话里"：
 `chatgpt_visible_message`（会话视图里可观察到）或 `chatgpt_conversation_message`（能读到这条消息本身，
@@ -34,18 +36,20 @@ node tools/continuation/bridge_loop_acceptance.mjs record.json --json   # 机器
 `noticeVisible:wrong_source(<来源>):sending_side_is_not_arrival`。
 
 到达证据还必须**点名**：`messageId`、`conversationId`，以及与本次运行绑定的 `runId`（或发送方分配的
-`eventId`/`bindingId`）。只有"消息出现在某个会话"而不指向这条 run 的记录判 `UNKNOWN`（`noticeVisible:run_binding_absent`）；
+`eventId`/`bindingId`）。`eventId` 仅和发送回执的 `eventId` 比较，`bindingId` 仅和发送回执的 `bindingId` 比较；发送回执必须点名本轮 run。只有任意事件字符串、没有同键关联回执时为 UNKNOWN，已知不同值为 FAIL；两个命名空间不互相替代。只有"消息出现在某个会话"而不指向这条 run 的记录判 `UNKNOWN`（`noticeVisible:run_binding_absent`）；
 指向了别的 run 判 FAIL（`noticeVisible:run_mismatch(...)`）。
 
 消息进入会话之后，**该会话里 ChatGPT 那一 turn 的复核与再派单动作**才是"消息被真正消费"的证据；
 `reviewed` 仍只接受 `chatgpt_review`，`redispatched` 仍只接受 `bridge_ledger` 且必须指向下一轮 `taskId`。
-以上三者都不需要人：一轮完整记录的 PASS 可以完全无人参与，报告里以 `unattended: true` 标注。
+以上三者不要求人工参与。`recordSupportsUnattended:true` 仅表示给定记录完整且自洽；旧 `unattended` 字段弃用并恒为 `null`，`liveObserved:false`、`evidenceScope:supplied_record_only`。任何 offline PASS 都不构成实际无人值守执行的观测。
 
 ## 记录格式（脱敏，无正文）
 
 ```json
 {
   "providerSessionId": "session-<本轮派单时的真实 id，不写入仓库>",
+  "conversationId": "<独立确认的目标会话 id>",
+  "bindingEpoch": "<适用于本发送尝试的 lowercase UUID；不是推测的最新 epoch>",
   "rounds": [
     {
       "round": 190,
@@ -55,11 +59,11 @@ node tools/continuation/bridge_loop_acceptance.mjs record.json --json   # 机器
       "startedAt": "2026-11-02T10:00:00Z",
       "completedAt": "2026-11-02T10:30:00Z",
       "states": {
-        "taskCompleted":       { "observed": true, "source": "bridge_ledger", "at": "..." },
-        "extensionSubmitted":  { "observed": true, "source": "extension_diagnostic", "at": "...", "status": "submitted" },
-        "noticeVisible":       { "observed": true, "source": "chatgpt_operator_confirmation", "at": "..." },
-        "reviewed":            { "observed": true, "source": "chatgpt_review", "at": "..." },
-        "redispatched":        { "observed": true, "source": "bridge_ledger", "at": "...", "taskId": "tsk-<下一轮>" }
+        "taskCompleted":       { "observed": true, "source": "bridge_ledger", "at": "2026-11-02T10:30:00Z", "status": "completed", "taskId": "tsk-<本轮>", "runId": "<本轮run>" },
+        "extensionSubmitted":  { "observed": true, "source": "extension_diagnostic", "at": "2026-11-02T10:30:05Z", "status": "submitted", "runId": "<本轮run>", "bindingEpoch": "<同适用epoch>" },
+        "noticeVisible":       { "observed": true, "source": "chatgpt_conversation_message", "at": "2026-11-02T10:30:30Z", "messageId": "<独立页面消息>", "conversationId": "<目标会话>", "runId": "<本轮run>" },
+        "reviewed":            { "observed": true, "source": "chatgpt_review", "at": "2026-11-02T10:35:00Z", "reviewId": "<独立审核>", "taskId": "tsk-<本轮>", "runId": "<本轮run>", "messageId": "<同页面消息>", "conversationId": "<同目标会话>" },
+        "redispatched":        { "observed": true, "source": "bridge_ledger", "at": "2026-11-02T10:36:00Z", "taskId": "tsk-<下一轮>", "reviewId": "<同独立审核>" }
       }
     }
   ]
@@ -89,7 +93,7 @@ node tools/continuation/bridge_loop_acceptance.mjs record.json --json   # 机器
 - `providerSessionId` 与记录头不一致 → FAIL（`session:mismatch(...)`）；**缺失**则是
   `UNKNOWN`（`session:absent`）——缺证据和自相矛盾不是一回事，不许合并。
 - `runId` / `taskId` 重复 → FAIL（`duplicate_run:` / `duplicate_task:`）。
-- 同一条 `noticeVisible.messageId` 出现在两轮 → FAIL（`duplicate_notice:<messageId>`）；同一个 `reviewId`（或 `reviewId` 缺失时的 `turnId`）出现在两轮 → FAIL（`duplicate_review:<id>`）。一条页面消息只能是一次完成的通知，一次复核只能复核一个 run；重复记账等于把同一个环节算给两轮。
+- 同一条 `noticeVisible.messageId` 出现在两轮 → FAIL（`duplicate_notice:<messageId>`）；同一个 `reviewId` 或同一个 `turnId`（各自命名空间分别检查，两个都提供时两个都检查）出现在两轮 → FAIL（`duplicate_review:<id>`）。一条页面消息只能是一次完成的通知，一次复核只能复核一个 run；重复记账等于把同一个环节算给两轮。
 - 两轮时间窗重叠 → FAIL（`overlap:190/191`）：闭环一次只应有一条在跑。
 - `redispatched.taskId` 指向本轮或此前任一轮已完成任务 → FAIL（`redispatch:reuses_completed_task:<taskId>`），**末轮没有下一条记录也必须检查**。
 - `redispatched.taskId` 不指向下一轮的实际 `taskId` → FAIL（`redispatch:does_not_lead_to_round_N`）。
@@ -100,6 +104,17 @@ node tools/continuation/bridge_loop_acceptance.mjs record.json --json   # 机器
   `run_id_absent`。**T190 及更早格式的记录因此只能判 `UNKNOWN`**，不会被默认值凑成 PASS。
 - 来源是 `fixture` / `mock` / `test` / `synthetic` / `replay` → **`UNKNOWN`**，不是 PASS：
   模拟数据永远不能充当实机证据。
+
+## T261 严格状态与外部回执边界
+
+- `record.bindingEpoch` 或 `round.bindingEpoch` 是**适用于该发送尝试**的预期grant快照，不是审核时的“最新epoch”。两者都提供时必须相同；两个目标conversation上下文都提供时也必须相同，不静默覆盖。
+- `extensionSubmitted.bindingEpoch` 必须是lowercase UUID并与预期相同。缺失/无效为 UNKNOWN；已知不同为 `epoch_mismatch` / `epoch_context_conflict`。跨不同顺序run复用同一个合法grant不算重复通知。
+- 原始 `runEpoch` / `run_epoch` / `armEpoch` / `postArmEpoch` 仅在调用者明确声明 `epochScope:sender_attempt`、它们同指一次grant快照时纳入同义比较；否则 `epoch_scope_unverified` UNKNOWN。此限定不表示现有producer字段天然等义。`t058_epoch:UNKNOWN` 不是epoch；单个非原子t059快照不证明最新有效绑定。
+- 不推断TTL、失效时刻或当前有效性。已知 `binding_invalidated` / `binding_changed` / `grant_expired` 与 submitted 并列时仍 FAIL；缺独立有效epoch事实时 UNKNOWN。
+- 合格来源的阶段时间必须不早于本run的startedAt；taskCompleted时间不早于completedAt。页面/审核/续派可以晚于completedAt，没有人为“新鲜度”阈值。此检查不计算授权、不重建endedAtMs、不改变strict-before-consent规则。
+- fixture、未观测或错误来源不贡献排序、重复消息/审核或续派关联断言；阶段UNKNOWN保留。合格来源的已知重复id仍FAIL，即便另一个时间字段缺失。`rounds[].stages` 给出逐段 PASS/FAIL/UNKNOWN。
+- **独立页面组件缺口**：目标会话侧需独立导出messageId、conversationId、run/同键notice关联和观测时间；Native ACK/seen/发送诊断都替代不了它。
+- **独立审核/派单组件缺口**：ChatGPT审核执行侧需导出reviewId或turnId、确切消费的messageId/conversationId/task/run；派单方需提供该review引用与新taskId的独立关联。当前检视的producer没有证明这些新增输入已可导出，本次只加强offline判定，不升级或修改外部组件。
 
 ## 三轮验收需要什么
 

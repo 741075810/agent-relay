@@ -11,7 +11,7 @@
 //   notice visible        a human read it in the ChatGPT conversation
 //   reviewed              ChatGPT independently reviewed the task's result
 //   redispatched          a NEW task was created from that review
-// Only the third link can be supplied by a human reading the conversation. A host ACK, a Chrome persistence
+// Only an independent conversation-side receipt can support the third link. A host ACK, a Chrome persistence
 // event or an adapter `submitted` is never evidence for it.
 //
 // Usage:
@@ -30,9 +30,9 @@ export const STAGES = Object.freeze(['taskCompleted', 'extensionSubmitted', 'not
 //: T190R: the goal is *unattended* operation, so requiring a human to eyeball each notice would make a correct
 //: loop unpassable. `noticeVisible` therefore accepts observation of the message inside the target ChatGPT
 //: conversation -- `chatgpt_conversation_message` (a message the bridge can see in that conversation) or
-//: `chatgpt_visible_message` (visible in the conversation view) -- and the ChatGPT turn's own review/dispatch
-//: is what proves the message was actually consumed. A human confirmation is still accepted, as one of several
-//: valid observations, not as a requirement.
+//: `chatgpt_visible_message` (visible in the conversation view) -- and the supplied ChatGPT review/dispatch
+//: references support a consumption claim. This checker never observes consumption itself. A human confirmation
+//: is still accepted as one of several valid observations, not as a requirement.
 //:
 //: What stays forbidden is unchanged: a host ACK, a Chrome persistence event and an adapter `submitted` prove
 //: the notice left, never that it arrived; a DSH summary is the worker describing itself; fixtures are not
@@ -54,6 +54,29 @@ export const MACHINE_SOURCE_HINTS = Object.freeze(['host_ack', 'host_state', 'ch
   'extension_diagnostic', 'bridge_ledger']);
 
 const FIXTURE_SOURCES = Object.freeze(['fixture', 'mock', 'test', 'synthetic', 'replay']);
+const EPOCH = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/;
+const credited = (stage, value) => value?.observed === true && SOURCES[stage].includes(value.source);
+
+function checkEpoch(value, round, expected) {
+  const problems = [], unknowns = [];
+  const contexts = [round.bindingEpoch, expected.bindingEpoch].filter(v => v !== undefined);
+  const validContexts = contexts.filter(v => typeof v === 'string' && EPOCH.test(v));
+  const target = validContexts[0];
+  if (!contexts.length) unknowns.push('extensionSubmitted:epoch_context_absent');
+  else if (contexts.length !== validContexts.length) unknowns.push('extensionSubmitted:epoch_context_invalid');
+  if (new Set(validContexts).size > 1) problems.push('extensionSubmitted:epoch_context_conflict');
+  const values = [value.bindingEpoch];
+  const aliases = ['runEpoch', 'run_epoch', 'armEpoch', 'postArmEpoch'].filter(key => Object.hasOwn(value, key));
+  if (aliases.length && value.epochScope !== 'sender_attempt') unknowns.push('extensionSubmitted:epoch_scope_unverified');
+  if (value.epochScope === 'sender_attempt') values.push(...aliases.map(key => value[key]));
+  const valid = values.filter(v => typeof v === 'string' && EPOCH.test(v));
+  if (values.some(v => v === undefined || v === null || v === '')) unknowns.push('extensionSubmitted:epoch_absent');
+  if (values.includes('UNKNOWN')) unknowns.push('extensionSubmitted:epoch_unavailable');
+  if (values.some(v => v !== undefined && v !== null && v !== '' && v !== 'UNKNOWN' && (typeof v !== 'string' || !EPOCH.test(v)))) unknowns.push('extensionSubmitted:epoch_invalid');
+  if (new Set(valid).size > 1) problems.push('extensionSubmitted:epoch_conflict');
+  if (typeof target === 'string' && EPOCH.test(target) && valid.some(v => v !== target)) problems.push('extensionSubmitted:epoch_mismatch');
+  return { problems, unknowns };
+}
 
 function timeOf(stage) {
   if (!stage || typeof stage.at !== 'string') return null;
@@ -75,7 +98,7 @@ function text(value) {
  * A missing name is UNKNOWN, never a default. This tool cannot verify a signature on any of them -- it can only
  * refuse a record whose own fields do not join up.
  */
-function checkStage(stage, value, round) {
+function checkStage(stage, value, round, expected = {}) {
   const problems = [];
   const unknowns = [];
   const roundRun = text(round && round.runId);
@@ -97,6 +120,15 @@ function checkStage(stage, value, round) {
     const runId = text(value.runId);
     if (!runId) unknowns.push('extensionSubmitted:run_id_absent');
     else if (roundRun && runId !== roundRun) problems.push(`extensionSubmitted:run_mismatch(${runId})`);
+    const status = text(value.status);
+    if (['blocked', 'refused', 'stopped', 'failed', 'interrupted'].includes(status)) problems.push(`extensionSubmitted:status_not_submitted(${status})`);
+    else if (status !== 'submitted') unknowns.push('extensionSubmitted:status_unverified');
+    const senderState = text(value.state);
+    if (['blocked', 'refused', 'stopped', 'failed', 'interrupted'].includes(senderState)) problems.push(`extensionSubmitted:state_not_sent(${senderState})`);
+    else if (senderState && !['sent', 'submitted'].includes(senderState)) unknowns.push('extensionSubmitted:state_unverified');
+    if (['binding_invalidated', 'binding_changed', 'grant_expired'].includes(value.reason)) problems.push(`extensionSubmitted:blocked(${value.reason})`);
+    const epoch = checkEpoch(value, round, expected);
+    problems.push(...epoch.problems); unknowns.push(...epoch.unknowns);
   }
 
   if (stage === 'noticeVisible') {
@@ -104,12 +136,18 @@ function checkStage(stage, value, round) {
     if (!messageId) unknowns.push('noticeVisible:message_id_absent');
     const conversationId = text(value.conversationId);
     if (!conversationId) unknowns.push('noticeVisible:conversation_id_absent');
-    // The message must be tied to *this* run, by run id or by a binding id the sender assigned.
+    const targetConversation = text(expected.conversationId) || text(round.conversationId);
+    if (text(expected.conversationId) && text(round.conversationId) && expected.conversationId !== round.conversationId) problems.push('noticeVisible:conversation_context_conflict');
+    if (!targetConversation) unknowns.push('noticeVisible:target_conversation_absent');
+    else if (conversationId && conversationId !== targetConversation) problems.push('noticeVisible:conversation_mismatch');
     const boundRun = text(value.runId);
-    const bindingId = text(value.eventId) || text(value.bindingId);
-    if (!boundRun && !bindingId) unknowns.push('noticeVisible:run_binding_absent');
-    else if (boundRun && roundRun && boundRun !== roundRun) {
-      problems.push(`noticeVisible:run_mismatch(${boundRun})`);
+    const refs = ['eventId', 'bindingId'].filter(key => text(value[key]));
+    if (!boundRun && !refs.length) unknowns.push('noticeVisible:run_binding_absent');
+    else if (boundRun && roundRun && boundRun !== roundRun) problems.push(`noticeVisible:run_mismatch(${boundRun})`);
+    const sender = round.states?.extensionSubmitted;
+    for (const key of refs) {
+      if (!credited('extensionSubmitted', sender) || !text(sender[key]) || !text(sender.runId)) unknowns.push(`noticeVisible:${key}_binding_unverified`);
+      else if (sender.runId !== roundRun || value[key] !== sender[key]) problems.push(`noticeVisible:${key}_binding_mismatch`);
     }
   }
 
@@ -119,60 +157,84 @@ function checkStage(stage, value, round) {
     const reviewedTask = text(value.taskId);
     if (!reviewedTask) unknowns.push('reviewed:task_id_absent');
     else if (roundTask && reviewedTask !== roundTask) problems.push(`reviewed:task_mismatch(${reviewedTask})`);
-    const reviewedRun = text(value.runId) || text(value.reviewRunId);
-    if (!reviewedRun) unknowns.push('reviewed:run_id_absent');
-    else if (roundRun && reviewedRun !== roundRun) problems.push(`reviewed:run_mismatch(${reviewedRun})`);
+    const reviewedRuns = ['runId', 'reviewRunId'].map(key => text(value[key])).filter(Boolean);
+    if (!reviewedRuns.length) unknowns.push('reviewed:run_id_absent');
+    for (const reviewedRun of reviewedRuns) {
+      if (roundRun && reviewedRun !== roundRun) problems.push(`reviewed:run_mismatch(${reviewedRun})`);
+    }
+    const notice = round.states?.noticeVisible;
+    for (const key of ['messageId', 'conversationId']) {
+      if (!text(value[key])) unknowns.push(`reviewed:${key}_absent`);
+      else if (!credited('noticeVisible', notice) || !text(notice[key])) unknowns.push(`reviewed:${key}_binding_unverified`);
+      else if (value[key] !== notice[key]) problems.push(`reviewed:${key}_mismatch`);
+    }
   }
 
   if (stage === 'redispatched') {
     const taskId = text(value.taskId);
     if (!taskId) problems.push('redispatched:task_id_absent');
     else if (roundTask && taskId === roundTask) problems.push(`redispatched:same_task_id(${taskId})`);
+    const review = round.states?.reviewed;
+    const pairs = [['reviewId', 'reviewId'], ['reviewTurnId', 'turnId']];
+    if (!pairs.some(([key]) => text(value[key]))) unknowns.push('redispatched:review_reference_absent');
+    for (const [key, target] of pairs) {
+      if (!text(value[key])) continue;
+      if (!credited('reviewed', review) || !text(review[target])) unknowns.push(`redispatched:${key}_binding_unverified`);
+      else if (value[key] !== review[target]) problems.push(`redispatched:${key}_mismatch`);
+    }
   }
 
   return { problems, unknowns };
 }
 
-export function judgeRound(round, expected) {
+export function judgeRound(round, expected = {}) {
+  round = round && typeof round === 'object' ? round : {};
   const problems = [];
   const unknowns = [];
+  const stages = {};
   const states = (round && round.states) || {};
 
   for (const stage of STAGES) {
     const value = states[stage];
     if (!value || value.observed === undefined || value.observed === null) {
       unknowns.push(`${stage}:not_observed`);
+      stages[stage] = 'UNKNOWN';
       continue;
     }
     if (value.observed !== true) {
       problems.push(`${stage}:reported_false`);
+      stages[stage] = 'FAIL';
       continue;
     }
     const source = typeof value.source === 'string' ? value.source : '';
     if (FIXTURE_SOURCES.includes(source)) {
       unknowns.push(`${stage}:fixture_evidence`);
+      stages[stage] = 'UNKNOWN';
       continue;
     }
     if (!SOURCES[stage].includes(source)) {
       const hint = NOT_ARRIVAL.includes(source) && stage === 'noticeVisible'
         ? ':sending_side_is_not_arrival' : '';
       problems.push(`${stage}:wrong_source(${source || 'none'})${hint}`);
+      stages[stage] = 'FAIL';
       continue;
     }
-    if (timeOf(value) === null) unknowns.push(`${stage}:no_timestamp`);
-    const credential = checkStage(stage, value, round);
+    const noTime = timeOf(value) === null;
+    if (noTime) unknowns.push(`${stage}:no_timestamp`);
+    const credential = checkStage(stage, value, round, expected);
     problems.push(...credential.problems);
     unknowns.push(...credential.unknowns);
+    stages[stage] = credential.problems.length ? 'FAIL' : (noTime || credential.unknowns.length ? 'UNKNOWN' : 'PASS');
   }
 
   // A failed run may be notified, but it is never a passed round, whatever else the record says.
   const completed = states.taskCompleted;
-  if (completed && text(completed.status) && text(completed.status) !== 'completed') {
+  if (credited('taskCompleted', completed) && text(completed.status) && text(completed.status) !== 'completed') {
     problems.push('round:not_a_successful_completion');
   }
 
   // Ordering: each link must be observed no earlier than the one it depends on.
-  const ordered = STAGES.map((stage) => timeOf(states[stage])).filter((ms) => ms !== null);
+  const ordered = STAGES.filter(stage => credited(stage, states[stage])).map((stage) => timeOf(states[stage])).filter((ms) => ms !== null);
   for (let i = 1; i < ordered.length; i += 1) {
     if (ordered[i] < ordered[i - 1]) problems.push('chain:out_of_order');
   }
@@ -191,16 +253,24 @@ export function judgeRound(round, expected) {
   const end = Date.parse(round.completedAt || '');
   if (Number.isNaN(start) || Number.isNaN(end)) problems.push('window:unreadable');
   if (!Number.isNaN(start) && !Number.isNaN(end) && end < start) problems.push('window:ends_before_start');
+  for (const stage of STAGES) {
+    const at = credited(stage, states[stage]) ? timeOf(states[stage]) : null;
+    if (at !== null && ((!Number.isNaN(start) && at < start) || (!Number.isNaN(end) && stage === 'taskCompleted' && at < end))) {
+      problems.push(`${stage}:before_run_window`);
+      stages[stage] = 'FAIL';
+    }
+  }
 
-  if (problems.length) return { verdict: 'FAIL', problems, unknowns };
-  if (unknowns.length) return { verdict: 'UNKNOWN', problems, unknowns };
-  return { verdict: 'PASS', problems, unknowns };
+  if (problems.length) return { verdict: 'FAIL', problems, unknowns, stages };
+  if (unknowns.length) return { verdict: 'UNKNOWN', problems, unknowns, stages };
+  return { verdict: 'PASS', problems, unknowns, stages };
 }
 
 /** The whole record: every round, plus the cross-round facts a single round cannot see. */
 export function judgeRecord(record) {
   const rounds = Array.isArray(record && record.rounds) ? record.rounds : [];
-  const expected = { providerSessionId: record && record.providerSessionId };
+  const expected = { providerSessionId: record && record.providerSessionId,
+    conversationId: record && record.conversationId, bindingEpoch: record && record.bindingEpoch };
   const problems = [];
   const results = rounds.map((round) => ({
     round: round && round.round,
@@ -239,16 +309,19 @@ export function judgeRecord(record) {
   const seenReview = new Map();
   for (const round of rounds) {
     const states = (round && round.states) || {};
-    const messageId = text(states.noticeVisible && states.noticeVisible.messageId);
+    const messageId = credited('noticeVisible', states.noticeVisible) ? text(states.noticeVisible.messageId) : null;
     if (messageId) {
       if (seenNotice.has(messageId)) problems.push(`duplicate_notice:${messageId}`);
       else seenNotice.set(messageId, round && round.round);
     }
     const reviewed = states.reviewed || {};
-    const reviewId = text(reviewed.reviewId) || text(reviewed.turnId);
-    if (reviewId) {
-      if (seenReview.has(reviewId)) problems.push(`duplicate_review:${reviewId}`);
-      else seenReview.set(reviewId, round && round.round);
+    for (const key of ['reviewId', 'turnId']) {
+      const reviewId = credited('reviewed', reviewed) ? text(reviewed[key]) : null;
+      if (reviewId) {
+        const identity = `${key}:${reviewId}`;
+        if (seenReview.has(identity)) problems.push(`duplicate_review:${reviewId}`);
+        else seenReview.set(identity, round && round.round);
+      }
     }
   }
 
@@ -258,7 +331,7 @@ export function judgeRecord(record) {
     if (rounds[i] && rounds[i].taskId) completedTasks.add(rounds[i].taskId);
     const next = rounds[i + 1];
     const dispatched = rounds[i] && rounds[i].states && rounds[i].states.redispatched;
-    if (!dispatched || !dispatched.taskId) continue;
+    if (!credited('redispatched', dispatched) || !text(dispatched.taskId)) continue;
     // The last round has no successor record, but still must not loop back into old work.
     if (completedTasks.has(dispatched.taskId)) {
       problems.push(`redispatch:reuses_completed_task:${dispatched.taskId}`);
@@ -266,8 +339,7 @@ export function judgeRecord(record) {
     if (next && dispatched.taskId !== next.taskId) problems.push(`redispatch:does_not_lead_to_round_${next.round}`);
   }
 
-  // T190R: nothing in this judgement requires a person. A round whose notice was observed inside the target
-  // conversation, and whose review and re-dispatch are on record, passes with no human involvement at all.
+  // T261: a supplied complete record may describe an unattended loop; this program observes no live loop.
   const verdicts = results.map((r) => r.verdict);
   let verdict = 'PASS';
   if (problems.length || verdicts.includes('FAIL')) verdict = 'FAIL';
@@ -276,10 +348,13 @@ export function judgeRecord(record) {
     verdict,
     rounds: results,
     problems,
-    unattended: verdict === 'PASS' ? true : null,
+    unattended: null, // Deprecated: a pure offline checker never observes unattended execution.
+    recordSupportsUnattended: verdict === 'PASS' ? true : null,
+    evidenceScope: 'supplied_record_only',
+    liveObserved: false,
     note: 'This tool judges a supplied record. A PASS means the record is complete and self-consistent, not that '
-      + 'the loop was observed by this program. A PASS needs no human in the loop: an arrival observed inside the '
-      + 'target conversation plus the ChatGPT turn\'s own review and re-dispatch is enough. Sending-side facts '
+      + 'the loop was observed by this program. recordSupportsUnattended describes the supplied record only; '
+      + 'unattended is UNKNOWN. Sending-side facts '
       + '(host ack, Chrome persistence, adapter submitted, DSH summary) and fixtures are never arrival evidence.',
   };
 }
