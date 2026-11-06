@@ -4,7 +4,8 @@
 // connection error) while a round was in progress, and T250 resumed the *same* DSH session and carried on.
 // That only works if nothing in the continuation path touches the worktree. This suite builds a throwaway git
 // repository -- never the real one -- puts uncommitted work in it, drives the recorded failure paths
-// (`complete(failed)` and a crash that `recover` escalates) plus the handoff builder, and asserts the tree,
+// (UNKNOWN, verified nonacceptance, and a crash that recover escalates) plus the handoff builder,
+// and asserts the tree,
 // HEAD, the stash and the untracked file are all exactly as they were.
 //
 // It also pins the negative: the generated handoff text must not contain a git command that could discard or
@@ -79,34 +80,54 @@ const EVENT = {
     expiresAt: 1793453600000, sessionId: 'session-22222222-2222-4222-8222-222222222222' },
 };
 
-test('T254: a failed round leaves the uncommitted worktree byte-identical', () => {
+test('T262/T254: upstream uncertainty survives restart without retry or dirty-work loss', () => {
   const root = fixture();
   try {
     const before = observe(root);
     assert.match(before.status, /M work\.txt/);
     assert.match(before.status, /\?\? scratch\.txt/);
-
-    // The round is admitted, leased, and then dies upstream: exactly the T249 shape.
-    const admitted = CS.admit(CS.createStore({ epoch: 'epoch-t254' }), { ...EVENT, now: 1793450001000 });
-    assert.equal(admitted.code, null);
-    const leased = CS.lease(admitted.store, admitted.key, 1793450002000, 60000);
-    assert.equal(leased.code, null);
-    const failed = CS.complete(leased.store, admitted.key,
-      { outcome: 'failed', code: 'dsh_connection_error', at: 1793450003000 });
-    assert.equal(failed.code, 'retry_scheduled');
-    assert.equal(failed.store.jobs[admitted.key].state, 'failed');
-    assert.equal(failed.store.jobs[admitted.key].nextRetryAt, 1793450033000,
-      'the retry is scheduled 30 s out, not attempted immediately');
-
-    // Nothing may be dispatchable before that instant: no unconditional re-request.
-    assert.deepEqual(CS.dispatchable(failed.store, 1793450032999), []);
-    assert.deepEqual(CS.dispatchable(failed.store, 1793450033000), [admitted.key]);
-
-    const after = observe(root);
-    assert.deepEqual(after, before, 'a failed round must not modify, commit, stash or delete anything');
+    for (const code of ['dsh_connection_error', 'quota_precharge_fixture']) {
+      const admitted = CS.admit(CS.createStore({ epoch: 'epoch-t254' }), { ...EVENT, now: 1793450001000 });
+      assert.equal(admitted.code, null);
+      const leased = CS.lease(admitted.store, admitted.key, 1793450002000, 60000);
+      assert.equal(leased.code, null);
+      // Upstream failure does not establish that submission was never accepted.
+      const uncertain = CS.complete(leased.store, admitted.key,
+        { outcome: 'unknown', attempt: leased.attempt, code, at: 1793450003000 });
+      assert.equal(uncertain.code, 'unknown_outcome');
+      assert.equal(uncertain.store.jobs[admitted.key].state, 'escalated');
+      assert.equal(uncertain.store.jobs[admitted.key].nextRetryAt, null);
+      const restored = CS.restore(JSON.parse(CS.snapshot(uncertain.store)));
+      assert.deepEqual(CS.dispatchable(restored, 1793450100000), []);
+      assert.equal(CS.lease(restored, admitted.key, 1793450100000).code, 'not_dispatchable');
+      assert.equal(CS.admit(restored, { ...EVENT, now: 1793450100000 }).code, 'duplicate_event');
+      assert.equal(CS.complete(restored, admitted.key,
+        { outcome: 'acked', attempt: leased.attempt, at: 1793450100000 }).code, 'not_dispatchable');
+      assert.deepEqual(observe(root), before, code + ': no file, HEAD, stash or index changes');
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('T262/T254: known nonacceptance backoff preserves staged and untracked work', () => {
+  const root = fixture();
+  try {
+    git(root, 'add', 'work.txt'); // stage only the owned fixture before its preservation baseline
+    const before = observe(root);
+    assert.match(before.status, /M  work\.txt/); assert.match(before.status, /\?\? scratch\.txt/);
+    const admitted = CS.admit(CS.createStore(), { ...EVENT, now: 1793450001000 });
+    const leased = CS.lease(admitted.store, admitted.key, 1793450002000, 60000);
+    const refused = CS.complete(leased.store, admitted.key,
+      { outcome: 'failed', attempt: leased.attempt, code: 'verified_refusal_fixture', at: 1793450003000 });
+    assert.equal(refused.code, 'retry_scheduled');
+    assert.equal(refused.store.jobs[admitted.key].nextRetryAt, 1793450033000);
+    assert.deepEqual(CS.dispatchable(refused.store, 1793450032999), []);
+    assert.equal(CS.lease(refused.store, admitted.key, 1793450032999).code, 'retry_not_due');
+    const restored = CS.restore(JSON.parse(CS.snapshot(refused.store)));
+    assert.equal(CS.lease(restored, admitted.key, 1793450033000).attempt, 2);
+    assert.deepEqual(observe(root), before, 'verified refusal neither discards staged work nor commits it');
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test('T254: a crash mid-handoff is escalated, never retried, and still touches no file', () => {
