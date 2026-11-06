@@ -12,6 +12,8 @@
 
 import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createTriggerState, admit } from '../../extension/lib/terminal_trigger.js';
 
 export const CANDIDATES_KEY = 'terminalCandidates';
@@ -184,6 +186,10 @@ async function main() {
     pageDelivery: 'unknown', deliverable: false }) + '\n');
 }
 
-const invokedDirectly = process.argv[1]
-  && new URL(import.meta.url).pathname.endsWith(process.argv[1].replace(/\\/g, '/').split('/').pop());
+// T265: exact-path identity, never a suffix test on the basename. The previous
+// `new URL(import.meta.url).pathname.endsWith(basename)` form ran `main()` whenever an importer's own file name
+// happened to be a suffix of this one (`intake.mjs`), and `main()` spawns the host and writes the candidate store
+// and trigger state. Same form as `relay_service.mjs` / `host_ingest.mjs` / `bridge_loop_acceptance.mjs`.
+const invokedDirectly = typeof process.argv[1] === 'string'
+  && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (invokedDirectly) main();

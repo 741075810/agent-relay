@@ -11,6 +11,8 @@
 // `ALLOWED_STATUS`, and a host ack never means the page received anything (`pageDelivery` stays `unknown`).
 
 import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createTriggerState, admit } from '../../extension/lib/terminal_trigger.js';
 
 export const DEFAULT_LEDGER = Object.freeze({ seen: {}, windowCount: 0, windowStartedAt: null,
@@ -88,6 +90,8 @@ async function main() {
   }) + '\n');
 }
 
-const invokedDirectly = process.argv[1]
-  && new URL(import.meta.url).pathname.endsWith(process.argv[1].replace(/\\/g, '/').split('/').pop());
+// T265: exact-path identity; the basename suffix test made `adapter.mjs` run `main()`, which issues an
+// authenticated request to the local service, merely by importing `admitAll` from this module.
+const invokedDirectly = typeof process.argv[1] === 'string'
+  && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (invokedDirectly) main();

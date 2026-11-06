@@ -16,6 +16,8 @@
 
 import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const MAX_FRAME = 1024 * 1024;
 
@@ -183,6 +185,8 @@ async function main() {
   for (;;) { await run(); await new Promise((r) => setTimeout(r, pollMs)); }
 }
 
-const invokedDirectly = process.argv[1]
-  && new URL(import.meta.url).pathname.endsWith(process.argv[1].replace(/\\/g, '/').split('/').pop());
+// T265: exact-path identity; a basename suffix test let `mirror.mjs` (or any importer named so) run `main()` --
+// which spawns the host and POSTs to the service -- merely by importing this module. See `relay_service.mjs`.
+const invokedDirectly = typeof process.argv[1] === 'string'
+  && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (invokedDirectly) main();
