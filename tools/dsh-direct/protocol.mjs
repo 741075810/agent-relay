@@ -8,11 +8,18 @@ export const PROTOCOL_VERSION = '2024-11-05';
 export const SERVER_NAME = 'dsh-direct';
 export const SERVER_VERSION = '0.1.0';
 
-// The MCP revisions this server can speak over Streamable HTTP, newest first. `initialize` echoes the client's version
-// when it is one of these and offers `LATEST_PROTOCOL_VERSION` otherwise, which is what the specification asks a server
-// to do when it does not support the requested revision.
+// The MCP revisions this server can speak, newest first. `initialize` echoes the client's version when it is one of
+// these and offers `LATEST_PROTOCOL_VERSION` otherwise, which is what the specification asks a server to do when it does
+// not support the requested revision.
 export const LATEST_PROTOCOL_VERSION = '2025-11-25';
+/** stdio existed in every revision, so this transport may speak all of them. */
 export const SUPPORTED_PROTOCOL_VERSIONS = Object.freeze(['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05']);
+/**
+ * Streamable HTTP was introduced in the 2025-03-26 revision. Offering `2024-11-05` here would be a claim that cannot
+ * be true: that revision has no such transport, so a client asking for it could not have meant this endpoint. The stdio
+ * set keeps 2024-11-05; this one starts at 2025-03-26.
+ */
+export const SUPPORTED_HTTP_PROTOCOL_VERSIONS = Object.freeze(['2025-11-25', '2025-06-18', '2025-03-26']);
 
 /** Every refusal this module can produce. Stable strings: the tests and the operator both match on them. */
 export const CODES = Object.freeze({
@@ -29,6 +36,8 @@ export const CODES = Object.freeze({
   origin_rejected: 'origin_rejected',
   body_too_large: 'body_too_large',
   unsupported_accept: 'unsupported_accept',
+  unsupported_content_type: 'unsupported_content_type',
+  too_many_requests: 'too_many_requests',
   unsupported_protocol_version: 'unsupported_protocol_version',
   session_required: 'session_required',
   request_timeout: 'request_timeout',
@@ -72,7 +81,8 @@ export const MAX_SESSIONS_DEFAULT = 16;
 
 /** The keys `config.http` may contain. Exported so the preflight and the docs check use the list the server enforces. */
 export const HTTP_CONFIG_FIELDS = Object.freeze(['enabled', 'host', 'port', 'path', 'authTokenFile', 'allowedOrigins',
-  'maxBodyBytes', 'requestTimeoutMs', 'maxSessions']);
+  'maxBodyBytes', 'requestTimeoutMs', 'maxSessions', 'maxConcurrentRequests']);
+export const MAX_CONCURRENT_DEFAULT = 8;
 
 /**
  * Validate the optional `http` block. Returns `null` when the transport is off, which is the default: this is a
@@ -125,8 +135,14 @@ export function loadHttpConfig(raw) {
   if (!Number.isInteger(maxSessions) || maxSessions < 1 || maxSessions > 256) {
     fail(CODES.invalid_arguments, 'config.http.maxSessions must be an integer in 1..256', { maxSessions });
   }
+  const maxConcurrentRequests = raw.maxConcurrentRequests === undefined ? MAX_CONCURRENT_DEFAULT
+    : raw.maxConcurrentRequests;
+  if (!Number.isInteger(maxConcurrentRequests) || maxConcurrentRequests < 1 || maxConcurrentRequests > 64) {
+    fail(CODES.invalid_arguments, 'config.http.maxConcurrentRequests must be an integer in 1..64',
+      { maxConcurrentRequests });
+  }
   return { enabled: true, host, port, path: urlPath, authTokenFile: raw.authTokenFile,
-    allowedOrigins: allowedOrigins.slice(), maxBodyBytes, requestTimeoutMs, maxSessions };
+    allowedOrigins: allowedOrigins.slice(), maxBodyBytes, requestTimeoutMs, maxSessions, maxConcurrentRequests };
 }
 
 export class DirectError extends Error {

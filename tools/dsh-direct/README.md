@@ -92,7 +92,7 @@ profile change.
 
 | level | meaning | status |
 |---|---|---|
-| **A** | plugin, MCP server (stdio **and** Streamable HTTP) and preflight verified in isolation against a fake Host; the HTTP layer driven over a real socket by a real HTTP client | **done** — `test_t271_*` … `test_t274_*` |
+| **A** | plugin, MCP server (stdio **and** Streamable HTTP) and preflight verified in isolation against a fake Host; the HTTP layer driven over a real socket by a real HTTP client | **done** — `test_t271_*` … `test_t275_*` |
 | **B** | the real Desktop Host loads the plugin and serves the bridge on loopback | **not done** — needs the operator to install |
 | **C** | an existing session received a real prompt through this bridge | **not done** — needs B |
 
@@ -155,16 +155,17 @@ transport adds no business logic: it validates a request, resolves a session, ca
 node tools/dsh-direct/mcp_server.mjs --config <config.json>   # starts HTTP when config.http.enabled is true
 ```
 
-Request rules, all enforced and each covered by a test in `test_t274_http_transport.mjs`:
+Request rules, all enforced and each covered by a test in `test_t274_http_transport.mjs` (transport) and `test_t275_http_interop.mjs` (media type, revision boundary, rate limit, timed-out submit):
 
 | rule | behaviour |
 |---|---|
 | `POST /mcp` with one JSON-RPC message | `200` + `application/json`, or a single `text/event-stream` event when the client accepts only SSE |
-| a body with no request id (notification) | `202` with no body — including `notifications/initialized` |
-| `initialize` | negotiates the revision: echoes `2025-11-25` / `2025-06-18` / `2025-03-26` / `2024-11-05`, otherwise offers `2025-11-25`; issues `Mcp-Session-Id` (32 hex) |
+| `Content-Type` other than `application/json` (or absent) | `415` `unsupported_content_type`, decided **before** the body is parsed — a valid payload under the wrong media type is not a request this server understood. `application/json; charset=utf-8` is accepted |
+| a body with no request id (notification) | `202` with no body — including `notifications/initialized`, and unknown notifications too |
+| `initialize` | requires a string `params.protocolVersion`; anything else is `-32602` and opens no session. Negotiates over the **HTTP** set: echoes `2025-11-25` / `2025-06-18` / `2025-03-26`, otherwise offers `2025-11-25`. `2024-11-05` is deliberately absent — that revision has no Streamable HTTP, so echoing it would be a false claim. stdio still speaks it. Issues `Mcp-Session-Id` (32 hex) |
 | any request before `initialize` | `400` `session_required`; unknown or terminated session id → `404` `session_not_found` |
 | `notifications/initialized` not yet sent | `400` `session_required` — a client must complete the handshake |
-| `MCP-Protocol-Version` | `400` for a revision this server does not speak, and `400` when it disagrees with the negotiated one |
+| `MCP-Protocol-Version` | `400` for a revision this transport does not speak (the list starts at `2025-03-26`), and `400` when it disagrees with the negotiated one |
 | `Origin` present | `403` `origin_rejected` unless listed in `allowedOrigins` (empty by default = every browser refused) |
 | no/wrong `Authorization` | `401` + `WWW-Authenticate: Bearer realm="dsh-direct"`, compared in constant time |
 | `GET /mcp` | `405` with `Allow: POST, DELETE` — this server has no server-initiated stream |
@@ -174,6 +175,7 @@ Request rules, all enforced and each covered by a test in `test_t274_http_transp
 | body over `maxBodyBytes` | `413`, refused before the body is buffered |
 | `Accept` without JSON or SSE | `406` |
 | unknown JSON-RPC method | `200` with `-32601` in-band, as JSON-RPC expects |
+| more `tools/call` in flight than `maxConcurrentRequests` | `429` `too_many_requests` + `Retry-After: 1`. `initialize` and notifications are never rate-limited, so a client that filled the queue can still get a session handle |
 | tool call slower than `requestTimeoutMs` | `504` `request_timeout` — **not** a refusal: the Host may already hold the prompt, so the transport never touches the ledger and the caller reconciles |
 
 Deliberately absent: server-initiated SSE streaming (hence 405 on GET), resumability via `Last-Event-ID`, and OAuth
@@ -219,6 +221,7 @@ node test_t273_endpoint.mjs                # descriptor lifecycle, bind_failed, 
 node test_t273_preflight.mjs               # every preflight check, including the defects it was written for
 node test_t273_plugin_config.mjs           # listener rules, unload releases the port, bind_failed at the plugin level
 node test_t274_http_transport.mjs          # Streamable HTTP over a real socket: session, Origin, auth, 202/405/413/504,
+node test_t275_http_interop.mjs            # 415 media type, no 2024-11-05 claim, -32602 initialize, 429, 504 lock semantics
                                            # SSE framing, and a full submit→result→duplicate run against a fake Host
 ```
 

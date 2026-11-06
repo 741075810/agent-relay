@@ -202,8 +202,13 @@ test('T274: initialize over a real socket negotiates the revision and issues a s
     assert.equal(init.headers.get('content-type'), 'application/json; charset=utf-8');
     assert.equal(sessionId.length, 32);
 
+    // T275 correction: 2024-11-05 has no Streamable HTTP, so echoing it would be a claim that cannot be true. The
+    // server answers with the newest revision it actually speaks; the stdio transport still speaks 2024-11-05.
     const old = await sc.open({ version: '2024-11-05' });
-    assert.equal(old.init.json.result.protocolVersion, '2024-11-05', 'a supported revision is echoed');
+    assert.equal(old.init.json.result.protocolVersion, LATEST_PROTOCOL_VERSION,
+      'a revision older than this transport is not echoed');
+    const supported = await sc.open({ version: '2025-03-26' });
+    assert.equal(supported.init.json.result.protocolVersion, '2025-03-26', 'a supported revision is echoed');
 
     const future = await sc.open({ version: '2026-99-99' });
     assert.equal(future.init.json.result.protocolVersion, LATEST_PROTOCOL_VERSION,
@@ -335,8 +340,16 @@ test('T274: malformed, batched and oversized bodies are refused with the transpo
     assert.equal(badVersion.status, 400);
     assert.equal(badVersion.json.error.data.code, CODES.unsupported_protocol_version);
 
-    const mismatch = await sc.call('POST', { sessionId, headers: { [V]: '2024-11-05' },
+    // T275: 2024-11-05 has no Streamable HTTP, so this header is refused by the supported set before the
+    // session-mismatch check is reached; the refusal names the revisions this transport does speak.
+    const preTransport = await sc.call('POST', { sessionId, headers: { [V]: '2024-11-05' },
       body: { jsonrpc: '2.0', id: 6, method: 'tools/list' } });
+    assert.equal(preTransport.status, 400);
+    assert.equal(preTransport.json.error.data.code, CODES.unsupported_protocol_version);
+    assert.deepEqual(preTransport.json.error.data.supported, ['2025-11-25', '2025-06-18', '2025-03-26']);
+
+    const mismatch = await sc.call('POST', { sessionId, headers: { [V]: '2025-06-18' },
+      body: { jsonrpc: '2.0', id: 7, method: 'tools/list' } });
     assert.equal(mismatch.status, 400, 'the header must agree with what initialize negotiated');
     assert.equal(mismatch.json.error.data.negotiated, LATEST_PROTOCOL_VERSION);
   } finally {

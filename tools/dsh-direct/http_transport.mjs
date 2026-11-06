@@ -33,8 +33,8 @@ import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 
 import {
-  CODES, DirectError, LATEST_PROTOCOL_VERSION, MIN_TOKEN_CHARS, SERVER_NAME, SERVER_VERSION,
-  SUPPORTED_PROTOCOL_VERSIONS, fail,
+  CODES, DirectError, LATEST_PROTOCOL_VERSION, MAX_CONCURRENT_DEFAULT, MIN_TOKEN_CHARS, SERVER_NAME, SERVER_VERSION,
+  SUPPORTED_HTTP_PROTOCOL_VERSIONS, fail,
 } from './protocol.mjs';
 import { handle } from './mcp_server.mjs';
 
@@ -79,21 +79,42 @@ function rpcResult(id, result) {
 const isInitialize = (message) => Boolean(message) && message.method === 'initialize';
 const isNotification = (message) => Boolean(message) && message.id === undefined && typeof message.method === 'string';
 
-/** Which revision this server may be spoken to with, and what it answers when it does not know the requested one. */
+/**
+ * Which revision this server may be spoken to with, and what it answers when it does not know the requested one.
+ * The set is the HTTP one: `2024-11-05` predates this transport, so a client asking for it gets the newest revision this
+ * endpoint actually speaks rather than a false echo.
+ */
 export function negotiateProtocolVersion(requested) {
-  if (typeof requested === 'string' && SUPPORTED_PROTOCOL_VERSIONS.includes(requested)) {
+  if (typeof requested === 'string' && SUPPORTED_HTTP_PROTOCOL_VERSIONS.includes(requested)) {
     return { version: requested, supported: true };
   }
   return { version: LATEST_PROTOCOL_VERSION, supported: false };
 }
 
 /**
+ * The client MUST send `application/json` on a Streamable HTTP POST. A body of the right shape under the wrong media
+ * type is a request the server cannot claim to understand, so it is refused with 415 before a byte of it is parsed.
+ * Parameters (`; charset=utf-8`) are accepted; anything else, including a missing header, is not.
+ */
+export function isJsonContentType(header) {
+  if (typeof header !== 'string') return false;
+  const base = header.split(';')[0].trim().toLowerCase();
+  return base === 'application/json';
+}
+
+/**
  * Build the request handler. Kept separate from `createServer` so the pieces can be reasoned about, though every test
  * drives it over a real socket: a handler exercised through a mock socket proves the handler, not the transport.
  */
-export function createMcpHttpHandler({ direct, http, token, serverInfo }) {
-  if (!http || http.enabled !== true) fail(CODES.http_disabled, 'the HTTP transport is not enabled in config.http');
+export function createMcpHttpHandler({ direct, http: rawHttp, token, serverInfo }) {
+  if (!rawHttp || rawHttp.enabled !== true) fail(CODES.http_disabled, 'the HTTP transport is not enabled in config.http');
+  // A caller may hand in a hand-built object (tests, embedded use); `loadHttpConfig` is the only path that fills every
+  // field, so missing values are defaulted here rather than dereferenced as undefined.
+  const http = { ...rawHttp, maxConcurrentRequests: Number.isInteger(rawHttp.maxConcurrentRequests)
+    ? rawHttp.maxConcurrentRequests : MAX_CONCURRENT_DEFAULT };
   const sessions = new Map();
+  // Tool calls currently in flight, bounded by `config.http.maxConcurrentRequests`. Declared before any handler runs.
+  const inFlight = { count: 0 };
 
   const send = (res, status, body, headers = {}) => {
     const payload = body === null ? '' : JSON.stringify(body);
@@ -163,8 +184,17 @@ export function createMcpHttpHandler({ direct, http, token, serverInfo }) {
       return rpcError(message.id, -32600, 'invalid request: a response is not accepted on this endpoint');
     }
     if (isInitialize(message)) {
-      const negotiated = negotiateProtocolVersion(message.params && message.params.protocolVersion);
+      const params = message.params;
+      // The specification requires `params.protocolVersion` on initialize. Answering without one would let a client
+      // believe it negotiated something it never asked for, so an absent or non-string version is invalid params.
+      if (!params || typeof params !== 'object' || Array.isArray(params) || typeof params.protocolVersion !== 'string') {
+        const received = params === undefined || params === null ? null : typeof params.protocolVersion;
+        return rpcError(message.id, -32602, 'invalid params: initialize requires a string protocolVersion',
+          { received });
+      }
+      const negotiated = negotiateProtocolVersion(params.protocolVersion);
       const created = { id: newSessionId(), protocolVersion: negotiated.version, initialized: false,
+        requestedVersion: params.protocolVersion,
         touchedAt: Date.now(), createdAt: Date.now() };
       sessions.set(created.id, created);
       prune();
@@ -195,6 +225,12 @@ export function createMcpHttpHandler({ direct, http, token, serverInfo }) {
     }
   };
 
+  /**
+   * Race the dispatch against `requestTimeoutMs`. When the timeout wins the dispatch keeps running — the Host may
+   * already hold the prompt — so its eventual outcome is recorded only in the ledger. The abandoned branch must never
+   * surface as an unhandled rejection: a process that dies right after a timeout is the failure mode this transport
+   * must not have.
+   */
   const withTimeout = async (promise) => {
     let timer = null;
     const timeout = new Promise((resolve) => {
@@ -205,6 +241,9 @@ export function createMcpHttpHandler({ direct, http, token, serverInfo }) {
       return await Promise.race([promise, timeout]);
     } finally {
       if (timer) clearTimeout(timer);
+      // Attached unconditionally: a no-op when the dispatch won the race, and the only thing standing between a late
+      // failure and an unhandled rejection when it did not.
+      promise.catch(() => {});
     }
   };
 
@@ -225,6 +264,14 @@ export function createMcpHttpHandler({ direct, http, token, serverInfo }) {
 
   const post = async (req, res) => {
     if (!authorized(req, res)) return;
+    // The media type comes before anything that reads the body: a valid JSON-RPC payload sent as text/plain is a
+    // request this server cannot claim to have understood, and T274 parsed it anyway.
+    if (!isJsonContentType(req.headers['content-type'])) {
+      sendError(res, 415, CODES.unsupported_content_type,
+        'Content-Type must be application/json on a Streamable HTTP request',
+        { contentType: req.headers['content-type'] === undefined ? null : String(req.headers['content-type']) });
+      return;
+    }
     const accept = String(req.headers.accept || '');
     const wantsJson = accept === '' || accept.includes('application/json') || accept.includes('*/*');
     const wantsSse = accept.includes('text/event-stream');
@@ -234,10 +281,10 @@ export function createMcpHttpHandler({ direct, http, token, serverInfo }) {
       return;
     }
     const versionHeader = req.headers['mcp-protocol-version'];
-    if (versionHeader !== undefined && !SUPPORTED_PROTOCOL_VERSIONS.includes(String(versionHeader))) {
+    if (versionHeader !== undefined && !SUPPORTED_HTTP_PROTOCOL_VERSIONS.includes(String(versionHeader))) {
       sendError(res, 400, CODES.unsupported_protocol_version,
-        'MCP-Protocol-Version names a revision this server does not speak',
-        { requested: String(versionHeader), supported: SUPPORTED_PROTOCOL_VERSIONS });
+        'MCP-Protocol-Version names a revision this transport does not speak (Streamable HTTP starts at 2025-03-26)',
+        { requested: String(versionHeader), supported: SUPPORTED_HTTP_PROTOCOL_VERSIONS });
       return;
     }
     let body = '';
@@ -288,7 +335,24 @@ export function createMcpHttpHandler({ direct, http, token, serverInfo }) {
         return;
       }
     }
-    const outcome = await withTimeout(dispatchOne(parsed, session, res));
+    // One bounded queue for the expensive path. `initialize` and notifications stay cheap and always answerable, so a
+    // client that filled the queue can still recover a session; `tools/call` is what holds Host sockets and session
+    // locks, and that is what gets the 429.
+    const isToolCall = parsed !== null && typeof parsed === 'object' && parsed.method === 'tools/call';
+    if (isToolCall && inFlight.count >= http.maxConcurrentRequests) {
+      sendError(res, 429, CODES.too_many_requests,
+        'too many tool calls in flight; retry after the current ones finish',
+        { maxConcurrentRequests: http.maxConcurrentRequests, inFlight: inFlight.count },
+        { 'retry-after': '1' });
+      return;
+    }
+    if (isToolCall) inFlight.count += 1;
+    let outcome = null;
+    try {
+      outcome = await withTimeout(dispatchOne(parsed, session, res));
+    } finally {
+      if (isToolCall) inFlight.count -= 1;
+    }
     if (outcome && outcome.__timeout === true) {
       // No answer in time. The transport reports that and nothing else: a `submit_task` in flight may already have been
       // admitted by the Host, so a caller that reads 504 as a refusal would lose track of a real prompt.

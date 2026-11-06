@@ -215,7 +215,8 @@ Add the `http` block to `<HOME>/.dsh/dsh-direct/config.json` (the example ships 
   "allowedOrigins": [],
   "maxBodyBytes": 1048576,
   "requestTimeoutMs": 120000,
-  "maxSessions": 16
+  "maxSessions": 16,
+  "maxConcurrentRequests": 8
 }
 ```
 

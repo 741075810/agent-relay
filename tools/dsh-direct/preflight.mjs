@@ -238,7 +238,8 @@ export function checkHttpConfig(config) {
   }
   const checks = [];
   checks.push(result('http.config', 'ok', 'Streamable HTTP enabled on http://' + http.host + ':' + http.port + http.path
-    + ' (' + http.maxSessions + ' sessions max, ' + http.requestTimeoutMs + ' ms request timeout)'));
+    + ' (' + http.maxSessions + ' sessions max, ' + http.maxConcurrentRequests + ' concurrent tool calls, '
+    + http.requestTimeoutMs + ' ms request timeout)'));
   const problems = [];
   if (!existsSync(http.authTokenFile)) {
     problems.push('the HTTP token file does not exist, so the transport would refuse to start');
