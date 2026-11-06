@@ -147,16 +147,29 @@ TRUSTED_COMPLETION_SOURCES = {
     'interrupted': 'bridge.task_events.task.interrupted',
 }
 
+# T266: which status each trusted event justifies -- the same mapping `run_origin.EVENTS_FOR_STATUS` and
+# `terminal_source.FACT_TO_STATUS` use. A Bridge fact `interrupted` is announced as `failed`, so its event is
+# evidence for `failed`; requiring the single name `task.failed` refused the provenance the host itself had just
+# resolved, which turned every interrupted run into an unprovable one (`relay_source_untrusted`) and produced no
+# notice for it. The check is still "the provenance must agree with the status", only now complete.
+EVENT_STATUS = {
+    'bridge.task_events.task.completed': 'completed',
+    'bridge.task_events.task.failed': 'failed',
+    'bridge.task_events.task.interrupted': 'failed',
+}
+
 
 def completion_source_ok(item):
-    """Whether this candidate's stated instant has a provenance that matches its own status."""
+    """Whether this candidate's stated instant has a provenance that matches its own status.
+
+    The comparison is `EVENT_STATUS[source] == status`, not `source == TRUSTED_COMPLETION_SOURCES[status]`: one status
+    can be the resolved form of several Bridge facts (`interrupted` -> `failed`), and the instant is still evidence.
+    A source that names no trusted event, or one that resolves to a different status, is refused.
+    """
     if not isinstance(item, dict):
         return False
-    expected = TRUSTED_COMPLETION_SOURCES.get(item.get('status'))
-    if expected is None:
-        return False
-    source = item.get('completedAtSource')
-    return isinstance(source, str) and source == expected
+    expected = EVENT_STATUS.get(item.get('completedAtSource'))
+    return expected is not None and expected == item.get('status')
 
 
 def trusted_completed_ms(item):

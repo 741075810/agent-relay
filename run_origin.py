@@ -90,10 +90,23 @@ TERMINAL_SQL = (
     "where e.kind in (%s) and t.provider_run_id is not null and t.provider_run_id <> '' "
     'order by t.provider_run_id, e.created_at' % ','.join("'%s'" % kind for kind in TERMINAL_EVENTS))
 
-# Which event kind is allowed to speak for which resolved status. An event that contradicts the status is not evidence
-# of anything, so the run's completion time stays unknown rather than becoming a guess.
-EVENT_FOR_STATUS = {'completed': 'task.completed', 'failed': 'task.failed',
-                    'interrupted': 'task.interrupted'}
+# Which event kinds are allowed to speak for which resolved status. An event that contradicts the status is not
+# evidence of anything, so the run's completion time stays unknown rather than becoming a guess.
+#
+# T266: this is a *set* per status, not one kind per status. `terminal_source.FACT_TO_STATUS` resolves a Bridge
+# fact `interrupted` to the announceable status `failed` (an interruption is not a decision by the operator), and
+# the event the Bridge writes for it is `task.interrupted`. Comparing the instant against the single kind
+# `task.failed` therefore rejected the Bridge's own row, every interrupted run reported `completedAt: null`, and
+# the relay -- which refuses to decide a run without a credible instant -- deferred it for ever with no notice.
+# `task.interrupted` is accepted for `failed` only, and `task.completed` still does not speak for it.
+EVENTS_FOR_STATUS = {
+    'completed': ('task.completed',),
+    'failed': ('task.failed', 'task.interrupted'),
+    'interrupted': ('task.interrupted',),
+}
+
+# The first kind for each status: what an agreeing event is called when there is one obvious name for it.
+EVENT_FOR_STATUS = {status: kinds[0] for status, kinds in EVENTS_FOR_STATUS.items()}
 
 SECONDS_THRESHOLD = 100000000000     # anything below this is seconds, not milliseconds
 
@@ -343,18 +356,19 @@ def completion_for_status(run_id, status, times):
     """The completion instant that is credible for this run and status, or None.
 
     A `task.completed` event next to a `failed` status is a contradiction, not a timestamp: the run's instant is unknown
-    until the sources agree.
+    until the sources agree. The agreement is checked against every event kind that justifies the status, because a
+    status may be the resolved form of more than one fact (`interrupted` is announced as `failed`).
     """
     entry = (times or {}).get(run_id)
     if not entry:
         return None
     if not status:
         return entry['completedAtMs']
-    expected = EVENT_FOR_STATUS.get(status)
-    if expected is None:
+    kinds = EVENTS_FOR_STATUS.get(status)
+    if kinds is None:
         # A terminal status this table does not describe: keep the instant but do not claim agreement.
         return entry['completedAtMs'] if entry['event'] in TERMINAL_EVENTS else None
-    if entry['event'] != expected:
+    if entry['event'] not in kinds:
         return None
     return entry['completedAtMs']
 
