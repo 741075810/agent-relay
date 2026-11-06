@@ -326,11 +326,18 @@ def read_terminal_times(db_path=None, attempts=ATTEMPTS):
             continue
         entry = times.get(run_id)
         if entry is None:
-            times[run_id] = {'completedAtMs': instant, 'event': kind, 'events': 1}
-            continue
+            entry = times[run_id] = {'completedAtMs': instant, 'event': kind, 'events': 0, 'kinds': {}}
         entry['events'] += 1
-        # Several terminal events for one run: the earliest is when it first became terminal, which is the instant a
-        # notice may not predate. The kind is kept as the first one seen, in `created_at` order.
+        # T267: the earliest instant *per kind* is kept, because one run can legitimately receive more than one
+        # terminal event: an interruption followed by a resume that completes writes `task.interrupted` and then
+        # `task.completed`. Keeping only the single earliest event made the later kind unreachable, so the run's
+        # resolved status had no agreeing event and its instant became `unknown` -- which the relay then refuses to
+        # decide, for ever.
+        known = entry['kinds'].get(kind)
+        if known is None or instant < known:
+            entry['kinds'][kind] = instant
+        # `completedAtMs`/`event` stay "the earliest terminal moment and the kind that produced it", unchanged for
+        # every reader that only asks when the run first became terminal.
         if instant < entry['completedAtMs']:
             entry['completedAtMs'] = instant
             entry['event'] = kind
@@ -352,25 +359,52 @@ def _epoch_ms(value):
     return int(round(value))
 
 
+def completion_evidence(run_id, status, times):
+    """`(instant, kind)`: the earliest instant whose event justifies this status, or `(None, None)`.
+
+    T267: a run can carry several terminal events. An interruption followed by a completed resume is the normal shape
+    of "the Bridge said interrupted, DSH kept working, and the task finished anyway", and both events are real facts
+    about the same run. The status decides which of them may speak:
+
+      * the kind must justify the status (the same table `EVENTS_FOR_STATUS` uses);
+      * among the kinds that do, the earliest wins -- a notice may never predate the moment the run became terminal
+        in that way, and for `failed` (which absorbs `interrupted`) the interruption is the stricter instant.
+
+    A kind that does not justify the status is not evidence, exactly as before: this function never turns a
+    contradiction into a timestamp.
+    """
+    entry = (times or {}).get(run_id)
+    if not entry:
+        return None, None
+    if not status:
+        return entry['completedAtMs'], entry['event']
+    kinds = EVENTS_FOR_STATUS.get(status)
+    if kinds is None:
+        # A terminal status this table does not describe: keep the instant but do not claim agreement.
+        return (entry['completedAtMs'], entry['event']) if entry['event'] in TERMINAL_EVENTS else (None, None)
+    by_kind = entry.get('kinds') or {}
+    if by_kind:
+        best = None
+        for kind in kinds:
+            instant = by_kind.get(kind)
+            if instant is not None and (best is None or instant < best[0]):
+                best = (instant, kind)
+        return best if best is not None else (None, None)
+    # A `times` mapping built by an older reader has only the single event; keep its exact agreement rule.
+    if entry['event'] in kinds:
+        return entry['completedAtMs'], entry['event']
+    return None, None
+
+
 def completion_for_status(run_id, status, times):
     """The completion instant that is credible for this run and status, or None.
 
     A `task.completed` event next to a `failed` status is a contradiction, not a timestamp: the run's instant is unknown
     until the sources agree. The agreement is checked against every event kind that justifies the status, because a
-    status may be the resolved form of more than one fact (`interrupted` is announced as `failed`).
+    status may be the resolved form of more than one fact (`interrupted` is announced as `failed`) and because one run
+    may legitimately write more than one terminal event.
     """
-    entry = (times or {}).get(run_id)
-    if not entry:
-        return None
-    if not status:
-        return entry['completedAtMs']
-    kinds = EVENTS_FOR_STATUS.get(status)
-    if kinds is None:
-        # A terminal status this table does not describe: keep the instant but do not claim agreement.
-        return entry['completedAtMs'] if entry['event'] in TERMINAL_EVENTS else None
-    if entry['event'] not in kinds:
-        return None
-    return entry['completedAtMs']
+    return completion_evidence(run_id, status, times)[0]
 
 
 def load_cache(state_dir):

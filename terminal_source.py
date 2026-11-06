@@ -1235,7 +1235,7 @@ def mirror(state_dir, root=None, bridge_db=None, origin_fixture=None):
         status = resolve_status(run.get('status'), fact)
         if not status:
             continue  # not terminal yet; the mirror reports finished runs only
-        completed_ms = run_origin.completion_for_status(run_id, status, times)
+        completed_ms, completed_kind = run_origin.completion_evidence(run_id, status, times)
         report['candidates'].append({
             'runId': run_id,
             'status': status,
@@ -1246,8 +1246,10 @@ def mirror(state_dir, root=None, bridge_db=None, origin_fixture=None):
             # `None` is a statement, not a gap: this run has no terminal event, so when it finished is unknown and
             # nothing downstream may compute it from `startedAt`.
             'completedAt': completed_ms,
-            'completedAtSource': ('bridge.task_events.%s' % (times or {})[run_id]['event']
-                                  if completed_ms is not None else 'unknown'),
+            # T267: the provenance is the event the instant came from, not a fixed one per status. A run that was
+            # interrupted and later completed carries both kinds, and only the agreeing one may name the instant.
+            'completedAtSource': ('bridge.task_events.%s' % completed_kind
+                                  if completed_ms is not None and completed_kind else 'unknown'),
             'pageDelivery': 'unknown',
         })
     report['ok'] = True
