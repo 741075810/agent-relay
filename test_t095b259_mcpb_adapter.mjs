@@ -2,7 +2,10 @@
 import runTest from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
+import childProcess from 'node:child_process';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, existsSync,
   realpathSync, unlinkSync, symlinkSync } from 'node:fs';
 import os from 'node:os';
@@ -205,6 +208,26 @@ await test('unsupported get_task required criteria refuses before any get_task p
   assert.equal(f.requests.some((r) => r.packet.params?.name === 'get_task'), false);
 });
 
+for (const [mode, code] of [['sse-limit', 'response_limit'], ['invalid-utf8', 'transport_error'],
+  ['duplicate-reply', 'protocol_invalid'], ['server-request', 'server_request_unsupported'], ['batch-limit', 'protocol_invalid']]) {
+  await test('T260 bounded protocol refusal ' + mode, async (t) => {
+    const f = await fixture(t, '', (f, packet, req, res) => {
+      if (packet.method !== 'initialize') return false;
+      const reply = { jsonrpc: '2.0', id: packet.id, result: { protocolVersion: '2025-03-26', capabilities: { tools: {} } } };
+      res.writeHead(200, { 'content-type': mode === 'sse-limit' ? 'text/event-stream' : 'application/json' });
+      if (mode === 'sse-limit') res.end('data: ' + 'x'.repeat(300000));
+      else if (mode === 'invalid-utf8') res.end(Buffer.from([0xff]));
+      else if (mode === 'duplicate-reply') res.end(JSON.stringify([reply, reply]));
+      else if (mode === 'server-request') res.end(JSON.stringify({ jsonrpc: '2.0', id: 99, method: 'sampling/createMessage', params: {} }));
+      else res.end(JSON.stringify([...Array.from({ length: 32 }, () => ({ jsonrpc: '2.0', method: 'notifications/progress' })), reply]));
+      return true;
+    });
+    const result = await f.client().submitTask(INPUT);
+    assert.equal(result.code, code); assert.equal(JSON.stringify(result).includes(TOKEN), false);
+    assert.equal(f.requests.length, 1); assert.equal(f.journal().jobs.length, 0);
+  });
+}
+
 for (const mode of ['sse', 'sse-cr', 'sse-cr-open', 'text']) await test(mode + ' standard response supported', async (t) => {
   const f = await fixture(t, mode); assert.equal((await f.client().submitTask(INPUT)).ok, true);
 });
@@ -229,6 +252,59 @@ for (const mode of ['disconnect', 'timeout', 'bad-receipt', 'tool-error', 'reuse
     assert.equal(f.requests.length, count);
     assert.equal(f.requests.filter((r) => r.packet.params?.name === 'submit_task').length, 1);
   });
+
+for (const output of ['H source.txt', 'Z source.txt\0']) await test('T260 malformed index listing fails closed: ' + JSON.stringify(output), async (t) => {
+  const f = await fixture(t), original = childProcess.execFileSync; let result;
+  childProcess.execFileSync = (file, args, options) => args.includes('ls-files') && args.includes(realpathSync.native(f.root)) ? output : original(file, args, options);
+  syncBuiltinESMExports();
+  try { result = await f.client().submitTask(INPUT); }
+  finally { childProcess.execFileSync = original; syncBuiltinESMExports(); }
+  assert.equal(result.code, 'workspace_unavailable'); assert.equal(f.requests.length, 0); assert.equal(existsSync(f.state), false);
+});
+await test('T260 filename marker is not mistaken for an unsafe index tag', async (t) => {
+  const f = await fixture(t); writeFileSync(path.join(f.root, 'h S marker.txt'), 'fixture'); f.git('add', '.'); f.git('commit', '-qm', 'fixture filename');
+  assert.equal((await f.client().submitTask(INPUT)).ok, true);
+});
+
+for (const flag of ['--assume-unchanged', '--skip-worktree']) {
+  await test('T260 hidden initial edit under ' + flag + ' stops before networking', async (t) => {
+    const f = await fixture(t); f.git('update-index', flag, 'source.txt');
+    writeFileSync(path.join(f.root, 'source.txt'), 'preserve hidden edit');
+    assert.equal(f.git('status', '--porcelain=v1').trim(), '');
+    const index = readFileSync(path.join(f.root, '.git', 'index'));
+    assert.equal((await f.client().submitTask(INPUT)).code, 'workspace_index_unverified');
+    assert.equal(f.requests.length, 0); assert.equal(existsSync(f.state), false);
+    assert.equal(readFileSync(path.join(f.root, 'source.txt'), 'utf8'), 'preserve hidden edit');
+    assert.deepEqual(readFileSync(path.join(f.root, '.git', 'index')), index);
+  });
+  await test('T260 clean flagged index under ' + flag + ' is unverified, not clean', async (t) => {
+    const f = await fixture(t); f.git('update-index', flag, 'source.txt');
+    assert.equal((await f.client().submitTask(INPUT)).code, 'workspace_index_unverified'); assert.equal(f.requests.length, 0);
+  });
+  await test('T260 hidden edit during handshake under ' + flag + ' stops before reservation', async (t) => {
+    let index;
+    const f = await fixture(t, '', (f, packet) => {
+      if (packet.method === 'tools/list') {
+        f.git('update-index', flag, 'source.txt'); writeFileSync(path.join(f.root, 'source.txt'), 'preserve late hidden edit');
+        index = readFileSync(path.join(f.root, '.git', 'index'));
+      } return false;
+    });
+    assert.equal((await f.client().submitTask(INPUT)).code, 'workspace_index_unverified');
+    assert.equal(f.requests.length, 3); assert.equal(f.journal().jobs.length, 0);
+    assert.equal(readFileSync(path.join(f.root, 'source.txt'), 'utf8'), 'preserve late hidden edit');
+    assert.deepEqual(readFileSync(path.join(f.root, '.git', 'index')), index);
+  });
+}
+await test('T260 failed Git stderr is captured and never forwarded to application logs', async (t) => {
+  const f = await fixture(t); f.git('config', 'core.ignorecase', TOKEN);
+  const script = path.join(path.dirname(f.root), 'git-error-child.mjs');
+  writeFileSync(script, `import {createMcpbAdapter} from ${JSON.stringify(new URL('./tools/continuation/mcpb_adapter.mjs', import.meta.url).href)};\n` +
+    `const client=createMcpbAdapter({...${JSON.stringify(f.options)},now:()=>12345678});\n` +
+    `console.log(JSON.stringify(await client.submitTask(${JSON.stringify(INPUT)})));\n`, 'utf8');
+  const child = spawnSync(process.execPath, [script], { encoding: 'utf8', timeout: 15000, env: gitPreflightEnvironment(process.env) });
+  assert.equal(child.status, 0); assert.deepEqual(JSON.parse(child.stdout), { ok: false, code: 'workspace_unavailable' });
+  assert.equal(child.stderr, ''); assert.equal(f.requests.length, 0); assert.equal(existsSync(f.state), false);
+});
 
 await test('dirty initial repository blocks networking without discarding changes', async (t) => {
   const f = await fixture(t); writeFileSync(path.join(f.root, 'source.txt'), 'operator changes');
@@ -273,6 +349,63 @@ await test('missing/mismatched terminal binding does not release the active slot
   assert.equal((await f.client().getTask(TASK())).code, 'unknown_outcome');
   assert.equal((await f.client().submitTask({ ...INPUT, clientRequestId: 'fixture-other' })).code, 'unknown_outcome');
 });
+await test('T260 failed reservation preserves empty journal and sends no submit', async (t) => {
+  let armed = false;
+  const f = await fixture(t, '', (f, packet) => { if (packet.method === 'tools/list') armed = true; return false; });
+  const original = fs.openSync, file = path.join(f.state, 'mcpb-intents.json'); let result;
+  fs.openSync = (name, ...args) => {
+    if (armed && String(name).startsWith(file + '.tmp-')) throw Object.assign(new Error('fixture ENOSPC'), { code: 'ENOSPC' });
+    return original(name, ...args);
+  }; syncBuiltinESMExports();
+  try { result = await f.client().submitTask(INPUT); }
+  finally { fs.openSync = original; syncBuiltinESMExports(); }
+  assert.equal(result.code, 'operation_failed'); assert.equal(f.journal().jobs.length, 0);
+  assert.equal(f.requests.length, 3); assert.equal(existsSync(path.join(f.state, '.mcpb-lock')), false);
+  assert.equal((await f.client().submitTask(INPUT)).ok, true);
+  assert.equal(f.requests.filter(r => r.packet.params?.name === 'submit_task').length, 1);
+});
+await test('T260 failed terminal save writes UNKNOWN and never releases the slot', async (t) => {
+  const f = await fixture(t, 'active'); await f.client().submitTask(INPUT);
+  const original = fs.openSync, file = path.join(f.state, 'mcpb-intents.json'); let failures = 0, result;
+  fs.openSync = (name, ...args) => {
+    if (String(name).startsWith(file + '.tmp-') && failures++ === 0) throw Object.assign(new Error('fixture ENOSPC'), { code: 'ENOSPC' });
+    return original(name, ...args);
+  }; syncBuiltinESMExports();
+  try { result = await f.client().getTask(TASK()); }
+  finally { fs.openSync = original; syncBuiltinESMExports(); }
+  assert.equal(result.code, 'unknown_outcome'); assert.equal(f.journal().jobs[0].phase, 'unknown');
+  assert.equal(existsSync(path.join(f.state, '.mcpb-lock')), false); const count = f.requests.length;
+  assert.equal((await f.client().getTask(TASK())).code, 'unknown_outcome');
+  assert.equal((await f.client().submitTask({ ...INPUT, clientRequestId: 'fixture-after-terminal-error' })).code, 'unknown_outcome');
+  assert.equal(f.requests.length, count);
+});
+
+for (const failure of ['binding-failure', 'terminal-write-failure']) await test('T260 failed UNKNOWN persistence retains lock and stops fresh instances: ' + failure, async (t) => {
+  let broken = failure === 'binding-failure';
+  const f = await fixture(t, 'active', (f, packet, req, res) => {
+    if (packet.params?.name !== 'get_task' || !broken) return false;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ jsonrpc: '2.0', id: packet.id, result: { structuredContent: { task: { task_id: TASK(), status: 'completed' } } } })); return true;
+  });
+  await f.client().submitTask(INPUT);
+  const file = path.join(f.state, 'mcpb-intents.json'), prior = readFileSync(file);
+  const original = fs.openSync, prefix = file + '.tmp-'; let result;
+  fs.openSync = (name, ...args) => {
+    if (String(name).startsWith(prefix)) { const error = new Error('fixture ENOSPC'); error.code = 'ENOSPC'; throw error; }
+    return original(name, ...args);
+  };
+  syncBuiltinESMExports();
+  try { result = await f.client().getTask(TASK()); }
+  finally { fs.openSync = original; syncBuiltinESMExports(); }
+  // A persistence failure preserves the old bytes; an existing lock is now the unresolved guard.
+  assert.deepEqual(readFileSync(file), prior);
+  assert.equal(result.code, 'journal_unresolved'); assert.equal(existsSync(path.join(f.state, '.mcpb-lock')), true);
+  broken = false; const count = f.requests.length;
+  assert.equal((await f.client().getTask(TASK())).code, 'journal_busy');
+  assert.equal((await f.client().submitTask({ ...INPUT, clientRequestId: 'fixture-after-error' })).code, 'journal_busy');
+  assert.equal(f.requests.length, count); assert.deepEqual(readFileSync(file), prior);
+});
+
 await test('deleted/corrupt journal is never reinitialized', async (t) => {
   const f = await fixture(t); await f.client().submitTask(INPUT);
   const file = path.join(f.state, 'mcpb-intents.json'); unlinkSync(file);

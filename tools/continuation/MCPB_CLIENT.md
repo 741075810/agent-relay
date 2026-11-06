@@ -69,8 +69,11 @@ lost/malformed response preserves the reservation. There is **zero automatic sub
 An atomic `.mcpb-lock` directory prevents another instance from writing the same journal. Locks
 are not reclaimed automatically, including stale ones. Missing/corrupt journals, binding changes,
 extra fields, and symlinks fail closed; an existing empty directory is not silently initialized.
-There is no reset/force-unlock API. Preserve unresolved state for exact operator reconciliation;
-do not delete/recreate the store or change request keys to resume an unknown operation.
+There is no reset/force-unlock API. If an owned-task read observes an unresolved result and the
+UNKNOWN journal write fails, `journal_unresolved` is returned and the owned lock is retained.
+The previous journal bytes can still say submitted; they are not permission to retry or release
+the slot. New instances stop at `journal_busy`. Preserve both journal and lock for exact operator
+reconciliation; do not delete/recreate the store or change request keys to resume an unknown operation.
 
 `getTask` releases a nonterminal slot only after an exact recorded `task_id` and matching
 `project_id/provider_id/provider_session_id/installation_id` in `result.task` plus a recognized
@@ -80,7 +83,11 @@ session. The inspected public `list_tasks` contract has no exact request-ID look
 
 Git preflight copies only named OS/runtime environment fields; it never enumerates or forwards
 internal credential variables. It sets `GIT_TERMINAL_PROMPT=0`, `GIT_OPTIONAL_LOCKS=0`, and uses
-`--no-optional-locks`, `core.fsmonitor=false`, and `core.untrackedCache=false`.
+`--no-optional-locks`, `core.fsmonitor=false`, and `core.untrackedCache=false`. Child stderr is
+captured, never forwarded to application logs, and failures return only stable sanitized codes.
+A bounded read-only `ls-files -v -z` rejects assume-unchanged/skip-worktree indices with
+`workspace_index_unverified`, even if porcelain is empty. Sparse-checkout S paths are deliberately
+unsupported by this preflight. No index flags are cleared. Normal
 Git status includes tracked/staged/untracked changes. Paths use native OS canonicalization;
 repository-root equality requires directory device/inode identities (BigInt, nonzero inode).
 Unavailable identity fails closed; a different directory remains rejected. A changed canonical

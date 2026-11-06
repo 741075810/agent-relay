@@ -39,12 +39,16 @@ export function gitPreflightEnvironment(source) {
 function cleanWorkspace(root) {
   try {
     const options = { encoding: 'utf8', timeout: 5000, maxBuffer: 256 * 1024, windowsHide: true,
-      env: gitPreflightEnvironment(process.env) };
+      stdio: ['ignore', 'pipe', 'pipe'], env: gitPreflightEnvironment(process.env) };
     const base = ['--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', '-C', root];
     const top = execFileSync('git', [...base, 'rev-parse', '--show-toplevel'], options).trim();
     const actual = lstatSync(canonical(root), { bigint: true }), reported = lstatSync(canonical(top), { bigint: true });
     if (!actual.isDirectory() || !reported.isDirectory() || actual.ino <= 0n || reported.ino <= 0n) return 'workspace_unavailable';
     if (actual.dev !== reported.dev || actual.ino !== reported.ino) return 'workspace_not_repository_root';
+    const index = execFileSync('git', [...base, 'ls-files', '-v', '-z'], options);
+    const entries = index === '' ? [] : index.slice(0, -1).split('\0');
+    if ((index !== '' && !index.endsWith('\0')) || entries.some((entry) => !/^[HSMRCK?hsmrck] [\s\S]+$/.test(entry))) return 'workspace_unavailable';
+    if (entries.some((entry) => /^[a-zS] /.test(entry))) return 'workspace_index_unverified';
     const status = execFileSync('git', [...base, 'status', '--porcelain=v1', '--untracked-files=all'], options);
     return status.trim() ? 'dirty_workspace' : null;
   } catch { return 'workspace_unavailable'; }
@@ -153,9 +157,11 @@ export function createMcpbAdapter(options = {}) {
       if (fresh) saveJournal(file, journal);
       return await callback(config, file, journal);
     } catch (error) {
+      // If an observed UNKNOWN could not be persisted, the owned lock must remain as the halt guard.
+      if (error?.message === 'journal_unresolved') lock = null;
       const allowed = new Set(['disabled', 'not_authorised', 'configuration_invalid', 'credentials_missing',
-        'workspace_not_repository_root', 'workspace_unavailable', 'dirty_workspace', 'journal_inside_workspace',
-        'journal_invalid', 'journal_busy', 'capability_unverified', 'protocol_invalid', 'protocol_unsupported',
+        'workspace_not_repository_root', 'workspace_unavailable', 'workspace_index_unverified', 'dirty_workspace', 'journal_inside_workspace',
+        'journal_invalid', 'journal_busy', 'journal_unresolved', 'capability_unverified', 'protocol_invalid', 'protocol_unsupported',
         'server_request_unsupported', 'rpc_error', 'response_limit', 'http_error', 'timeout', 'transport_error']);
       return refused(allowed.has(error?.message) ? error.message : 'operation_failed');
     } finally {
@@ -244,7 +250,8 @@ export function createMcpbAdapter(options = {}) {
           saveJournal(file, journal);
           return ack(job);
         } catch {
-          job.phase = 'unknown'; saveJournal(file, journal);
+          job.phase = 'unknown';
+          try { saveJournal(file, journal); } catch { fail('journal_unresolved'); }
           return refused('unknown_outcome');
         }
       }, false);
