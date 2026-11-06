@@ -1,10 +1,21 @@
 {
-  "$comment": "dsh-direct MCP server config. Copy outside the repository, fill in real values, keep it private. Exactly one locator: endpointFile (preferred: the plugin writes it at bind time, so a Desktop restart does not break the client) or hostUrl (only for a plugin pinned to a fixed port). The token file must hold at least 32 characters.",
+  "$comment": "dsh-direct MCP server config. Copy outside the repository, fill in real values, keep it private. Exactly one locator: endpointFile (preferred: the plugin writes it at bind time, so a Desktop restart does not break the client) or hostUrl (only for a plugin pinned to a fixed port). Both token files must hold at least 32 characters.",
   "endpointFile": "<USERPROFILE>/.dsh/dsh-direct/endpoint.json",
   "tokenFile": "<USERPROFILE>/.dsh/dsh-direct/host.token",
   "stateDir": "<USERPROFILE>/.dsh/dsh-direct/state",
   "boundSessionIds": ["session-11111111-2222-4333-8444-555566667777"],
   "boundCwds": ["<WORKSPACE>/project"],
   "boundProjectIds": [],
-  "maxPolls": 3
+  "maxPolls": 3,
+  "http": {
+    "$comment": "Optional Streamable HTTP transport. Off unless enabled is the boolean true; stdio stays the default. The listener is always 127.0.0.1. allowedOrigins is empty by default, which refuses every request that carries an Origin header -- name the origin a browser client sends, or leave it empty for a CLI client. requestTimeoutMs is how long the transport waits for a tool call; a call that outlives it answers 504 and must be reconciled, because the Host may already hold the prompt.",
+    "enabled": false,
+    "port": 42732,
+    "path": "/mcp",
+    "authTokenFile": "<USERPROFILE>/.dsh/dsh-direct/http.token",
+    "allowedOrigins": [],
+    "maxBodyBytes": 1048576,
+    "requestTimeoutMs": 120000,
+    "maxSessions": 16
+  }
 }

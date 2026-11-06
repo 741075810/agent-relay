@@ -187,6 +187,67 @@ Register the MCP server with your MCP client as a stdio server:
 }
 ```
 
+## 6b. Optional: serve MCP over Streamable HTTP instead of stdio
+
+Only needed when the MCP client speaks HTTP rather than launching a process. It is off by default and it uses a separate
+token: the HTTP listener is another credential surface, so it never reuses the Host token.
+
+```powershell
+$httpToken = Join-Path $HOME_DIR '.dsh\dsh-direct\http.token'
+if (-not (Test-Path -LiteralPath $httpToken)) {
+  $bytes = New-Object byte[] 32
+  [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+  (($bytes | ForEach-Object { $_.ToString('x2') }) -join '') |
+    Set-Content -LiteralPath $httpToken -NoNewline -Encoding ascii
+}
+icacls $httpToken /inheritance:r /grant:r "$($env:USERNAME):(R)" | Out-Null
+(Get-Content -LiteralPath $httpToken -Raw).Length     # expect 64
+```
+
+Add the `http` block to `<HOME>/.dsh/dsh-direct/config.json` (the example ships it disabled):
+
+```json
+"http": {
+  "enabled": true,
+  "port": 42732,
+  "path": "/mcp",
+  "authTokenFile": "<HOME>/.dsh/dsh-direct/http.token",
+  "allowedOrigins": [],
+  "maxBodyBytes": 1048576,
+  "requestTimeoutMs": 120000,
+  "maxSessions": 16
+}
+```
+
+`enabled` must be the JSON boolean `true`; the string `"true"` is refused by name. The listener is always `127.0.0.1` —
+`host` is not a knob. `allowedOrigins` stays empty for a CLI client, which sends no `Origin` header; a browser-based
+client must have its exact origin listed, otherwise every request from it is `403`.
+
+Start it and smoke-test the handshake:
+
+```powershell
+Start-Process -FilePath '<NODE_EXE>' -ArgumentList @("$REPO\tools\dsh-direct\mcp_server.mjs", '--config',
+  (Join-Path $HOME_DIR '.dsh\dsh-direct\config.json'))
+# stderr banner: dsh-direct: MCP Streamable HTTP on http://127.0.0.1:42732/mcp (loopback only, 0 allowed origin(s), ...)
+
+$body = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"smoke","version":"1.0.0"}}}'
+$token = Get-Content -LiteralPath $httpToken -Raw
+Invoke-WebRequest -Method Post -Uri 'http://127.0.0.1:42732/mcp' -Body $body -ContentType 'application/json' `
+  -Headers @{ Authorization = "Bearer $token"; Accept = 'application/json' }
+```
+
+Expect `200`, a 32-hex `Mcp-Session-Id`, and `protocolVersion: "2025-11-25"` in the body. `GET` on the same URL answers
+`405` with `Allow: POST, DELETE`: this server pushes nothing, so it never holds a stream open. A missing token answers
+`401`, a foreign `Origin` answers `403`, and a body over `maxBodyBytes` answers `413`.
+
+Re-run the preflight with the same `--config`: `http.config`, `http.origins` and `http.token` appear, and `http.token`
+fails if the file is missing, short, or is the same file as the Host token.
+
+**This is not a ChatGPT Web connection.** The listener is loopback-only and plain HTTP, so nothing outside this machine
+can reach it by design. Registering a custom MCP connector in ChatGPT is a user action in the ChatGPT settings, and it
+would need an HTTPS endpoint this repository does not create and does not authorise. Level C below stays unmet until
+that is done deliberately, with a decision about exposure.
+
 ## 7. First live check (level C)
 
 1. `list_sessions` → exactly the bound session, plus `protocol: dsh-api-session-controller@0.2.0-rc.2`.
@@ -216,11 +277,12 @@ socket sweep — a test asserts that a second instance can bind the same port im
 
 | level | requirement | status |
 |---|---|---|
-| **A** | plugin and MCP server verified in isolation against a fake Host and a fake Cordis context, plus this preflight | met by the repo's tests |
+| **A** | plugin, MCP server (stdio and Streamable HTTP) and preflight verified in isolation against a fake Host; the HTTP layer driven over a real socket, including a full submit→result→duplicate run | met by the repo's tests |
 | **B** | the real Desktop loads the plugin and the bridge answers on loopback | requires steps 1–6 by hand |
 | **C** | an existing session received a real prompt without the Bridge | requires step 7 |
 
-`mcp_server.mjs` is a working MCP stdio server, but nothing in this repository registers it with ChatGPT's custom-MCP
-settings: that registration is a Web-side action in the ChatGPT UI, and it needs a transport that reaches this machine.
-Stdio means the client launches the process locally, which works for a desktop MCP client; a Web client needs an
-HTTPS endpoint, and this bridge deliberately binds loopback only. That gap is stated rather than papered over.
+`mcp_server.mjs` is a working MCP server on both transports, but nothing in this repository registers it with ChatGPT's
+custom-MCP settings: that registration is a Web-side action in the ChatGPT UI, and it needs a transport that reaches this
+machine. Stdio means the client launches the process locally, which works for a desktop MCP client; the HTTP transport is
+loopback-only, which works for a local HTTP MCP client. A Web client needs an HTTPS endpoint reachable from the internet,
+and no part of this repository creates one or authorises one. That gap is stated rather than papered over.

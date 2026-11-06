@@ -19,7 +19,7 @@ import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
 import {
-  CODES, DirectError, PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION, TOOLS, fail, toolByName,
+  CODES, DirectError, PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION, TOOLS, fail, loadHttpConfig, toolByName,
   validateListSessions, validateSubmitTask, validateTaskId,
 } from './protocol.mjs';
 import { HostClient } from './host_client.mjs';
@@ -39,7 +39,7 @@ const DEFAULT_MAX_POLLS = 3;
  */
 export const CONFIG_FIELDS = Object.freeze(['hostUrl', 'endpointFile', 'tokenFile', 'stateDir', 'worktreeRoot',
   'allowDirtyWorktree', 'expectKind', 'expectProtocol', 'boundProjectIds', 'boundSessionIds', 'boundCwds',
-  'maxPolls']);
+  'maxPolls', 'http']);
 
 export function loadConfig(configPath) {
   const raw = JSON.parse(readFileSync(configPath, 'utf8'));
@@ -56,6 +56,10 @@ export function loadConfig(configPath) {
     boundSessionIds: Array.isArray(raw.boundSessionIds) ? raw.boundSessionIds.slice() : [],
     boundCwds: Array.isArray(raw.boundCwds) ? raw.boundCwds.slice() : [],
     maxPolls: Number.isFinite(raw.maxPolls) ? raw.maxPolls : DEFAULT_MAX_POLLS,
+    // Off unless `http.enabled` is the boolean true. The stdio transport stays the default; the HTTP one is an opt-in
+    // and refuses anything but a loopback host, so an existing deployment cannot become network-reachable by editing
+    // one field by accident.
+    http: loadHttpConfig(raw.http),
   };
   // Exactly one locator. A plugin that binds `port: 0` cannot be addressed by a frozen URL, so `endpointFile` is the
   // supported shape there; a pinned port uses `hostUrl`. Both at once means the caller cannot say which wins.
@@ -322,11 +326,17 @@ export function serve(server) {
   });
 }
 
-export async function handle(server, request) {
+/**
+ * The one dispatcher. Both transports call this: stdio passes nothing, Streamable HTTP passes the revision it negotiated
+ * during `initialize`, so a client that asked for 2024-11-05 is answered 2024-11-05 and one that asked for 2025-11-25
+ * is answered that. Everything else is identical between the two transports, which is the point.
+ */
+export async function handle(server, request, context = {}) {
   const method = request && request.method;
   const params = (request && request.params) || {};
   if (method === 'initialize') {
-    return { protocolVersion: PROTOCOL_VERSION, serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
+    return { protocolVersion: context.protocolVersion || PROTOCOL_VERSION,
+      serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
       capabilities: { tools: { listChanged: false } } };
   }
   if (method === 'tools/list') return { tools: TOOLS };
@@ -357,7 +367,8 @@ export async function main(argv = process.argv.slice(2)) {
   };
   const configPath = value('--config');
   if (!configPath) {
-    process.stderr.write('usage: mcp_server.mjs --config <dsh-direct.config.json>\n');
+    process.stderr.write('usage: mcp_server.mjs --config <dsh-direct.config.json> [--httponly]'
+      + '\n  stdio is the default; config.http.enabled=true starts the Streamable HTTP transport instead\n');
     process.exitCode = 2;
     return;
   }
@@ -370,7 +381,31 @@ export async function main(argv = process.argv.slice(2)) {
     return;
   }
   mkdirSync(config.stateDir, { recursive: true });
-  serve(new DirectServer(config));
+  const server = new DirectServer(config);
+  if (!config.http) {
+    serve(server);
+    return;
+  }
+  // Loaded here rather than imported at the top: the transport imports `handle` from this module, and a static import
+  // in both directions would make the module graph cyclic for no reason.
+  const { startHttpTransport } = await import('./http_transport.mjs');
+  let started = null;
+  try {
+    started = await startHttpTransport({ direct: server, http: config.http });
+  } catch (err) {
+    process.stderr.write('dsh-direct: ' + (err instanceof DirectError ? err.code + ': ' + err.message
+      : 'http_start_failed: ' + String(err && err.message)) + '\n');
+    process.exitCode = 1;
+    return;
+  }
+  process.stderr.write('dsh-direct: MCP Streamable HTTP on ' + started.base + ' (loopback only, '
+    + config.http.allowedOrigins.length + ' allowed origin(s), ' + config.boundSessionIds.length + ' bound session(s))\n');
+  const shutdown = async () => {
+    await started.close();
+    process.exit(0);
+  };
+  process.once('SIGINT', shutdown);
+  process.once('SIGTERM', shutdown);
 }
 
 // Entry detection by exact path, the same rule the service modules in this repository use: importing this file (a

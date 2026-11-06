@@ -19,7 +19,7 @@ import { fileURLToPath } from 'node:url';
 
 import { CONFIG_FIELDS, loadConfig } from './mcp_server.mjs';
 import { EXPECTED_KIND, EXPECTED_PROTOCOL, assertHealthIdentity, resolveEndpoint } from './endpoint.mjs';
-import { CODES, DirectError } from './protocol.mjs';
+import { CODES, DirectError, HTTP_CONFIG_FIELDS } from './protocol.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '..', '..');
@@ -179,6 +179,7 @@ const KEY_HINT = new Map([
   ['boundCwds', 'bind by workspace path instead of id'],
   ['worktreeRoot', 'optional worktree precheck'],
   ['maxPolls', 'how many times get_result may collect'],
+  ['http', 'the optional Streamable HTTP transport (off by default)'],
 ]);
 
 export function checkConfig(configPath) {
@@ -222,7 +223,43 @@ export function checkConfig(configPath) {
     checks.push(result('endpoint.locate', 'fail', (err instanceof DirectError ? err.code : 'internal') + ': '
       + String(err && err.message)));
   }
+  checks.push(...checkHttpConfig(config));
   return { checks, config };
+}
+
+/**
+ * The HTTP transport is optional, so "off" is a passing state and must be reported as a fact rather than skipped: an
+ * operator reading the report needs to know whether a loopback listener will exist after start.
+ */
+export function checkHttpConfig(config) {
+  const http = config && config.http ? config.http : null;
+  if (!http) {
+    return [result('http.config', 'ok', 'config.http is absent or disabled; this deployment serves stdio only')];
+  }
+  const checks = [];
+  checks.push(result('http.config', 'ok', 'Streamable HTTP enabled on http://' + http.host + ':' + http.port + http.path
+    + ' (' + http.maxSessions + ' sessions max, ' + http.requestTimeoutMs + ' ms request timeout)'));
+  const problems = [];
+  if (!existsSync(http.authTokenFile)) {
+    problems.push('the HTTP token file does not exist, so the transport would refuse to start');
+  } else {
+    const text = readFileSync(http.authTokenFile, 'utf8').trim();
+    if (text.length < 32) problems.push('the HTTP token holds ' + text.length + ' characters; 32 is the minimum');
+    if (config.tokenFile === http.authTokenFile) {
+      problems.push('the HTTP token and the Host token are the same file; a client that must talk to the MCP listener '
+        + 'would then also hold the Host bearer token');
+    }
+  }
+  if (http.allowedOrigins.length === 0) {
+    checks.push(result('http.origins', 'warn', 'allowedOrigins is empty: every request carrying an Origin header is '
+      + 'refused with 403. Right for a CLI client; a browser client needs its exact origin listed'));
+  } else {
+    checks.push(result('http.origins', 'ok', http.allowedOrigins.length + ' origin(s) allowed: '
+      + http.allowedOrigins.join(', ')));
+  }
+  if (problems.length) checks.push(result('http.token', 'fail', problems.join('; '), { problems }));
+  else checks.push(result('http.token', 'ok', 'HTTP token file holds a long enough secret and is not the Host token'));
+  return checks;
 }
 
 /** Connect without sending anything a Host would act on: /health is unauthenticated and has no side effects. */
@@ -335,6 +372,24 @@ export function checkDocs(root = REPO_ROOT) {
     if (example.endpointFile && example.hostUrl) {
       problems.push('config.example.json sets both endpointFile and hostUrl, which loadConfig rejects');
     }
+    // The shipped example is what an operator copies, so it must show the HTTP transport the way it ships: present,
+    // documented and off.
+    if (!example.http) {
+      problems.push('config.example.json has no http block, so the Streamable HTTP transport is undocumented there');
+    } else {
+      const badHttp = Object.keys(example.http).filter((key) => !key.startsWith('$')
+        && !HTTP_CONFIG_FIELDS.includes(key));
+      if (badHttp.length) {
+        problems.push('config.example.json http block uses fields loadHttpConfig does not read: ' + badHttp.join(', '));
+      }
+      if (example.http.enabled !== false) {
+        problems.push('config.example.json ships config.http.enabled other than false; the transport must be off in the '
+          + 'file an operator copies');
+      }
+      for (const key of ['authTokenFile', 'allowedOrigins']) {
+        if (example.http[key] === undefined) problems.push('config.example.json http block omits ' + key);
+      }
+    }
   }
 
   // Every occurrence of a host.token *path* must point at the same file. T272 shipped two different ones: the token was
@@ -360,8 +415,15 @@ export function checkDocs(root = REPO_ROOT) {
   if (/port:\s*0\b/.test(doc)) {
     problems.push('INSTALL-WINDOWS.md still tells the reader to use port: 0');
   }
-  for (const key of Object.keys(KEY_HINT)) {
+  // The hint table and the schema must agree, and the fields an operator cannot install without must actually be
+  // documented. (The previous loop iterated `Object.keys` of a Map, which is always empty: it checked nothing.)
+  for (const key of KEY_HINT.keys()) {
     if (!CONFIG_FIELDS.includes(key)) problems.push('KEY_HINT names an unknown field: ' + key);
+  }
+  for (const key of ['endpointFile', 'tokenFile', 'http']) {
+    if (!doc.includes(key)) {
+      problems.push('INSTALL-WINDOWS.md never mentions ' + key + ', so a field that changes behaviour is undocumented');
+    }
   }
 
   if (problems.length) checks.push(result('docs.consistency', 'fail', problems.join('; '), { problems }));

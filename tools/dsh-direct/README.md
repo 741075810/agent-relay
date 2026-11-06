@@ -73,8 +73,10 @@ protocol.mjs      tool schemas, error codes, task states
 store.mjs         JSON ledger; unsettled survives restart; get_result refuses it
 host_bridge.mjs   loopback HTTP: /health /sessions /prompt /events /admission; publish + remove the descriptor
 host_client.mjs   the MCP server's client; resolves URL or descriptor; verifies identity before a prompt
-mcp_server.mjs    stdio JSON-RPC; five tools: list_sessions, submit_task, reconcile_task, get_task, get_result
-preflight.mjs     read-only deployment check (package, Cordis version, config, endpoint, port, docs)
+mcp_server.mjs    stdio JSON-RPC and the one dispatcher; five tools: list_sessions, submit_task, reconcile_task,
+                  get_task, get_result
+http_transport.mjs the Streamable HTTP transport (opt-in): sessions, Origin, bearer auth, body/timeout limits, 202/405/504
+preflight.mjs     read-only deployment check (package, Cordis version, config, endpoint, port, docs, http)
 plugin/           the installable Cordis plugin (see INSTALL-WINDOWS.md)
 ```
 
@@ -90,14 +92,15 @@ profile change.
 
 | level | meaning | status |
 |---|---|---|
-| **A** | the plugin, the MCP server and the preflight verified in isolation against a fake Host and a fake Cordis context | **done**, `test_t271_*` … `test_t273_*` |
+| **A** | plugin, MCP server (stdio **and** Streamable HTTP) and preflight verified in isolation against a fake Host; the HTTP layer driven over a real socket by a real HTTP client | **done** — `test_t271_*` … `test_t274_*` |
 | **B** | the real Desktop Host loads the plugin and serves the bridge on loopback | **not done** — needs the operator to install |
-| **C** | an existing session received a real prompt through that bridge | **not done** — needs B |
+| **C** | an existing session received a real prompt through this bridge | **not done** — needs B |
 
-The MCP server is a working stdio MCP server, and it is **not** registered with ChatGPT's custom-MCP settings: that
-registration is a Web-side action, and a Web client needs an HTTPS transport while this bridge binds loopback only.
-Stdio works for a desktop MCP client that launches the process itself. That boundary is stated here rather than implied
-away by a working local server.
+The HTTP transport does not change B or C: it makes the MCP side reachable by an HTTP client, not the Desktop
+reachable by ChatGPT. The stdio server is still not registered with ChatGPT's custom-MCP settings, and a Web client
+needs an HTTPS endpoint that is reachable from the internet while this listener is loopback-only by construction.
+Stdio works for a desktop MCP client that launches the process itself; HTTP works for a local HTTP MCP client. Neither
+is a Web connection, and this file says so rather than implying it away with a working local server.
 
 Everything in this directory is level A. No claim in the repo says otherwise.
 
@@ -126,6 +129,60 @@ There is now one descriptor, written after `listen` succeeds and removed when th
   `host_identity_mismatch` and, being a refusal that never sent anything, it frees the session lock.
 * A fixed port that is already taken is now `bind_failed`: a rejection the plugin logs, not the unhandled `error` event
   that used to take the Host process down with `EADDRINUSE`.
+
+## Streamable HTTP: the same server, reachable by an HTTP MCP client (T274)
+
+The stdio server is unchanged and remains the default. With `config.http.enabled` set to the boolean `true` the same
+process serves the MCP Streamable HTTP transport at `http://127.0.0.1:<port>/mcp` instead of stdio.
+
+It is the **same** `DirectServer`, the same `handle()` dispatcher, the same task ledger and the same Host bridge. The
+transport adds no business logic: it validates a request, resolves a session, calls `handle()`, and frames the answer.
+
+```json
+"http": {
+  "enabled": true,
+  "port": 42732,
+  "path": "/mcp",
+  "authTokenFile": "<HOME>/.dsh/dsh-direct/http.token",
+  "allowedOrigins": [],
+  "maxBodyBytes": 1048576,
+  "requestTimeoutMs": 120000,
+  "maxSessions": 16
+}
+```
+
+```powershell
+node tools/dsh-direct/mcp_server.mjs --config <config.json>   # starts HTTP when config.http.enabled is true
+```
+
+Request rules, all enforced and each covered by a test in `test_t274_http_transport.mjs`:
+
+| rule | behaviour |
+|---|---|
+| `POST /mcp` with one JSON-RPC message | `200` + `application/json`, or a single `text/event-stream` event when the client accepts only SSE |
+| a body with no request id (notification) | `202` with no body — including `notifications/initialized` |
+| `initialize` | negotiates the revision: echoes `2025-11-25` / `2025-06-18` / `2025-03-26` / `2024-11-05`, otherwise offers `2025-11-25`; issues `Mcp-Session-Id` (32 hex) |
+| any request before `initialize` | `400` `session_required`; unknown or terminated session id → `404` `session_not_found` |
+| `notifications/initialized` not yet sent | `400` `session_required` — a client must complete the handshake |
+| `MCP-Protocol-Version` | `400` for a revision this server does not speak, and `400` when it disagrees with the negotiated one |
+| `Origin` present | `403` `origin_rejected` unless listed in `allowedOrigins` (empty by default = every browser refused) |
+| no/wrong `Authorization` | `401` + `WWW-Authenticate: Bearer realm="dsh-direct"`, compared in constant time |
+| `GET /mcp` | `405` with `Allow: POST, DELETE` — this server has no server-initiated stream |
+| `DELETE /mcp` | `204`, and the session id is dead afterwards |
+| other path | `404` |
+| malformed JSON | `400` `-32700`; a JSON-RPC batch → `400` `-32600` (batches were removed in 2025-06-18) |
+| body over `maxBodyBytes` | `413`, refused before the body is buffered |
+| `Accept` without JSON or SSE | `406` |
+| unknown JSON-RPC method | `200` with `-32601` in-band, as JSON-RPC expects |
+| tool call slower than `requestTimeoutMs` | `504` `request_timeout` — **not** a refusal: the Host may already hold the prompt, so the transport never touches the ledger and the caller reconciles |
+
+Deliberately absent: server-initiated SSE streaming (hence 405 on GET), resumability via `Last-Event-ID`, and OAuth
+(the bearer token is a shared secret, not a delegated grant). None of the three is simulated.
+
+**The Web gap, stated plainly.** This listener is `127.0.0.1` only and speaks plain HTTP. A ChatGPT *web* client cannot
+reach it, and registering a custom MCP connector in ChatGPT is a user action in the ChatGPT settings — nothing in this
+repository does it. What exists is an HTTP MCP endpoint that a local MCP client (or a tunnel the operator runs) can
+reach; what does not exist is an authorised Web connection.
 
 ## Preflight: the read-only check before anyone installs
 
@@ -161,6 +218,8 @@ node test_t272_plugin.mjs                  # apply/dispose, binding filter, fail
 node test_t273_endpoint.mjs                # descriptor lifecycle, bind_failed, follow a restart, stale-port identity
 node test_t273_preflight.mjs               # every preflight check, including the defects it was written for
 node test_t273_plugin_config.mjs           # listener rules, unload releases the port, bind_failed at the plugin level
+node test_t274_http_transport.mjs          # Streamable HTTP over a real socket: session, Origin, auth, 202/405/413/504,
+                                           # SSE framing, and a full submit→result→duplicate run against a fake Host
 ```
 
 The reconcile suite injects the failure that matters: the fake Host **admits** the prompt and then throws on the way

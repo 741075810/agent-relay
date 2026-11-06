@@ -8,6 +8,12 @@ export const PROTOCOL_VERSION = '2024-11-05';
 export const SERVER_NAME = 'dsh-direct';
 export const SERVER_VERSION = '0.1.0';
 
+// The MCP revisions this server can speak over Streamable HTTP, newest first. `initialize` echoes the client's version
+// when it is one of these and offers `LATEST_PROTOCOL_VERSION` otherwise, which is what the specification asks a server
+// to do when it does not support the requested revision.
+export const LATEST_PROTOCOL_VERSION = '2025-11-25';
+export const SUPPORTED_PROTOCOL_VERSIONS = Object.freeze(['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05']);
+
 /** Every refusal this module can produce. Stable strings: the tests and the operator both match on them. */
 export const CODES = Object.freeze({
   // request shape
@@ -18,6 +24,15 @@ export const CODES = Object.freeze({
   not_bound: 'not_bound',
   session_not_found: 'session_not_found',
   project_mismatch: 'project_mismatch',
+  // transport (Streamable HTTP). None of these ever reached the Host, so none of them may touch a session lock.
+  method_not_allowed: 'method_not_allowed',
+  origin_rejected: 'origin_rejected',
+  body_too_large: 'body_too_large',
+  unsupported_accept: 'unsupported_accept',
+  unsupported_protocol_version: 'unsupported_protocol_version',
+  session_required: 'session_required',
+  request_timeout: 'request_timeout',
+  http_disabled: 'http_disabled',
   // the port answered, but it is not the bridge we expect there (stale endpoint file, or another local program);
   // nothing was sent, so this is a refusal and never a reason to keep the session locked
   host_identity_mismatch: 'host_identity_mismatch',
@@ -46,6 +61,73 @@ export const CODES = Object.freeze({
 // prompt. It keeps the session lock and refuses `get_result` until `reconcile_task` re-submits the same requestId.
 export const TASK_STATES = Object.freeze(['accepted', 'running', 'succeeded', 'failed', 'unsettled', 'unknown']);
 export const ACTIVE_STATES = Object.freeze(['accepted', 'running', 'unsettled']);
+
+/** The token file must hold at least this many characters. Length only; the value is never logged or returned. */
+export const MIN_TOKEN_CHARS = 32;
+
+export const HTTP_PATH_DEFAULT = '/mcp';
+export const MAX_BODY_DEFAULT = 1048576;
+export const REQUEST_TIMEOUT_DEFAULT = 120000;
+export const MAX_SESSIONS_DEFAULT = 16;
+
+/** The keys `config.http` may contain. Exported so the preflight and the docs check use the list the server enforces. */
+export const HTTP_CONFIG_FIELDS = Object.freeze(['enabled', 'host', 'port', 'path', 'authTokenFile', 'allowedOrigins',
+  'maxBodyBytes', 'requestTimeoutMs', 'maxSessions']);
+
+/**
+ * Validate the optional `http` block. Returns `null` when the transport is off, which is the default: this is a
+ * deliberate opt-in, not something a profile can enable by accident or by writing `"true"` in a string.
+ */
+export function loadHttpConfig(raw) {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== 'object' || Array.isArray(raw)) fail(CODES.invalid_arguments, 'config.http must be an object');
+  const unknown = Object.keys(raw).filter((key) => !key.startsWith('$') && !HTTP_CONFIG_FIELDS.includes(key));
+  if (unknown.length) {
+    fail(CODES.invalid_arguments, 'config.http has fields this server does not read: ' + unknown.join(', '),
+      { fields: unknown });
+  }
+  if (raw.enabled === false || raw.enabled === undefined) return null;
+  if (raw.enabled !== true) {
+    fail(CODES.invalid_arguments, 'config.http.enabled must be the boolean true to enable the HTTP transport',
+      { enabled: raw.enabled });
+  }
+  const host = raw.host === undefined ? '127.0.0.1' : raw.host;
+  if (host !== '127.0.0.1') {
+    fail(CODES.invalid_arguments, 'config.http.host must be 127.0.0.1; this transport refuses to listen anywhere else',
+      { host });
+  }
+  const port = raw.port;
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+    fail(CODES.invalid_arguments, 'config.http.port must be an integer in 1024..65535', { port });
+  }
+  const urlPath = raw.path === undefined ? HTTP_PATH_DEFAULT : raw.path;
+  if (typeof urlPath !== 'string' || !urlPath.startsWith('/') || urlPath.includes('..') || urlPath.length > 128) {
+    fail(CODES.invalid_arguments, 'config.http.path must start with "/" and contain no ".."', { path: urlPath });
+  }
+  if (typeof raw.authTokenFile !== 'string' || !raw.authTokenFile) {
+    fail(CODES.invalid_arguments, 'config.http.authTokenFile is required: an unauthenticated loopback listener is still '
+      + 'reachable from a browser', { field: 'authTokenFile' });
+  }
+  const allowedOrigins = raw.allowedOrigins === undefined ? [] : raw.allowedOrigins;
+  if (!Array.isArray(allowedOrigins) || allowedOrigins.some((value) => typeof value !== 'string' || !value)) {
+    fail(CODES.invalid_arguments, 'config.http.allowedOrigins must be an array of origin strings', { allowedOrigins });
+  }
+  const maxBodyBytes = raw.maxBodyBytes === undefined ? MAX_BODY_DEFAULT : raw.maxBodyBytes;
+  if (!Number.isInteger(maxBodyBytes) || maxBodyBytes < 1024 || maxBodyBytes > 8388608) {
+    fail(CODES.invalid_arguments, 'config.http.maxBodyBytes must be an integer in 1024..8388608', { maxBodyBytes });
+  }
+  const requestTimeoutMs = raw.requestTimeoutMs === undefined ? REQUEST_TIMEOUT_DEFAULT : raw.requestTimeoutMs;
+  if (!Number.isInteger(requestTimeoutMs) || requestTimeoutMs < 50 || requestTimeoutMs > 600000) {
+    fail(CODES.invalid_arguments, 'config.http.requestTimeoutMs must be an integer in 50..600000',
+      { requestTimeoutMs });
+  }
+  const maxSessions = raw.maxSessions === undefined ? MAX_SESSIONS_DEFAULT : raw.maxSessions;
+  if (!Number.isInteger(maxSessions) || maxSessions < 1 || maxSessions > 256) {
+    fail(CODES.invalid_arguments, 'config.http.maxSessions must be an integer in 1..256', { maxSessions });
+  }
+  return { enabled: true, host, port, path: urlPath, authTokenFile: raw.authTokenFile,
+    allowedOrigins: allowedOrigins.slice(), maxBodyBytes, requestTimeoutMs, maxSessions };
+}
 
 export class DirectError extends Error {
   constructor(code, message, details) {
