@@ -58,6 +58,20 @@ const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,79}$/;
 const TERMINAL_RUN_STATES = Object.freeze(['completed', 'failed', 'cancelled']);
 const TERMINAL_STATUS_SOURCES = Object.freeze(['bridge.run_facts.status', 'bridge_ledger.status']);
 
+// T269: `hostAck` is the host's own bookkeeping (`acked` / `pending` / `unseen`), and the sidecar re-posts every
+// terminal candidate on every round. Freezing the label at first ingest made it wrong for every run acknowledged
+// afterwards -- the live store still said `unseen` for a run the host had listed in `ackedIds`. The label therefore
+// moves forward only: a later round may raise it, never lower it, and a value outside the contract is not an upgrade.
+const HOST_ACK_RANK = Object.freeze({ unseen: 0, pending: 1, acked: 2 });
+
+function hostAckMerge(current, incoming) {
+  const now = HOST_ACK_RANK[current];
+  const next = HOST_ACK_RANK[incoming];
+  if (next === undefined) return typeof current === 'string' && current ? current : 'unseen';
+  if (now === undefined) return incoming;
+  return next > now ? incoming : current;
+}
+
 function loadState(dir) {
   const path = join(dir, STATE_FILE);
   try {
@@ -362,6 +376,10 @@ export function createRelay(config) {
         if (existing) {
           const incomingInstant = Number.isFinite(item.completedAt) ? item.completedAt : null;
           const incomingSource = typeof item.completedAtSource === 'string' ? item.completedAtSource : 'unknown';
+          // T269: the ACK label describes the host's queue state *now*, and the sidecar reports it every round.
+          const incomingAck = typeof item.hostAck === 'string' ? item.hostAck : 'unseen';
+          const mergedAck = hostAckMerge(existing.hostAck || 'unseen', incomingAck);
+          const ackMoved = mergedAck !== (existing.hostAck || 'unseen');
           if (existing.terminalStatus !== terminalStatus) {
             // The status moved, so the instant must move with it: an instant that belonged to the previous status is
             // no longer evidence for this one. `null` means the new report had none, and unknown stays unknown.
@@ -369,6 +387,7 @@ export function createRelay(config) {
             existing.statusSource = statusSource;
             existing.completedAt = incomingInstant;
             existing.completedAtSource = incomingInstant === null ? 'unknown' : incomingSource;
+            existing.hostAck = mergedAck;
             existing.updatedAt = now();
             accepted.push({ runId, terminalStatus, duplicate: true, updated: true, seq: existing.seq });
           } else {
@@ -381,6 +400,10 @@ export function createRelay(config) {
                 existing.completedAtSource = incomingSource;
                 refreshed = true;
               }
+            }
+            if (ackMoved) {
+              existing.hostAck = mergedAck;
+              refreshed = true;
             }
             accepted.push({ runId, terminalStatus, duplicate: true, updated: false, refreshed, seq: existing.seq });
           }
