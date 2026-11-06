@@ -52,9 +52,17 @@ export class TaskStore {
         || typeof parsed.requestIds !== 'object' || parsed.requestIds === null) {
       fail(CODES.state_unreadable, 'the task ledger is not a version ' + STATE_VERSION + ' ledger', { path: this.path });
     }
-    // A run that was in flight when the previous process died has no outcome this process may claim.
+    // A run that was in flight when the previous process died has no outcome this process may claim. An `unsettled`
+    // task is different: it already means "the Host may hold the prompt", so it keeps its state *and* its lock, and
+    // the operator reconciles it with the same requestId.
     let recovered = 0;
     for (const task of parsed.tasks) {
+      if (task.state === 'unsettled') {
+        task.stages = (task.stages || []).concat([{ at: this.now(), stage: 'unsettled_across_restart',
+          detail: 'still requiring reconcile with the same requestId' }]);
+        recovered += 1;
+        continue;
+      }
       if (ACTIVE_STATES.includes(task.state)) {
         task.state = 'unknown';
         task.unknownReason = 'process_restart';
@@ -160,6 +168,10 @@ export class TaskStore {
   finished(taskId) {
     const task = this.find(taskId);
     if (!task) fail(CODES.task_not_found, 'no such task', { taskId });
+    if (task.state === 'unsettled') {
+      fail(CODES.task_unsettled, 'the submission never got an answer; reconcile it with its requestId first', {
+        taskId, requestId: task.requestId, stages: task.stages.length });
+    }
     if (ACTIVE_STATES.includes(task.state)) {
       fail(CODES.task_not_finished, 'the task has not finished', { taskId, state: task.state,
         stages: task.stages.length });

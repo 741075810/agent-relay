@@ -1,28 +1,38 @@
 // DSH Direct: the MCP server (stdio, JSON-RPC 2.0).
 //
-// Transports: newline-delimited JSON on stdin/stdout, which is what an MCP client launches. No port is opened, no
+// Transport: newline-delimited JSON on stdin/stdout, which is what an MCP client launches. No port is opened, no
 // session is created, and the only outbound call is HTTP to the loopback Host bridge with a bearer token.
 //
-// The server refuses to start unless it was given a config that names: the bridge URL (loopback only), the token
-// file, the bound project/session allowlist, and a state dir. An unbound call is refused with `not_bound`, not
-// quietly widened -- this is the "only the bound project/session" rule, and it is enforced here, at the entry point,
-// as well as in the store.
+// The decision this file exists for is what to do when a prompt gets no answer. T271 marked that `failed` and released
+// the session, which is wrong: the Host may already hold the prompt. The rule now is:
+//
+//   * an explicit Host refusal (`host_refused`, `session_busy`, `session_writer_held`, `session_not_found`,
+//     `invalid_arguments`) is an outcome -> `failed`, lock released;
+//   * anything else (`host_unreachable`, `host_error`, `cancelled`, `internal`) means the answer never arrived ->
+//     `unsettled`, the session lock is **kept**, `get_result` refuses with `task_unsettled`, and `reconcile_task`
+//     re-submits the *same* requestId, which `@deepseek-ai/dsh-api-session-controller@0.2.0-rc.2` acknowledges
+//     without inserting a second message (`lib/index.js:855`).
 
 import { mkdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
-import { CODES, DirectError, PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION, TOOLS, fail, toolByName,
-  validateListSessions, validateSubmitTask, validateTaskId } from './protocol.mjs';
+import {
+  CODES, DirectError, PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION, TOOLS, fail, toolByName,
+  validateListSessions, validateSubmitTask, validateTaskId,
+} from './protocol.mjs';
 import { HostClient } from './host_client.mjs';
-import { TaskStore } from './store.mjs';
+import { TaskStore, promptSha } from './store.mjs';
 import { precheckWorktree } from './worktree.mjs';
 
-const MAX_POLLS = 3;
+/** Codes that mean "the Host answered, and the answer was no". Everything else is an unanswered call. */
+const REFUSAL_CODES = new Set([CODES.host_refused, CODES.session_busy, CODES.session_writer_held,
+  CODES.session_not_found, CODES.invalid_arguments, CODES.unauthenticated, CODES.not_bound,
+  CODES.project_mismatch, CODES.host_capability_missing]);
+const DEFAULT_MAX_POLLS = 3;
 
 export function loadConfig(configPath) {
-  // Required by every code path below: no config, no server. The file is the operator's, not the repository's.
   const raw = JSON.parse(readFileSync(configPath, 'utf8'));
   const config = {
     hostUrl: raw.hostUrl,
@@ -32,7 +42,8 @@ export function loadConfig(configPath) {
     allowDirtyWorktree: raw.allowDirtyWorktree === true,
     boundProjectIds: Array.isArray(raw.boundProjectIds) ? raw.boundProjectIds.slice() : [],
     boundSessionIds: Array.isArray(raw.boundSessionIds) ? raw.boundSessionIds.slice() : [],
-    maxPolls: Number.isFinite(raw.maxPolls) ? raw.maxPolls : MAX_POLLS,
+    boundCwds: Array.isArray(raw.boundCwds) ? raw.boundCwds.slice() : [],
+    maxPolls: Number.isFinite(raw.maxPolls) ? raw.maxPolls : DEFAULT_MAX_POLLS,
   };
   if (typeof config.hostUrl !== 'string' || !/^http:\/\/(127\.0\.0\.1|\[::1\]):\d{1,5}$/.test(config.hostUrl)) {
     fail(CODES.invalid_arguments, 'config.hostUrl must be a loopback http URL', { hostUrl: config.hostUrl });
@@ -42,21 +53,19 @@ export function loadConfig(configPath) {
       fail(CODES.invalid_arguments, 'config.' + key + ' is required', { field: key });
     }
   }
-  if (!config.boundSessionIds.length && !config.boundProjectIds.length) {
-    fail(CODES.not_bound, 'config binds no session and no project; refusing to run unbound');
+  if (!config.boundSessionIds.length && !config.boundProjectIds.length && !config.boundCwds.length) {
+    fail(CODES.not_bound, 'config binds no session, project or cwd; refusing to run unbound');
   }
   return config;
 }
 
-/** Bound, existing, and matching the project the caller named. */
+/** Bound, existing, and matching the project/cwd the caller named. rc.2 rows carry `cwd`, not a project id. */
 export function assertBound(config, session) {
-  if (!config.boundSessionIds.includes(session.sessionId)) {
-    fail(CODES.not_bound, 'this session is not in the binding', { sessionId: session.sessionId });
-  }
-  if (session.projectId && config.boundProjectIds.length
-      && !config.boundProjectIds.includes(session.projectId)) {
-    fail(CODES.not_bound, 'this session belongs to a project outside the binding', {
-      sessionId: session.sessionId, projectId: session.projectId });
+  const byId = config.boundSessionIds.includes(session.sessionId);
+  const byCwd = typeof session.cwd === 'string' && config.boundCwds.includes(session.cwd);
+  if (!byId && !byCwd) {
+    fail(CODES.not_bound, 'this session is not in the binding', { sessionId: session.sessionId,
+      cwd: session.cwd === undefined ? null : session.cwd });
   }
 }
 
@@ -71,9 +80,13 @@ export class DirectServer {
   async listSessions(args) {
     const input = validateListSessions(args);
     const listed = await this.client.listSessions();
-    const allowed = listed.filter((session) => this.config.boundSessionIds.includes(session.sessionId));
-    const filtered = input.projectId ? allowed.filter((session) => session.projectId === input.projectId) : allowed;
-    return { ok: true, host: this.client.kind, bound: this.config.boundSessionIds.length,
+    const allowed = listed.filter((session) => {
+      const bound = this.config.boundSessionIds.includes(session.sessionId);
+      const cwdBound = typeof session.cwd === 'string' && this.config.boundCwds.includes(session.cwd);
+      return bound || cwdBound;
+    });
+    const filtered = input.projectId ? allowed.filter((session) => session.cwd === input.projectId) : allowed;
+    return { ok: true, host: this.client.kind, protocol: this.client.protocol, bound: this.config.boundSessionIds.length,
       sessions: filtered, counts: { listed: listed.length, bound: allowed.length, returned: filtered.length } };
   }
 
@@ -95,55 +108,110 @@ export class DirectServer {
         sessionId: input.sessionId });
     }
     assertBound(this.config, session);
-    if (input.projectId && session.projectId && input.projectId !== session.projectId) {
-      fail(CODES.project_mismatch, 'the session belongs to a different project', {
-        sessionId: input.sessionId, expected: session.projectId, got: input.projectId });
+    if (input.projectId && session.cwd && input.projectId !== session.cwd) {
+      fail(CODES.project_mismatch, 'the session belongs to a different cwd', {
+        sessionId: input.sessionId, expected: session.cwd, got: input.projectId });
     }
-    const accepted = this.store.accept({ ...input, projectId: session.projectId });
+    const accepted = this.store.accept({ ...input, projectId: session.cwd });
     if (accepted.duplicate) {
       return { ok: true, host: this.client.kind, duplicate: true, worktree, task: this.#view(accepted.task) };
     }
-    const task = accepted.task;
-    this.store.stage(task.taskId, 'host_prompt_sent', { sessionId: input.sessionId });
+    return this.#admit(accepted.task, input, worktree);
+  }
+
+  /**
+   * Re-submit an unsettled task. Order of preference:
+   *   1. if the durable log already holds this requestId, the earlier attempt was admitted -> no second call;
+   *   2. otherwise re-submit the *same* requestId with the same text (the caller supplies it; this server keeps only
+   *      the digest, and the digest must match), which rc.2 acknowledges without inserting a second message.
+   */
+  async reconcileTask(args) {
+    const taskId = validateTaskId(args);
+    const task = this.store.find(taskId);
+    if (!task) fail(CODES.task_not_found, 'no such task', { taskId });
+    if (task.state !== 'unsettled') {
+      fail(CODES.not_reconcilable, 'only an unsettled task can be reconciled', { taskId, state: task.state });
+    }
+    let admission = null;
+    try {
+      admission = await this.client.findAdmission({ sessionId: task.sessionId, requestId: task.requestId });
+    } catch (err) {
+      this.store.stage(taskId, 'reconcile_evidence_unavailable', { code: err instanceof DirectError ? err.code : null });
+    }
+    if (admission && admission.found) {
+      this.store.stage(taskId, 'admission_found_in_log', { seq: admission.seq, eventType: admission.eventType });
+      this.store.transition(taskId, 'running', { turnId: null, requiresReconcile: false });
+      return { ok: true, host: this.client.kind, reconciledBy: 'durable_log',
+        task: this.#view(await this.#collect(taskId)) };
+    }
+    const prompt = args === undefined || args === null ? undefined : args.prompt;
+    if (typeof prompt !== 'string' || !prompt.length) {
+      fail(CODES.not_reconcilable,
+        'reconcile needs the original `prompt` text: this server keeps only its digest, never the text', {
+          taskId, promptSha256: task.promptSha256, reason: 'reconcile_needs_prompt' });
+    }
+    const digest = promptSha(prompt);
+    if (digest !== task.promptSha256) {
+      fail(CODES.invalid_arguments, 'the supplied prompt does not match the digest recorded for this task', {
+        taskId, expected: task.promptSha256, got: digest });
+    }
+    this.store.stage(taskId, 'reconcile_reprompt', { requestId: task.requestId });
+    const settled = await this.#admit(task, { prompt }, null, { reconciling: true });
+    return { ...settled, reconciledBy: 'idempotent_reprompt' };
+  }
+
+  /** Send (or re-send) one prompt for an existing task, then collect what the Host has. */
+  async #admit(task, input, worktree, { reconciling = false } = {}) {
+    if (typeof input.prompt !== 'string' || !input.prompt.length) {
+      fail(CODES.not_reconcilable,
+        'reconcile needs the original prompt text: this server keeps only its digest, never the text', {
+          taskId: task.taskId, promptSha256: task.promptSha256 });
+    }
+    this.store.stage(task.taskId, reconciling ? 'host_reprompt_sent' : 'host_prompt_sent',
+      { sessionId: task.sessionId, requestId: task.requestId });
     let receipt = null;
     try {
-      receipt = await this.client.prompt({ sessionId: input.sessionId, text: input.prompt,
-        requestId: input.requestId });
+      receipt = await this.client.prompt({ sessionId: task.sessionId, text: input.prompt,
+        requestId: task.requestId });
     } catch (err) {
-      // A prompt that never reached the Host must not leave the task active: the ledger would then refuse every
-      // later submit to this session with `session_busy`, which is a stuck state, not a safety property.
       const code = err instanceof DirectError ? err.code : CODES.internal;
-      this.store.transition(task.taskId, 'failed', { error: { code,
-        message: String(err && err.message), phase: 'host_prompt' } });
-      throw err;
+      if (REFUSAL_CODES.has(code)) {
+        // The Host said no. That is an outcome, and the session is free again.
+        this.store.transition(task.taskId, 'failed', { error: { code, message: String(err && err.message),
+          phase: 'host_prompt' } });
+        throw err;
+      }
+      // No answer: the prompt may already be in the Host. Keep the lock and require a reconcile.
+      this.store.transition(task.taskId, 'unsettled', { error: { code, message: String(err && err.message),
+        phase: 'host_prompt' }, requiresReconcile: true });
+      return { ok: false, host: this.client.kind, code: CODES.task_unsettled, requiresReconcile: true,
+        message: 'the prompt call got no answer; the Host may hold it, so the session stays locked until reconcile',
+        worktree, task: this.#view(this.store.find(task.taskId)) };
     }
     if (receipt.accepted !== true) {
-      this.store.transition(task.taskId, 'failed', { error: { code: 'host_refused',
-        message: 'the Host refused the turn', reason: receipt.reason } });
+      this.store.transition(task.taskId, 'failed', { error: { code: CODES.host_refused,
+        message: 'the Host did not accept the prompt', reason: receipt.reason || null } });
       return { ok: false, host: this.client.kind, worktree, task: this.#view(this.store.find(task.taskId)) };
     }
-    this.store.transition(task.taskId, 'running', { turnId: receipt.turnId });
-    const settled = await this.#collect(task.taskId, receipt.turnId);
+    this.store.transition(task.taskId, 'running', { turnId: receipt.turnId || null, requiresReconcile: false });
+    const settled = await this.#collect(task.taskId);
     return { ok: true, host: this.client.kind, duplicate: false, worktree, task: this.#view(settled) };
   }
 
   /** Poll the Host a bounded number of times per call: no timers, no long-running process, no unbounded wait. */
-  async #collect(taskId, turnId) {
+  async #collect(taskId) {
     const task = this.store.find(taskId);
     let cursor = null;
     for (let poll = 1; poll <= this.config.maxPolls; poll += 1) {
-      const page = await this.client.getEvents({ sessionId: task.sessionId, turnId, cursor });
+      const page = await this.client.getEvents({ sessionId: task.sessionId, requestId: task.requestId });
       cursor = page.cursor;
-      const text = page.events.filter((event) => event.kind === 'assistant.message' && event.text)
-        .map((event) => event.text).join('\n');
-      this.store.stage(taskId, 'host_events', { poll, events: page.events.length, done: page.done });
+      const text = page.assistantText || null;
+      this.store.stage(taskId, 'host_events', { poll, events: page.events.length, done: page.done,
+        admission: page.admission ? page.admission.found : null });
       if (page.done) {
         return this.store.transition(taskId, 'succeeded', {
-          result: { text: text || null, events: page.events, cursor, polls: poll },
+          result: { text, events: page.events.map((event) => ({ seq: event.seq, kind: event.kind })), cursor, polls: poll },
         });
-      }
-      if (text) {
-        this.store.stage(taskId, 'assistant_text_seen', { chars: text.length });
       }
     }
     this.store.stage(taskId, 'poll_budget_spent', { polls: this.config.maxPolls });
@@ -170,6 +238,7 @@ export class DirectServer {
       projectId: task.projectId,
       state: task.state,
       unknownReason: task.unknownReason === undefined ? null : task.unknownReason,
+      requiresReconcile: task.requiresReconcile === true,
       turnId: task.turnId,
       promptChars: task.promptChars,
       promptSha256: task.promptSha256,
@@ -189,6 +258,7 @@ async function dispatch(server, name, args) {
   switch (name) {
     case 'list_sessions': return server.listSessions(args);
     case 'submit_task': return server.submitTask(args);
+    case 'reconcile_task': return server.reconcileTask(args);
     case 'get_task': return server.getTask(args);
     case 'get_result': return server.getResult(args);
     default: return fail(CODES.unknown_tool, 'no such tool', { tool: name });

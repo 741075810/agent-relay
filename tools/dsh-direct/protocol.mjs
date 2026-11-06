@@ -21,18 +21,26 @@ export const CODES = Object.freeze({
   // lifecycle
   request_conflict: 'request_conflict',
   session_busy: 'session_busy',
+  session_writer_held: 'session_writer_held',
   task_not_found: 'task_not_found',
   task_not_finished: 'task_not_finished',
+  task_unsettled: 'task_unsettled',
+  not_reconcilable: 'not_reconcilable',
   // environment
   host_unreachable: 'host_unreachable',
   host_capability_missing: 'host_capability_missing',
+  host_refused: 'host_refused',
+  host_error: 'host_error',
+  cancelled: 'cancelled',
   worktree_dirty: 'worktree_dirty',
   state_unreadable: 'state_unreadable',
   internal: 'internal',
 });
 
-export const TASK_STATES = Object.freeze(['accepted', 'running', 'succeeded', 'failed', 'unknown']);
-export const ACTIVE_STATES = Object.freeze(['accepted', 'running']);
+// `unsettled` is the state a submission enters when the answer never arrived but the Host may already have the
+// prompt. It keeps the session lock and refuses `get_result` until `reconcile_task` re-submits the same requestId.
+export const TASK_STATES = Object.freeze(['accepted', 'running', 'succeeded', 'failed', 'unsettled', 'unknown']);
+export const ACTIVE_STATES = Object.freeze(['accepted', 'running', 'unsettled']);
 
 export class DirectError extends Error {
   constructor(code, message, details) {
@@ -51,12 +59,13 @@ export function fail(code, message, details) {
 }
 
 const SESSION_ID = /^(session-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
-const PROJECT_ID = /^(prj-[0-9a-z][0-9a-z-]{2,62})$/;
+// 0.2.0-rc.2 rows carry `cwd` (a workspace path), not a project id; both spellings are accepted for the filter.
+const PROJECT_OR_CWD = /^[^\u0000-\u001f]{1,512}$/;
 const REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,79}$/;
 const TASK_ID = /^dshd-[0-9a-f]{16}$/;
 
 export const isSessionId = (value) => typeof value === 'string' && SESSION_ID.test(value);
-export const isProjectId = (value) => typeof value === 'string' && PROJECT_ID.test(value);
+export const isProjectId = (value) => typeof value === 'string' && PROJECT_OR_CWD.test(value);
 export const isRequestId = (value) => typeof value === 'string' && REQUEST_ID.test(value);
 export const isTaskId = (value) => typeof value === 'string' && TASK_ID.test(value);
 
@@ -79,7 +88,7 @@ export function validateListSessions(args) {
   if (typeof input !== 'object' || Array.isArray(input)) fail(CODES.invalid_arguments, 'arguments must be an object');
   const out = {};
   if (input.projectId !== undefined && input.projectId !== null) {
-    out.projectId = requireString(input, 'projectId', PROJECT_ID);
+    out.projectId = requireString(input, 'projectId', PROJECT_OR_CWD);
   }
   return out;
 }
@@ -100,7 +109,8 @@ export function validateSubmitTask(args) {
       maxChars: MAX_PROMPT_CHARS, chars: prompt.length });
   }
   const out = { requestId, sessionId, prompt };
-  if (args.projectId !== undefined && args.projectId !== null) out.projectId = requireString(args, 'projectId', PROJECT_ID);
+  if (args.projectId !== undefined && args.projectId !== null) out.projectId = requireString(args, 'projectId', PROJECT_OR_CWD);
+  if (args.cwd !== undefined && args.cwd !== null) out.projectId = requireString(args, 'cwd', PROJECT_OR_CWD);
   if (args.createSession !== undefined) {
     // Named explicitly so the refusal is legible instead of "unknown argument".
     fail(CODES.not_bound, 'this server never creates a session; omit `createSession`', { field: 'createSession' });
@@ -122,7 +132,7 @@ export const TOOLS = Object.freeze([
     description: 'List the DSH sessions this server is bound to. Read-only; never creates a session.',
     inputSchema: {
       type: 'object',
-      properties: { projectId: { type: 'string', description: 'Optional project filter (prj-...).' } },
+      properties: { projectId: { type: 'string', description: 'Optional cwd/workspace filter (0.2.0-rc.2 rows carry cwd).' } },
       additionalProperties: false,
     },
   },
@@ -136,7 +146,7 @@ export const TOOLS = Object.freeze([
         requestId: { type: 'string', description: 'Caller-chosen idempotency key (8-80 chars).' },
         sessionId: { type: 'string', description: 'An existing session id (session-<uuid>).' },
         prompt: { type: 'string', description: 'The text to deliver as one turn.' },
-        projectId: { type: 'string', description: 'Optional; must match the session\'s own project.' },
+        projectId: { type: 'string', description: 'Optional; must equal the session\'s own cwd. `cwd` is accepted as an alias.' },
       },
       required: ['requestId', 'sessionId', 'prompt'],
       additionalProperties: false,
@@ -154,10 +164,27 @@ export const TOOLS = Object.freeze([
   },
   {
     name: 'get_result',
-    description: 'Read the result of a finished task. Refuses with task_not_finished while it is still active.',
+    description: 'Read the result of a finished task. Refuses with task_not_finished while it is still active, and '
+      + 'with task_unsettled when the submission never got an answer and must be reconciled first.',
     inputSchema: {
       type: 'object',
       properties: { taskId: { type: 'string' } },
+      required: ['taskId'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'reconcile_task',
+    description: 'Re-submit an unsettled task with its original requestId. The Host acknowledges a repeated '
+      + 'requestId without inserting a second message, so this cannot duplicate a prompt; it settles whether the '
+      + 'earlier attempt was admitted. Pass `prompt` when the Host has no admission evidence yet: this server keeps '
+      + 'only the digest, and the text must hash to it.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        taskId: { type: 'string' },
+        prompt: { type: 'string', description: 'The original prompt text; must match the recorded digest.' },
+      },
       required: ['taskId'],
       additionalProperties: false,
     },

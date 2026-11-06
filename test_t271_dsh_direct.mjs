@@ -20,10 +20,10 @@ const SERVER = path.join(process.cwd(), 'tools', 'dsh-direct', 'mcp_server.mjs')
 const TOKEN = 'test-token-' + 'a'.repeat(40);
 
 const SESSIONS = [
-  { sessionId: 'session-11111111-2222-4333-8444-555566667777', projectId: 'prj-alpha', title: 'alpha',
-    status: 'idle', lastActivityAt: 1794000000000 },
-  { sessionId: 'session-99999999-8888-4777-8666-555544443333', projectId: 'prj-beta', title: 'beta',
-    status: 'idle', lastActivityAt: 1794000001000 },
+  { sessionId: 'session-11111111-2222-4333-8444-555566667777', cwd: '/work/alpha', title: 'alpha',
+    running: false, blank: false, agentAvailable: true, updatedAt: 1794000000000 },
+  { sessionId: 'session-99999999-8888-4777-8666-555544443333', cwd: '/work/beta', title: 'beta',
+    running: false, blank: false, agentAvailable: true, updatedAt: 1794000001000 },
 ];
 const BOUND = SESSIONS[0].sessionId;
 
@@ -47,7 +47,7 @@ function writeConfig(sceneRef, bridge, extra = {}) {
     tokenFile: sceneRef.tokenFile,
     stateDir: path.join(sceneRef.dir, 'state'),
     boundSessionIds: [BOUND],
-    boundProjectIds: ['prj-alpha'],
+    boundCwds: ['/work/alpha'],
     maxPolls: 3,
   }, extra);
   writeFileSync(sceneRef.configFile, JSON.stringify(config, null, 2) + '\n', 'utf8');
@@ -94,7 +94,7 @@ async function tool(server, name, args) {
     content: message.result.content };
 }
 
-test('T271: the tool surface is exactly four tools and none of them creates a session', async () => {
+test('T271: the tool surface is exactly five tools and none of them creates a session', async () => {
   const sc = scene();
   const bridge = await startBridge(sc);
   const config = writeConfig(sc, bridge);
@@ -104,7 +104,7 @@ test('T271: the tool surface is exactly four tools and none of them creates a se
     assert.equal(init.result.serverInfo.name, 'dsh-direct');
     const listed = await server.call('tools/list', {});
     assert.deepEqual(listed.result.tools.map((t) => t.name).sort(),
-      ['get_result', 'get_task', 'list_sessions', 'submit_task']);
+      ['get_result', 'get_task', 'list_sessions', 'reconcile_task', 'submit_task']);
     for (const spec of listed.result.tools) {
       assert.equal(spec.inputSchema.type, 'object');
       assert.ok(!('createSession' in (spec.inputSchema.properties || {})), spec.name + ' must not offer a create knob');
@@ -128,8 +128,8 @@ test('T271: list_sessions returns only the bound session', async () => {
     assert.deepEqual(structured.sessions.map((s) => s.sessionId), [BOUND]);
     assert.equal(structured.counts.listed, 2, 'the Host listed two; only the bound one is offered');
     assert.equal(structured.host, 'offline_fake');
-    const filtered = await tool(server, 'list_sessions', { projectId: 'prj-beta' });
-    assert.equal(filtered.structured.sessions.length, 0, 'an unbound project filter returns nothing');
+    const filtered = await tool(server, 'list_sessions', { projectId: '/work/beta' });
+    assert.equal(filtered.structured.sessions.length, 0, 'an unbound cwd filter returns nothing');
   } finally {
     await server.stop();
     await bridge.close();
@@ -235,7 +235,7 @@ test('T271: an unbound, unknown or project-mismatched session is refused', async
     assert.match(create.structured.message, /never creates a session/);
 
     const mismatch = await tool(server, 'submit_task', { requestId: 't271-mismatch-1', sessionId: BOUND,
-      prompt: 'hi', projectId: 'prj-beta' });
+      prompt: 'hi', projectId: '/work/somewhere-else' });
     assert.equal(mismatch.structured.code, 'project_mismatch');
   } finally {
     await server.stop();

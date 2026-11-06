@@ -122,11 +122,14 @@ test('T271: a short token file is refused at load time', () => {
 
 test('T271: a session-controller object without the required methods is refused, and named', () => {
   const caps = describeCapabilities({ listSessions() {} });
-  assert.deepEqual(caps.missing, ['prompt', 'getEvents']);
+  assert.deepEqual(caps.missing, ['list', 'prompt', 'page'],
+    '0.2.0-rc.2 exposes list/prompt/page; listSessions/getEvents never existed');
+  assert.deepEqual(caps.legacyGuessPresent, ['listSessions'],
+    'the names this build does have are reported, so the refusal explains itself');
   assert.throws(() => createSessionControllerAdapter({ listSessions() {} }), (err) => {
     assert.equal(err.code, 'host_capability_missing');
-    assert.deepEqual(err.details.missing, ['prompt', 'getEvents']);
-    assert.deepEqual(err.details.required, ['listSessions', 'prompt', 'getEvents']);
+    assert.deepEqual(err.details.missing, ['list', 'prompt', 'page']);
+    assert.deepEqual(err.details.required, ['list', 'prompt', 'page']);
     return true;
   });
 });
@@ -249,10 +252,12 @@ test('T271: an unreachable Host is refused with host_unreachable, not with a fak
   }
 });
 
-test('T271: a prompt that never reaches the Host fails the task and frees the session', async () => {
+test('T272: a prompt that gets no answer stays unsettled and keeps the session locked', async () => {
   const sc = scene();
   const { createServer } = await import('node:http');
   // A Host that answers the session list and then drops the connection on /prompt: the worst realistic middle case.
+  // T271 called this a failure and freed the session, which allowed a second prompt into a session that may already
+  // have been running the first one. The rule now: no answer means unknown, the lock stays, reconcile decides.
   const flaky = createServer((req, res) => {
     if (req.url === '/health') {
       res.writeHead(200, { 'content-type': 'application/json' });
@@ -263,7 +268,8 @@ test('T271: a prompt that never reaches the Host fails the task and frees the se
     if (req.url === '/sessions') {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ ok: true, host: 'offline_partial', sessions: [{ sessionId: SESSION,
-        projectId: 'prj-alpha', title: 'alpha', status: 'idle', lastActivityAt: 1794000000000 }] }));
+        cwd: '/work/alpha', title: 'alpha', running: false, blank: false, agentAvailable: true,
+        updatedAt: 1794000000000 }] }));
       return;
     }
     req.socket.destroy();
@@ -273,18 +279,23 @@ test('T271: a prompt that never reaches the Host fails the task and frees the se
   config(sc, { base });
   const srv = server(sc.configFile);
   try {
-    const first = await call(srv, 'submit_task', { requestId: 't271-flaky-0001', sessionId: SESSION, prompt: 'one' });
-    assert.equal(first.code, 'host_unreachable');
-    const second = await call(srv, 'submit_task', { requestId: 't271-flaky-0002', sessionId: SESSION, prompt: 'two' });
-    assert.notEqual(second.code, 'session_busy', 'a failed prompt must not hold the session hostage');
-    assert.equal(second.code, 'host_unreachable');
+    const first = await call(srv, 'submit_task', { requestId: 't272-flaky-0001', sessionId: SESSION, prompt: 'one' });
+    assert.equal(first.code, 'task_unsettled');
+    assert.equal(first.task.state, 'unsettled');
+    assert.equal(first.requiresReconcile, true);
+
+    const second = await call(srv, 'submit_task', { requestId: 't272-flaky-0002', sessionId: SESSION, prompt: 'two' });
+    assert.equal(second.code, 'session_busy',
+      'an unanswered prompt must keep the session locked: the Host may already hold it');
 
     const doc = JSON.parse(readFileSync(path.join(sc.dir, 'state', 'tasks.json'), 'utf8'));
-    assert.equal(doc.tasks.length, 2);
-    for (const task of doc.tasks) {
-      assert.equal(task.state, 'failed');
-      assert.equal(task.error.phase, 'host_prompt');
-    }
+    assert.equal(doc.tasks.length, 1, 'the second prompt must never reach the ledger');
+    assert.equal(doc.tasks[0].state, 'unsettled');
+    assert.equal(doc.tasks[0].error.phase, 'host_prompt');
+    assert.equal(doc.tasks[0].requiresReconcile, true);
+
+    const early = await call(srv, 'get_result', { taskId: doc.tasks[0].taskId });
+    assert.equal(early.code, 'task_unsettled');
   } finally {
     await srv.stop();
     await new Promise((resolve) => flaky.close(resolve));

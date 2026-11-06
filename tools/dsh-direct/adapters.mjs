@@ -1,145 +1,242 @@
-// DSH Direct: the Host adapter contract, and the adapter that would run inside a Cordis Desktop plugin.
+// DSH Direct: the Host adapter contract, the rc.2 adapter, and the offline fake.
 //
-// The boundary this file paints is the whole honesty argument of the module:
+// T271 shipped an adapter that invented `listSessions` / `prompt({sessionId, text, requestId})` / `getEvents`.
+// `session_api.mjs` records what `@deepseek-ai/dsh-api-session-controller@0.2.0-rc.2` actually declares
+// (`list` / `prompt` / `page`), and this file is the only place that touches those methods.
 //
-//   * the MCP server never talks to Electron, to Chrome, or to a private WebSocket token. It talks HTTP to a Host
-//     bridge on loopback, with a bearer token, and that is the only thing it trusts;
-//   * the Host bridge is fed by an adapter. `createSessionControllerAdapter()` adapts the object a Cordis plugin
-//     receives as `ctx.sessionController` -- and it *probes* that object instead of assuming its shape. When the
-//     methods are absent it refuses with `host_capability_missing` and names them, because "the Host cannot do this"
-//     and "this experiment failed" must not collapse into one message;
-//   * `createFakeHost()` implements the same contract for tests. It is labelled `offline_fake` all the way through to
-//     the MCP result, so no receipt produced by it can be mistaken for a real Desktop dispatch.
+// The honesty boundary is unchanged and now sharper:
 //
-// What is verified today: the contract, the probe, the bridge, the MCP surface, the ledger. What is NOT verified:
-// that the installed Desktop build actually exposes `ctx.sessionController` with `listSessions`/`prompt`/`getEvents`.
-// A string count over `resources/app/lib/main.js` and `preload-app.cjs` of `@deepseek-ai/dsh-desktop@0.2.0-rc.2`
-// finds no `sessionController` at all, so the probe is the honest end of this road until a plugin is installed and
-// run inside the app.
+//   * `createSessionControllerAdapter()` probes the object it is handed. The probe requires exactly the rc.2 methods
+//     `list`, `prompt`, `page`; a Host that offers the old guesses instead is refused with `host_capability_missing`
+//     and the missing/required/available lists, so a version mismatch reads as a version mismatch;
+//   * `createFakeHost()` is rc.2-shaped, including the one behaviour that matters for lost responses: a repeated
+//     `requestId` is acknowledged **without** admitting a second message. It labels itself `offline_fake` all the way
+//     into the MCP result.
 
 import { CODES, DirectError, fail } from './protocol.mjs';
+import {
+  REMOTE_METHODS, buildPageRequest, buildPromptRequest, extractAssistantText, findAdmission, mapRemoteError,
+  normalizeList, normalizePage, readPromptValue,
+} from './session_api.mjs';
 
-/** The three methods the adapter needs. Named here so a refusal can enumerate them. */
-export const REQUIRED_SESSION_CONTROLLER = Object.freeze(['listSessions', 'prompt', 'getEvents']);
+export { REMOTE_METHODS as REQUIRED_SESSION_CONTROLLER };
 
-/** Which methods an arbitrary object actually has. Used by the probe's refusal details and by `/health`. */
 export function describeCapabilities(candidate) {
   const available = [];
   const missing = [];
-  for (const name of REQUIRED_SESSION_CONTROLLER) {
+  for (const name of REMOTE_METHODS) {
     const value = candidate ? candidate[name] : undefined;
     (typeof value === 'function' ? available : missing).push(name);
   }
-  return { available, missing, required: REQUIRED_SESSION_CONTROLLER.slice() };
-}
-
-function normalizeSession(raw) {
-  if (!raw || typeof raw !== 'object') fail(CODES.internal, 'the Host returned a session that is not an object');
-  const sessionId = raw.sessionId;
-  if (typeof sessionId !== 'string' || !sessionId.startsWith('session-')) {
-    fail(CODES.internal, 'the Host returned a session without a usable sessionId', { got: typeof sessionId });
-  }
-  return {
-    sessionId,
-    projectId: typeof raw.projectId === 'string' ? raw.projectId : null,
-    title: typeof raw.title === 'string' ? raw.title.slice(0, 200) : null,
-    status: typeof raw.status === 'string' ? raw.status : 'unknown',
-    lastActivityAt: Number.isFinite(raw.lastActivityAt) ? raw.lastActivityAt : null,
-  };
+  return { available, missing, required: REMOTE_METHODS.slice(),
+    // Named so a receipt can show *why* a probe failed on an older build: T271's guessed names are not present.
+    legacyGuessPresent: ['listSessions', 'getEvents'].filter((name) => typeof (candidate ? candidate[name] : undefined)
+      === 'function') };
 }
 
 /**
- * Adapt a `ctx.sessionController`-shaped object. Nothing is cached beyond the probe: a Host that withdraws a method
- * after activation must fail the next call, not keep answering from a stale belief that it can.
+ * Adapt `ctx.sessionController`. The returned object is the neutral shape the bridge publishes over loopback:
+ *
+ *   listSessions()                                     -> rows (from list() -> { items } | array)
+ *   prompt({ sessionId, text, requestId, clientTimeZone? }) -> { accepted, turnId | null, reason | null }
+ *   getEvents({ sessionId, throughSeq=-1, maxMessages })    -> newest page mapped to assistant text + admission
+ *   findAdmission({ sessionId, requestId })                -> { found, seq, eventType }
+ *
+ * Errors the Host raises deliberately are mapped by `mapRemoteError`; everything else propagates as a transport loss,
+ * which the MCP server treats as "unknown, reconcile with the same requestId".
  */
 export function createSessionControllerAdapter(candidate, { kind = 'cordis_session_controller' } = {}) {
   const caps = describeCapabilities(candidate);
   if (caps.missing.length) {
     throw new DirectError(CODES.host_capability_missing,
-      'the Host does not offer the session-controller methods this adapter requires',
-      { kind, missing: caps.missing, required: caps.required, available: caps.available });
+      'the Host does not offer the session-controller methods 0.2.0-rc.2 declares',
+      { kind, missing: caps.missing, required: caps.required, available: caps.available,
+        legacyGuessPresent: caps.legacyGuessPresent });
   }
+
+  async function call(method, ...args) {
+    try {
+      return await candidate[method](...args);
+    } catch (err) {
+      throw mapRemoteError(err);
+    }
+  }
+
   return {
     kind,
+    protocol: 'dsh-api-session-controller@0.2.0-rc.2',
     capabilities: () => describeCapabilities(candidate),
     async listSessions() {
-      const listed = await candidate.listSessions();
-      if (!Array.isArray(listed)) {
-        fail(CODES.internal, 'sessionController.listSessions() did not return an array');
-      }
-      return listed.map(normalizeSession);
+      const value = await call('list', {});
+      const { rows, shape } = normalizeList(value);
+      // `shape` travels with the data: rc.2's type says { items }, the service class returned an array.
+      return rows.map((row) => ({ ...row, listShape: shape }));
     },
-    async prompt({ sessionId, text, requestId }) {
-      const answer = await candidate.prompt({ sessionId, text, requestId });
-      if (!answer || typeof answer !== 'object') {
-        fail(CODES.internal, 'sessionController.prompt() returned no receipt');
-      }
-      if (answer.accepted !== true && answer.accepted !== false) {
-        fail(CODES.internal, 'sessionController.prompt() did not say whether the turn was accepted');
-      }
-      return { accepted: answer.accepted === true, turnId: typeof answer.turnId === 'string' ? answer.turnId : null,
-        reason: typeof answer.reason === 'string' ? answer.reason : null };
+    async prompt({ sessionId, text, requestId, clientTimeZone }) {
+      const request = buildPromptRequest({ requestId, sessionId, text, clientTimeZone });
+      const value = await call('prompt', request, undefined);
+      return { ...readPromptValue(value), requestId };
     },
-    async getEvents({ sessionId, turnId, cursor }) {
-      const answer = await candidate.getEvents({ sessionId, turnId, cursor });
-      if (!answer || typeof answer !== 'object' || !Array.isArray(answer.events)) {
-        fail(CODES.internal, 'sessionController.getEvents() did not return an event list');
-      }
+    async getEvents({ sessionId, throughSeq = -1, maxMessages }) {
+      const value = await call('page', buildPageRequest({ sessionId, throughSeq, maxMessages }));
+      const { records, hasMore } = normalizePage(value);
       return {
-        events: answer.events.map((event) => ({
-          seq: Number.isFinite(event && event.seq) ? event.seq : null,
-          kind: typeof (event && event.kind) === 'string' ? event.kind : 'unknown',
-          text: typeof (event && event.text) === 'string' ? event.text : null,
-        })),
-        cursor: Number.isFinite(answer.cursor) ? answer.cursor : null,
-        done: answer.done === true,
+        events: records.map((record) => {
+          const event = record && record.event ? record.event : null;
+          return { seq: Number.isFinite(event && event.seq) ? event.seq : null,
+            kind: event && typeof event.type === 'string' ? event.type : 'unknown',
+            data: event ? event.data : null };
+        }),
+        records,
+        hasMore,
+        assistantText: extractAssistantText(records),
       };
+    },
+    /** Proof that one requestId reached the durable log, used by reconciliation. */
+    async findAdmission({ sessionId, requestId, maxMessages = 120 }) {
+      const value = await call('page', buildPageRequest({ sessionId, throughSeq: -1, maxMessages }));
+      const { records } = normalizePage(value);
+      return findAdmission(records, requestId);
     },
   };
 }
 
 /**
- * An offline Host for tests. Deterministic, in-process, and labelled at every layer it can be labelled at: the
- * bridge reports `kind: offline_fake`, `/health` repeats it, and the MCP result carries it back to the caller.
+ * An offline Host for tests, shaped like rc.2. Deterministic, in-process, and labelled at every layer it can be.
  *
- * It is *not* a stand-in for a real dispatch. It exists so the MCP surface, the ledger, the auth and the occupancy
- * rules can be exercised for real (real processes, real HTTP, real stdio) without pretending a Desktop prompt ran.
+ * `admissions` counts accepted prompts; a repeated `requestId` is acknowledged without incrementing it, which is the
+ * one property the whole reconcile story rests on. `loseNextResponse` makes the next prompt be admitted and *then*
+ * fail on the way back -- the exact failure that used to be mislabelled as "never sent".
  */
-export function createFakeHost({ sessions = [], turnsPerTask = 2, failPrompt = false } = {}) {
+export function createFakeHost({ sessions = [], pagesPerTurn = 2, failPrompt = false } = {}) {
   const known = new Map();
-  for (const session of sessions) known.set(session.sessionId, { ...normalizeSession(session) });
-  const turns = new Map();
-  let seq = 0;
+  for (const session of sessions) {
+    known.set(session.sessionId, {
+      sessionId: session.sessionId,
+      cwd: session.cwd === undefined ? null : session.cwd,
+      updatedAt: session.updatedAt === undefined ? 1794000000000 : session.updatedAt,
+      running: false,
+      blank: session.blank === true,
+      agentAvailable: true,
+      parentSessionId: null,
+      origin: null,
+      title: session.title === undefined ? null : session.title,
+    });
+  }
+  const turns = new Map();      // sessionId -> { requestId, text, reads, admissions }
+  const admitted = [];          // every accepted requestId, in order
+  let state = { loseNextResponse: false, refuseAs: null, listShape: 'items', hideAdmission: false };
+
+  const rows = () => Array.from(known.values()).map((session) => ({
+    sessionId: session.sessionId, cwd: session.cwd, updatedAt: session.updatedAt, running: session.running,
+    blank: session.blank, agentAvailable: session.agentAvailable, parentSessionId: null, origin: null,
+  }));
+
   return {
     kind: 'offline_fake',
-    capabilities: () => ({ available: REQUIRED_SESSION_CONTROLLER.slice(), missing: [],
-      required: REQUIRED_SESSION_CONTROLLER.slice() }),
-    async listSessions() {
-      return Array.from(known.values()).map((session) => ({ ...session }));
+    protocol: 'dsh-api-session-controller@0.2.0-rc.2',
+    capabilities: () => ({ available: REMOTE_METHODS.slice(), missing: [], required: REMOTE_METHODS.slice(),
+      legacyGuessPresent: [] }),
+    // Test controls, not part of the adapter contract.
+    control: {
+      loseNextResponse(value = true) { state.loseNextResponse = value; },
+      refuseAs(code) { state.refuseAs = code; },
+      listShape(shape) { state.listShape = shape === 'array' ? 'array' : 'items'; },
+      hideAdmission(value = true) { state.hideAdmission = value; },
+      admissions() { return admitted.slice(); },
+      titles() { return new Map(Array.from(known.values()).map((s) => [s.sessionId, s.title])); },
     },
-    async prompt({ sessionId, text, requestId }) {
-      const session = known.get(sessionId);
-      if (!session) return { accepted: false, turnId: null, reason: 'session_not_found' };
-      if (failPrompt) return { accepted: false, turnId: null, reason: 'prompt_refused_by_fake' };
-      seq += 1;
-      const turnId = 'turn-' + String(seq).padStart(4, '0');
-      turns.set(turnId, { sessionId, text, requestId, reads: 0, turnsPerTask });
-      session.lastActivityAt = Date.now();
-      return { accepted: true, turnId };
+    async list() {
+      const items = rows();
+      return state.listShape === 'array' ? items : { items };
     },
-    async getEvents({ sessionId, turnId }) {
-      const turn = turns.get(turnId);
-      if (!turn || turn.sessionId !== sessionId) {
-        return { events: [], cursor: null, done: true };
+    async prompt(request) {
+      if (state.refuseAs) {
+        const code = state.refuseAs;
+        state.refuseAs = null;
+        const error = new Error('fake host refused with ' + code);
+        error.code = code;
+        throw error;
       }
-      turn.reads += 1;
-      const events = [{ seq: turn.reads, kind: 'turn.accepted', text: null }];
-      if (turn.reads >= turn.turnsPerTask) {
-        events.push({ seq: turn.reads + 1, kind: 'assistant.message',
-          text: 'offline fake answer for ' + turn.text.slice(0, 40) });
-        return { events, cursor: turn.reads + 1, done: true };
+      if (!request || typeof request.requestId !== 'string' || !request.requestId.length) {
+        const error = new Error('requestId is required');
+        error.code = 'gateway/bad-request';
+        throw error;
       }
-      return { events, cursor: turn.reads, done: false };
+      const text = Array.isArray(request.content)
+        ? request.content.filter((part) => part && part.type === 'text').map((part) => part.text).join('')
+        : '';
+      if (!text.trim().length) {
+        const error = new Error('prompt content must include non-whitespace text');
+        error.code = 'gateway/bad-request';
+        throw error;
+      }
+      const session = known.get(request.sessionId);
+      if (!session) {
+        const error = new Error('session "' + request.sessionId + '" not found');
+        error.code = 'session/not-found';
+        throw error;
+      }
+      if (failPrompt) return { accepted: false, reason: 'prompt_refused_by_fake' };
+      // Idempotent admission: the same requestId is acknowledged, never inserted twice (rc.2 lib/index.js:855).
+      if (admitted.includes(request.requestId)) {
+        const turn = turns.get(request.sessionId);
+        if (state.loseNextResponse) {
+          state.loseNextResponse = false;
+          const error = new Error('stream carrier closed after admission');
+          error.code = 'gateway/uplink-overflow';
+          throw error;
+        }
+        return { accepted: true };
+      }
+      admitted.push(request.requestId);
+      turns.set(request.sessionId, { requestId: request.requestId, text, reads: 0 });
+      session.updatedAt = Date.now();
+      session.running = true;
+      if (state.loseNextResponse) {
+        state.loseNextResponse = false;
+        // Admitted, then the answer is lost. This is the failure a naive client calls "failed".
+        const error = new Error('connection reset after the Host accepted the prompt');
+        error.code = 'gateway/internal';
+        throw error;
+      }
+      return { accepted: true };
+    },
+    async page(request) {
+      const sessionId = request && request.address && request.address.sessionId;
+      if (!known.has(sessionId)) {
+        const error = new Error('session "' + String(sessionId) + '" not found');
+        error.code = 'session/not-found';
+        throw error;
+      }
+      const turn = turns.get(sessionId);
+      const records = [];
+      if (turn) {
+        turn.reads += 1;
+        records.push({ type: 'event', event: { type: 'turn/start', seq: 1, time: Date.now(), data: { turn: 0 } } });
+        // `hideAdmission` models a durable log that does not (yet, or any more) carry the submission's rpcId -- the
+        // one case where reconcile genuinely needs the original text. The adapter scans records, so the evidence has
+        // to be absent from the records, not just from the fake's own convenience method.
+        if (!state.hideAdmission) {
+          records.push({ type: 'event', event: { type: 'user/message', seq: 2, time: Date.now(),
+            data: { message: { content: [{ type: 'text', text: turn.text }], source: { kind: 'user',
+              rpcId: turn.requestId } } } } });
+        }
+        if (turn.reads >= pagesPerTurn) {
+          records.push({ type: 'event', event: { type: 'assistant/message', seq: 3, time: Date.now(),
+            data: { turn: 0, step: 1, message: { content: [
+              { type: 'text', text: 'offline fake answer for ' + turn.text.slice(0, 40) }] } } } });
+          known.get(sessionId).running = false;
+        }
+      }
+      return { records, hasMore: false };
+    },
+    findAdmission: async ({ sessionId, requestId }) => {
+      if (state.hideAdmission) return { found: false, seq: null, eventType: null };
+      const turn = turns.get(sessionId);
+      return turn && turn.requestId === requestId
+        ? { found: true, seq: 2, eventType: 'user/message' }
+        : { found: false, seq: null, eventType: null };
     },
   };
 }

@@ -1,0 +1,9 @@
+# dsh-direct: one plugin row inside the existing Desktop Host.
+#
+# `insert` is the same shape the installed plugins use (see dsh-session-cleaner/cordis.patch.yml). The config is
+# intentionally empty: every field that matters is operator-specific and is supplied at install time in the Desktop
+# profile's own patch file, not here. Missing tokenFile or an empty binding makes the plugin refuse to serve.
+- insert:
+    - id: dsh-direct
+      name: 'dsh-direct'
+      config: {}
