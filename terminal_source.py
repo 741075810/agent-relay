@@ -349,6 +349,15 @@ def load_state(state_dir):
             not isinstance(doc.get('ackedIds', []), list) or \
             not isinstance(doc.get('pendingIds', []), list):
         raise SourceError('%s is missing its id lists' % path)
+    # T268: the status-scoped journals. A malformed one is refused rather than treated as empty, because
+    # "no forms" makes every historical ACK suppress all of a run's statuses again -- which is safe -- but
+    # silently accepting a damaged list would hide that the file needs looking at.
+    for key in ('pendingForms', 'ackedForms'):
+        value = doc.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, list) or not all(isinstance(item, str) and item for item in value):
+            raise SourceError('%s has a damaged %s list' % (path, key))
     return doc
 
 
@@ -601,6 +610,16 @@ def running_report(state_dir, root=None, bridge_db=None, native_root=None,
     return report
 
 
+def status_key(run_id, status):
+    """The identity of one *fact* about a run: which run, announced as what.
+
+    T268: this is the same key Chrome's trigger journal and dedupe use, and it is what an ACK has to be able to
+    name. A run id alone says "something about this task was consumed", which is true of the failure but not of a
+    later completion.
+    """
+    return '%s|%s' % (run_id, status)
+
+
 def candidates_from(runs, state, arm_ids=None, origin=None, facts=None,
                     native=None):
     """Split validated runs into (candidates due now, next state).
@@ -688,7 +707,9 @@ def candidates_from(runs, state, arm_ids=None, origin=None, facts=None,
                 'version': STATE_VERSION,
                 'baselineIds': baseline,
                 'pendingIds': [],
+                'pendingForms': [],
                 'ackedIds': [],
+                'ackedForms': [],
                 'baselineDropped': dropped,
                 'baselineCount': len(terminal),
             }, {'baselineEstablished': True, 'existingTerminalRuns': len(terminal),
@@ -711,7 +732,11 @@ def candidates_from(runs, state, arm_ids=None, origin=None, facts=None,
             'version': STATE_VERSION,
             'baselineIds': history_ids,
             'pendingIds': [item['runId'] for item in offered],
+            # T268: which *fact* each offer is. The ACK from Chrome names only a run id, so this is the only
+            # record of what the page was actually shown; without it an ACK could only consume the whole run.
+            'pendingForms': [status_key(item['runId'], item['status']) for item in offered],
             'ackedIds': [],
+            'ackedForms': [],
             'baselineDropped': 0,
             'baselineCount': len(history),
         }, {'baselineEstablished': True, 'existingTerminalRuns': len(terminal),
@@ -720,6 +745,18 @@ def candidates_from(runs, state, arm_ids=None, origin=None, facts=None,
     baseline_set = set(state['baselineIds'])
     acked = set(state['ackedIds'])
     pending = list(state.get('pendingIds') or [])
+    # T268: an ACK consumes the *fact* the page was given, not the run. Chrome's `terminal-ack` carries run ids
+    # only, so `ackedForms` records which status was actually on the page when it agreed. A run that was reported
+    # `failed` and then really completed is a different fact, and refusing to ever mention it again loses the one
+    # thing the operator needed to know.
+    acked_forms = set(state.get('ackedForms') or [])
+    # A bare id with no recorded fact is a state file from before this record existed (or an ACK for a run whose
+    # offer predates it). It keeps its old, wider meaning -- "this run is done" -- because re-opening history after
+    # an upgrade would re-announce every task the operator has already seen.
+    suppress_whole_run = acked - {form.split('|', 1)[0] for form in acked_forms if '|' in form}
+
+    def consumed(run_id, status):
+        return run_id in suppress_whole_run or status_key(run_id, status) in acked_forms
 
     # Anything still pending is re-offered: the previous answer may never have
     # reached storage.
@@ -735,7 +772,7 @@ def candidates_from(runs, state, arm_ids=None, origin=None, facts=None,
 
     fresh = [item for item in terminal
              if item['runId'] not in baseline_set
-             and item['runId'] not in acked
+             and not consumed(item['runId'], item['status'])
              and item['runId'] not in set(pending)]
     fresh.sort(key=lambda item: item['startedAt'])
     room = max(0, MAX_CANDIDATES - len(due))
@@ -744,8 +781,12 @@ def candidates_from(runs, state, arm_ids=None, origin=None, facts=None,
     handed_out = due + fresh
     pending_out = list(dict.fromkeys(
         [item['runId'] for item in handed_out] + pending))[-MAX_STATE_IDS:]
+    # The forms follow the offers: a run re-offered after its status moved is offered as the fact it now is.
+    pending_forms_out = list(dict.fromkeys(
+        [status_key(item['runId'], item['status']) for item in handed_out]))[-MAX_STATE_IDS:]
     carried = {key: value for key, value in state.items()
-               if key not in ('pendingIds', 'ackedIds', 'baselineIds', 'baselineDropped', 'baselineCount', 'version')}
+               if key not in ('pendingIds', 'pendingForms', 'ackedIds', 'ackedForms', 'baselineIds',
+                              'baselineDropped', 'baselineCount', 'version')}
     return handed_out, dict(carried, **{
         'version': STATE_VERSION,
         # The baseline is fixed at the first sample and must never be recomputed.
@@ -757,7 +798,9 @@ def candidates_from(runs, state, arm_ids=None, origin=None, facts=None,
         # finishing while another was still pending never notified at all.
         'baselineIds': state['baselineIds'],
         'pendingIds': pending_out,
+        'pendingForms': pending_forms_out,
         'ackedIds': list(state['ackedIds'])[-MAX_STATE_IDS:],
+        'ackedForms': list(state.get('ackedForms') or [])[-MAX_STATE_IDS:],
         'baselineDropped': dropped,
         'baselineCount': state.get('baselineCount'),
     }), {'baselineEstablished': False, 'existingTerminalRuns': len(terminal),
@@ -804,8 +847,15 @@ def acknowledge(state_dir, run_ids):
     """Mark candidates consumed. Called only after Chrome reports it persisted.
 
     Idempotent: acknowledging twice, or acknowledging something never handed out,
-    changes nothing. A run id is the whole identity here -- the trigger keys on
-    `runId|status`, and a run has exactly one terminal status.
+    changes nothing. The wire form is a bare run id -- that is what `background.js`
+    sends -- so what an ACK *means* is decided here, from the offers this host
+    actually made: every pending fact for that run is consumed, and only that fact.
+
+    T268: the older reading was "a run has exactly one terminal status, so a bare id
+    may consume the run". A run reported `failed` and later really completed is two
+    facts about one run, and collapsing them meant the corrected outcome could never
+    reach the page. A bare id with no recorded offer keeps the wide meaning, which is
+    what an upgraded state file needs.
     """
     if not isinstance(run_ids, list):
         raise SourceError('ack needs a list of run ids')
@@ -820,22 +870,37 @@ def acknowledge(state_dir, run_ids):
     acked = list(state['ackedIds'])
     known = set(acked)
     pending = [r for r in (state.get('pendingIds') or [])]
+    pending_forms = list(state.get('pendingForms') or [])
+    acked_forms = list(state.get('ackedForms') or [])
+    known_forms = set(acked_forms)
     moved = 0
     for run_id in wanted:
-        if run_id in known:
-            continue
         if run_id not in pending:
             # Never handed out: refusing to consume what was not delivered.
             continue
-        known.add(run_id)
-        acked.append(run_id)
+        # The facts this run was offered as. A state file from before `pendingForms`
+        # existed has none, and its ACK then falls back to the wide meaning below.
+        forms = [item for item in pending_forms if item.split('|', 1)[0] == run_id and '|' in item]
+        new_forms = [form for form in forms if form not in known_forms]
+        if not new_forms and run_id in known:
+            # This run, in the shape it was offered, has already been consumed. Saying
+            # so again changes nothing -- that is the idempotence the caller relies on.
+            continue
+        for form in new_forms:
+            known_forms.add(form)
+            acked_forms.append(form)
+        if run_id not in known:
+            known.add(run_id)
+            acked.append(run_id)
         moved += 1
     next_state = dict(state)
     next_state.update({
         'version': STATE_VERSION,
         'baselineIds': state['baselineIds'],
         'pendingIds': [r for r in pending if r not in known],
+        'pendingForms': [item for item in pending_forms if item.split('|', 1)[0] not in known],
         'ackedIds': acked[-MAX_STATE_IDS:],
+        'ackedForms': acked_forms[-MAX_STATE_IDS:],
         'baselineDropped': state.get('baselineDropped', 0),
         'baselineCount': state.get('baselineCount'),
     })
