@@ -18,14 +18,21 @@ Read from the installed bytes under `<DSH_INSTALL>\resources\app\dsh\node_module
 |---|---|---|---|
 | `list` | `SessionListRequest { cursor? }` | `SessionListValue { items: SessionSummary[] }` | `dsh-api-session-controller/lib/typert.host.js` (catalog id `session/list`) |
 | `prompt` | `SessionPromptRequest { requestId, sessionId, mode: 'queue'\|'steer', content: PromptContentPart[], clientTimeZone? }` | `{ accepted: true }` | same file; admission check at `lib/index.js:855` |
-| `page` | `SessionPageRequest { address: { kind: 'session', sessionId }, throughSeq, beforeSeq?, maxMessages?, turnWindow? }` | `SessionPage { records, hasMore }` | `lib/index.js:1417`; `throughSeq === -1` means "newest" |
+| `page` | `SessionPageRequest { address: { kind: 'session', sessionId }, throughSeq, beforeSeq?, maxMessages?, turnWindow? }` | `SessionPage { records, hasMore }` | `throughSeq === -1` is the empty prefix; use a finite snapshot cursor |
+| `projections` | `{ sessionId }`, plus AbortSignal | snapshot with `asOfSeq`, or `null` | read-only cursor for fixed-cut paging; no `follow` promotion |
 
 `SessionSummary = { agentAvailable, sessionId, updatedAt, running, blank, parentSessionId?, origin?, cwd?, projections? }`.
 **There is no `projectId`** — `cwd` is the identity a caller can bind to.
 
 T271 guessed `listSessions` / `getEvents({sessionId,turnId,cursor})`. Those never existed in rc.2. `adapters.mjs` now
-requires `list`/`prompt`/`page` and reports a build that only has the guessed names as
-`host_capability_missing` + `legacyGuessPresent`.
+requires `list`/`prompt`/`page`/`projections` and reports a build that only has the guessed names as
+`host_capability_missing` + `legacyGuessPresent`. The adapter passes real AbortSignals to `prompt`, `page` and
+`projections`; missing signals fail in the shipped service, not just in a hypothetical future build.
+
+A result joins the exact `user/message.data.source.rpcId` to its enclosing `turn/start`, the same turn's final
+noninterrupted non-tool `assistant/message`, and a completed `turn/end`. Old replies and intermediate text do not count.
+The history search uses one fixed snapshot and at most 32 backward pages. Missing correlation or a completed turn with
+no final text does not become success; inspect `get_task` and history rather than sending another prompt.
 
 There is also no `events`/`state`/`wait` in rc.2 (those are master-only). The read path here is `page`, and the
 plugin does not pretend otherwise: `protocol` in every receipt says `dsh-api-session-controller@0.2.0-rc.2`.
@@ -43,7 +50,7 @@ Therefore:
 
 | situation | state | session lock | what the caller does |
 |---|---|---|---|
-| prompt accepted | `running` → `succeeded` | held until terminal | nothing |
+| prompt accepted | `running` → `succeeded` or `failed` | held until correlated terminal | poll `get_result`; it refreshes history without another prompt |
 | Host explicitly refused (`session/writer-held`, `session/agent-busy`, `gateway/bad-request`, `session/not-found`, …) | `failed` | released | fix the cause, submit again |
 | no answer (`host_unreachable`, `host_error`, `cancelled`, `internal`) | **`unsettled`** | **kept** | `reconcile_task` |
 | process restart while active | `unknown` (`unknownReason: process_restart`) | kept | `get_task` |
@@ -54,9 +61,12 @@ Therefore:
 `reconcile_task` then settles it in the cheapest correct order:
 
 1. scan the durable log for the requestId; found → the earlier attempt was admitted, go straight to collecting;
-2. otherwise re-submit **the same** `requestId` with the original text, which the Host acknowledges without inserting
-   a second message. The text is not stored here (only `promptSha256`), so the caller must pass `prompt` and it must
-   hash to the recorded digest, otherwise `invalid_arguments`.
+2. otherwise require the bound session's `running === false` and `agentAvailable === true`, recheck the configured
+   worktree guard, then re-submit **the same** `requestId` with the original text. The Host deduplicates the id. The text
+   is not stored here (only `promptSha256`), so the caller must pass `prompt` matching that digest.
+
+New submissions also require positive idle evidence. Unknown/missing idle state fails closed; a busy session is not a
+queue target for this bridge. Durable history reads remain available while busy. Preserve unresolved ledgers and ids.
 
 Host error codes seen in rc.2 and how they map: `gateway/bad-request` → `invalid_arguments`, `gateway/cancelled` →
 `cancelled`, `gateway/internal` / `gateway/uplink-overflow` → `host_error`, `session/not-found` →
@@ -84,25 +94,23 @@ Tools: `list_sessions`, `submit_task`, `reconcile_task`, `get_task`, `get_result
 
 ## Installing into the Desktop
 
-The plugin half is packaged and tested, but **it is not installed on this machine**. `INSTALL-WINDOWS.md` has the
-exact steps; they are labelled as not performed, because installing requires a Desktop restart and a production
-profile change.
+[INSTALL-WINDOWS.md](INSTALL-WINDOWS.md) gives backup, profile dependency/bundle/override, official enable, loopback
+configuration and rollback steps. Machine-specific installation status and session ids belong in a local evidence report,
+not this source snapshot. First import may hot-load; replacing an already imported module can need a deferred Desktop
+restart. Never terminate the process hosting the installation task. Cordis cleanup is owned through `ctx.effect`.
 
 ## Acceptance levels — keep them apart
 
-| level | meaning | status |
+| level | meaning | evidence required per installation |
 |---|---|---|
-| **A** | plugin, MCP server (stdio **and** Streamable HTTP) and preflight verified in isolation against a fake Host; the HTTP layer driven over a real socket by a real HTTP client | **done** — `test_t271_*` … `test_t275_*` |
-| **B** | the real Desktop Host loads the plugin and serves the bridge on loopback | **not done** — needs the operator to install |
-| **C** | an existing session received a real prompt through this bridge | **not done** — needs B |
+| **A** | plugin, stdio/HTTP MCP, preflight and strict rc.2 contracts verified offline | `test_t271_*` … `test_t276_*`, full gate and exact-commit CI; optional actual Cordis Context teardown test |
+| **B** | the actual Desktop Host loads the installed generation and serves on loopback | fresh endpoint, socket ownership and authenticated bound-session listing; an isolated Host or old health response is not B |
+| **C** | the original existing session received the single harmless message after idle confirmation | exact session/request/turn/terminal/result evidence via the direct route; never substitute a replacement session |
 
-The HTTP transport does not change B or C: it makes the MCP side reachable by an HTTP client, not the Desktop
-reachable by ChatGPT. The stdio server is still not registered with ChatGPT's custom-MCP settings, and a Web client
-needs an HTTPS endpoint that is reachable from the internet while this listener is loopback-only by construction.
-Stdio works for a desktop MCP client that launches the process itself; HTTP works for a local HTTP MCP client. Neither
-is a Web connection, and this file says so rather than implying it away with a working local server.
-
-Everything in this directory is level A. No claim in the repo says otherwise.
+Stdio works for a local MCP client that launches the process; optional HTTP works for a local HTTP MCP client. A cloud
+Web connector is separate and is not a prerequisite for C. No public listener, tunnel or connector registration is part
+of these installation steps. The direct route is MCP → private loopback Host bridge → `ctx.sessionController`; the
+separate Bridge connector is not invoked. Record B/C per machine instead of deriving either from offline tests.
 
 ## Reachability: why there is an endpoint file (T273)
 
@@ -205,7 +213,7 @@ node tools/dsh-direct/preflight.mjs --alone            # package + docs only
 | `endpoint.identity` | the port answers as a different kind, protocol, or `endpointId` |
 | `port.availability` | the port is out of range or unprobeable (`warn` when it is occupied) |
 | `docs.consistency` | the install document teaches a field the server does not read, names two token paths, mentions `port: 0`, or never mentions `endpointFile` |
-| `install.state` | never: it only reports whether the plugin is installed, and writes nothing |
+| `install.state` | never: reports package-directory and profile-text presence only, not activation; writes nothing |
 
 Exit code 0 when nothing failed, 1 otherwise, 2 for bad flags. `--strict` turns `warn` into failure.
 
@@ -223,6 +231,8 @@ node test_t273_plugin_config.mjs           # listener rules, unload releases the
 node test_t274_http_transport.mjs          # Streamable HTTP over a real socket: session, Origin, auth, 202/405/413/504,
 node test_t275_http_interop.mjs            # 415 media type, no 2024-11-05 claim, -32602 initialize, 429, 504 lock semantics
                                            # SSE framing, and a full submit→result→duplicate run against a fake Host
+node test_t276_session_history.mjs          # fixed snapshot, real cursor semantics, request/turn/final result correlation
+node test_t276_task_lifecycle.mjs           # idle admission, delayed get_result refresh, terminal failure, busy reconcile
 ```
 
 The reconcile suite injects the failure that matters: the fake Host **admits** the prompt and then throws on the way
