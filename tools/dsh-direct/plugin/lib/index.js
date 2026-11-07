@@ -155,21 +155,31 @@ export function apply(ctx, config) {
       note(ctx, 'info', 'bridge on ' + started.base + ' closed');
     }
   };
-  // Returning the promise matters: a host that awaits its dispose handlers must see the socket actually closed, not
-  // merely asked to close. A host that ignores the return value still gets the teardown, just not synchronised.
-  if (ctx && typeof ctx.on === 'function') ctx.on('dispose', () => dispose());
-  // Nothing is published onto `ctx`. Cordis 4 rejects an assignment to a property it was not told about ("cannot set
-  // property \"dshDirect\" without provide"), and that rejection happens inside `apply`, so the whole row fails to
-  // activate in a live Host -- which is exactly what happened the first time this plugin was loaded by a real Desktop.
-  // The disposer therefore doubles as the status handle: Cordis calls the returned function on unload and ignores extra
-  // properties, while a test can await `ready` without the plugin writing anything onto the host context.
-  dispose.ready = ready;
-  dispose.boundSessionIds = boundSessionIds.slice();
-  dispose.tokenFile = tokenFile;
-  dispose.endpointFile = listener.endpointFile;
-  dispose.port = listener.port;
-
-  return dispose;
+  // Everything after the bind runs inside one guard. If any of it throws -- a Host whose `on` is not the shape we
+  // expect, a context proxy that rejects a property, anything -- the socket must not stay listening for the life of the
+  // process. That is not hypothetical: the first real Desktop load threw after the bind, Cordis reported `1 entry did
+  // not activate`, and the listener stayed up as an ownerless socket answering /health on the fixed port; the next
+  // activation then failed with `bind_failed` because the corpse of the previous one still owned the port.
+  try {
+    if (ctx && typeof ctx.on === 'function') ctx.on('dispose', () => dispose());
+    // Nothing is published onto `ctx`. Cordis 4 rejects an assignment to a property it was not told about ("cannot set
+    // property \"dshDirect\" without provide"), and that rejection happens inside `apply`, so the whole row fails to
+    // activate in a live Host -- which is exactly what happened the first time this plugin was loaded by a real Desktop.
+    // The disposer therefore doubles as the status handle: Cordis calls the returned function on unload and ignores extra
+    // properties, while a test can await `ready` without the plugin writing anything onto the host context.
+    dispose.ready = ready;
+    dispose.boundSessionIds = boundSessionIds.slice();
+    dispose.tokenFile = tokenFile;
+    dispose.endpointFile = listener.endpointFile;
+    dispose.port = listener.port;
+    // Returning the promise still matters: a host that awaits its dispose handlers must see the socket actually
+    // closed, not merely asked to close, and a host that ignores the return value still gets the teardown.
+    return dispose;
+  } catch (err) {
+    // Close whatever bound, then let the failure surface as the failure it is.
+    ready.then((started) => (started ? started.close() : null)).catch(() => {});
+    throw err;
+  }
 }
 
 /** Reported by the install check: does this Host expose what the plugin needs, and what would it bind? */

@@ -54,6 +54,20 @@ export function createSessionControllerAdapter(candidate, { kind = 'cordis_sessi
         legacyGuessPresent: caps.legacyGuessPresent });
   }
 
+  /**
+   * rc.2's host-side `prompt(request, signal)` and `page(request, signal)` call `signal.throwIfAborted()` **without**
+   * optional chaining (`lib/index.js:3096` and `:1419`), so an omitted signal is not a no-op: it is
+   * `Cannot read properties of undefined (reading 'throwIfAborted')`, thrown after the request was already sent. A real
+   * AbortSignal is therefore mandatory, and a timeout is the only cancellation this side can originate.
+   */
+  const CALL_SIGNAL_TIMEOUT_MS = 120000;
+  function callSignal() {
+    if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+      return AbortSignal.timeout(CALL_SIGNAL_TIMEOUT_MS);
+    }
+    return new AbortController().signal;
+  }
+
   async function call(method, ...args) {
     try {
       return await candidate[method](...args);
@@ -67,6 +81,8 @@ export function createSessionControllerAdapter(candidate, { kind = 'cordis_sessi
     protocol: 'dsh-api-session-controller@0.2.0-rc.2',
     capabilities: () => describeCapabilities(candidate),
     async listSessions() {
+      // `list(_request, signal)` reaches `signal?.throwIfAborted()`, which tolerates an absent signal, so the request
+      // object is the only argument this one needs.
       const value = await call('list', {});
       const { rows, shape } = normalizeList(value);
       // `shape` travels with the data: rc.2's type says { items }, the service class returned an array.
@@ -74,11 +90,11 @@ export function createSessionControllerAdapter(candidate, { kind = 'cordis_sessi
     },
     async prompt({ sessionId, text, requestId, clientTimeZone }) {
       const request = buildPromptRequest({ requestId, sessionId, text, clientTimeZone });
-      const value = await call('prompt', request, undefined);
+      const value = await call('prompt', request, callSignal());
       return { ...readPromptValue(value), requestId };
     },
     async getEvents({ sessionId, throughSeq = -1, maxMessages }) {
-      const value = await call('page', buildPageRequest({ sessionId, throughSeq, maxMessages }));
+      const value = await call('page', buildPageRequest({ sessionId, throughSeq, maxMessages }), callSignal());
       const { records, hasMore } = normalizePage(value);
       return {
         events: records.map((record) => {
@@ -94,7 +110,7 @@ export function createSessionControllerAdapter(candidate, { kind = 'cordis_sessi
     },
     /** Proof that one requestId reached the durable log, used by reconciliation. */
     async findAdmission({ sessionId, requestId, maxMessages = 120 }) {
-      const value = await call('page', buildPageRequest({ sessionId, throughSeq: -1, maxMessages }));
+      const value = await call('page', buildPageRequest({ sessionId, throughSeq: -1, maxMessages }), callSignal());
       const { records } = normalizePage(value);
       return findAdmission(records, requestId);
     },
@@ -150,7 +166,13 @@ export function createFakeHost({ sessions = [], pagesPerTurn = 2, failPrompt = f
       const items = rows();
       return state.listShape === 'array' ? items : { items };
     },
-    async prompt(request) {
+    async prompt(request, signal) {
+      // rc.2 calls this unconditionally (`lib/index.js:3096`); a fake that tolerates a missing signal let a real
+      // `Cannot read properties of undefined (reading 'throwIfAborted')` reach the operator instead of this suite.
+      if (!signal || typeof signal.throwIfAborted !== 'function') {
+        throw new TypeError("Cannot read properties of undefined (reading 'throwIfAborted')");
+      }
+      signal.throwIfAborted();
       if (state.refuseAs) {
         const code = state.refuseAs;
         state.refuseAs = null;
@@ -202,7 +224,11 @@ export function createFakeHost({ sessions = [], pagesPerTurn = 2, failPrompt = f
       }
       return { accepted: true };
     },
-    async page(request) {
+    async page(request, signal) {
+      if (!signal || typeof signal.throwIfAborted !== 'function') {
+        throw new TypeError("Cannot read properties of undefined (reading 'throwIfAborted')");
+      }
+      signal.throwIfAborted();
       const sessionId = request && request.address && request.address.sessionId;
       if (!known.has(sessionId)) {
         const error = new Error('session "' + String(sessionId) + '" not found');

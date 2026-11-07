@@ -39,7 +39,10 @@ function controller() {
       ] };
     },
     async prompt(request, signal) {
-      assert.equal(signal, undefined, 'the plugin must not pass a signal the Host does not expect');
+      // rc.2's host-side prompt(request, signal) calls signal.throwIfAborted() unconditionally (lib/index.js:3096), so a
+      // missing signal is a TypeError, not a tolerated omission. This assertion used to demand the opposite -- it encoded
+      // T271's guess, and a real Desktop answered `Cannot read properties of undefined (reading 'throwIfAborted')`.
+      assert.equal(typeof signal?.throwIfAborted, 'function', 'the Host expects a real AbortSignal');
       assert.equal(request.mode, 'queue');
       state.requestIds.push(request.requestId);
       state.lastText = request.content.map((part) => part.text).join('');
@@ -47,7 +50,8 @@ function controller() {
       state.running = true;
       return { accepted: true };
     },
-    async page() {
+    async page(request, signal) {
+      assert.equal(typeof signal?.throwIfAborted, 'function', 'page() takes the same signal contract as prompt()');
       state.pages += 1;
       return { records: [
         { type: 'event', event: { type: 'turn/start', seq: 1, time: 0, data: { turn: 0 } } },

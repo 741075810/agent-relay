@@ -207,7 +207,7 @@ test('T275: a 504 does not double-dispatch, does not release the lock, and the r
   const sc = await scene(t, { http: { requestTimeoutMs: 150 } });
   const { sessionId } = await open(sc.transport);
   const realPrompt = sc.controller.prompt.bind(sc.controller);
-  sc.controller.prompt = async (request) => { await sleep(600); return realPrompt(request); };
+  sc.controller.prompt = async (request, signal) => { await sleep(600); return realPrompt(request, signal); };
 
   const slow = await call(sc.transport, sessionId, 'submit_task',
     { requestId: 't275.504.0001', sessionId: SESSION, prompt: 'slow turn' });
@@ -278,7 +278,7 @@ test('T275: two concurrent submits with different requestIds admit exactly one p
   const sc = await scene(t);
   const { sessionId } = await open(sc.transport);
   const realPrompt = sc.controller.prompt.bind(sc.controller);
-  sc.controller.prompt = async (request) => { await sleep(250); return realPrompt(request); };
+  sc.controller.prompt = async (request, signal) => { await sleep(250); return realPrompt(request, signal); };
 
   const [first, second] = await Promise.all([
     call(sc.transport, sessionId, 'submit_task', { requestId: 't275.race.aaaa.1', sessionId: SESSION, prompt: 'race a' }),

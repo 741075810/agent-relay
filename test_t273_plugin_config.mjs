@@ -211,6 +211,28 @@ test('T273: apply writes nothing onto the host context (Cordis 4 refuses undecla
   }
 });
 
+test('T273: a host that throws while the plugin wires itself up leaves no listener behind', async () => {
+  // The first real Desktop load threw after the bind (`cannot set property "dshDirect" without provide`) and the socket
+  // stayed up: an ownerless bridge answering /health on the fixed port, which then made every later activation fail with
+  // `bind_failed`. `apply` now closes what it bound before it rethrows, so the port is free again immediately.
+  const sc = scene();
+  const ctx = fakeCtx();
+  ctx.on = () => { throw new Error('cannot set property "anything" without provide'); };
+  try {
+    assert.throws(() => apply(ctx, { tokenFile: sc.tokenFile, boundSessionIds: [SESSION], endpointFile: sc.endpointFile }),
+      /without provide/);
+    // The close is asynchronous; give the guard's promise one turn before judging.
+    const deadline = Date.now() + 2000;
+    while (openBridgeCount() > 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(openBridgeCount(), 0, 'a failed activation must not leave a socket answering on the port');
+    assert.equal(existsSync(sc.endpointFile), false, 'nor a descriptor pointing at one');
+  } finally {
+    rmSync(sc.dir, { recursive: true, force: true });
+  }
+});
+
 test('T273: the plugin copies stay byte-identical to their sources', () => {
   const dir = path.join(process.cwd(), 'tools', 'dsh-direct');
   for (const name of ['protocol.mjs', 'session_api.mjs', 'endpoint.mjs', 'adapters.mjs', 'host_bridge.mjs']) {
