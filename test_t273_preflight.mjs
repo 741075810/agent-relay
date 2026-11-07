@@ -259,6 +259,33 @@ test('T273: the port probe distinguishes free from occupied without binding', as
   assert.equal(outOfRange.status, 'fail');
 });
 
+test('T273: the install state is read from the profile patch layers a Desktop actually keeps', async () => {
+  // The Desktop keeps its user layer per profile (`<HOME>/.dsh/profiles/<name>/cordis.patch.yml`); the legacy
+  // `<HOME>/.dsh/cordis.patch.yml` does not exist there. Reporting "the profile patch does not exist" on a machine
+  // where the plugin is in fact enabled was wrong about the machine, so both layouts are searched and each hit named.
+  const home = temp('t273-install-');
+  try {
+    const pluginDir = path.join(home, '.dsh', 'plugins', 'dsh-direct');
+    mkdirSync(pluginDir, { recursive: true });
+    const desktopPatch = path.join(home, '.dsh', 'profiles', 'desktop', 'cordis.patch.yml');
+    mkdirSync(path.dirname(desktopPatch), { recursive: true });
+    writeFileSync(desktopPatch, '- id: dsh-direct\n  disabled: false\n', 'utf8');
+    const webPatch = path.join(home, '.dsh', 'profiles', 'web', 'cordis.patch.yml');
+    mkdirSync(path.dirname(webPatch), { recursive: true });
+    writeFileSync(webPatch, '[]\n', 'utf8');
+
+    const checks = await runPreflight({ home, docsRoot: REPO });
+    const detail = byId(checks, 'install.state').detail;
+    assert.equal(byId(checks, 'install.state').status, 'ok');
+    assert.match(detail, /plugin directory exists/);
+    assert.match(detail, /enabled in profile desktop/);
+    assert.doesNotMatch(detail, /enabled in profile web/, 'a profile whose patch does not name the plugin is not a hit');
+    assert.doesNotMatch(detail, /does not exist/);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('T273: the preflight writes nothing into a home directory it inspects', async () => {
   const home = temp('t273-home-');
   try {

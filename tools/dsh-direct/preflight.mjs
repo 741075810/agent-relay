@@ -12,7 +12,7 @@
 //
 // Exit codes: 0 nothing failed, 1 something failed, 2 the flags themselves were wrong.
 
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -435,17 +435,54 @@ export function checkDocs(root = REPO_ROOT) {
   return checks;
 }
 
+/**
+ * The patch files an install can land in, newest layout first. A Desktop install keeps its user layer per profile
+ * (`<HOME>/.dsh/profiles/<name>/cordis.patch.yml`) and only the CLI-era layout used `<HOME>/.dsh/cordis.patch.yml`,
+ * which does not exist on a Desktop machine at all -- reporting "the profile patch does not exist" there was wrong
+ * about the machine, so both layouts are searched and each hit is named.
+ */
+export function findProfilePatches(home) {
+  const dshRoot = path.join(home, '.dsh');
+  const patches = [];
+  const profilesDir = path.join(dshRoot, 'profiles');
+  if (existsSync(profilesDir)) {
+    let names = [];
+    try {
+      names = readdirSync(profilesDir, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory() && entry.name !== 'node_modules')
+        .map((entry) => entry.name)
+        .sort();
+    } catch { names = []; }
+    for (const name of names) {
+      const file = path.join(profilesDir, name, 'cordis.patch.yml');
+      if (existsSync(file)) patches.push({ label: 'profile ' + name, file });
+    }
+  }
+  const legacy = path.join(dshRoot, 'cordis.patch.yml');
+  if (existsSync(legacy)) patches.push({ label: 'root', file: legacy });
+  return patches;
+}
+
 /** Where the plugin would live, read-only: reporting only, nothing is created or changed. */
 export function checkInstallState(home = process.env.USERPROFILE || process.env.HOME || '') {
   const checks = [];
   if (!home) return [result('install.state', 'not-checked', 'no HOME/USERPROFILE to look under')];
   const pluginDir = path.join(home, '.dsh', 'plugins', 'dsh-direct');
-  const profilePatch = path.join(home, '.dsh', 'cordis.patch.yml');
   const present = existsSync(pluginDir);
-  const mentioned = existsSync(profilePatch) ? readFileSync(profilePatch, 'utf8').includes('dsh-direct') : false;
-  checks.push(result('install.state', 'ok', 'plugin directory ' + (present ? 'exists' : 'is absent')
-    + '; the profile patch ' + (existsSync(profilePatch) ? (mentioned ? 'mentions dsh-direct' : 'does not mention '
-      + 'dsh-direct') : 'does not exist') + '. Nothing was written; installing is the operator step in ' + DOC + '.'));
+  const patches = findProfilePatches(home).map((patch) => ({
+    label: patch.label,
+    mentions: readFileSync(patch.file, 'utf8').includes('dsh-direct'),
+  }));
+  const naming = patches.filter((patch) => patch.mentions).map((patch) => patch.label);
+  const where = patches.length === 0
+    ? 'no patch layer exists under .dsh (neither a profile layer nor the legacy root layer)'
+    : (naming.length === 0
+      ? 'no patch layer mentions dsh-direct (' + patches.map((p) => p.label).join(', ') + ')'
+      : 'enabled in ' + naming.join(', '));
+  // Informational either way: an absent install is the documented pre-install state, not a defect.
+  checks.push(result('install.state', 'ok',
+    'plugin directory ' + (present ? 'exists' : 'is absent') + '; ' + where
+      + '. Nothing was written; installing is the operator step in ' + DOC + '.'));
   return checks;
 }
 

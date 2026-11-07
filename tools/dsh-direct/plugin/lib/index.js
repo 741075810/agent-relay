@@ -158,9 +158,16 @@ export function apply(ctx, config) {
   // Returning the promise matters: a host that awaits its dispose handlers must see the socket actually closed, not
   // merely asked to close. A host that ignores the return value still gets the teardown, just not synchronised.
   if (ctx && typeof ctx.on === 'function') ctx.on('dispose', () => dispose());
-  // Exposed for a host that wants to report status; not read by anything in this package.
-  if (ctx) ctx.dshDirect = { ready, dispose, boundSessionIds: boundSessionIds.slice(), tokenFile,
-    endpointFile: listener.endpointFile, port: listener.port };
+  // Nothing is published onto `ctx`. Cordis 4 rejects an assignment to a property it was not told about ("cannot set
+  // property \"dshDirect\" without provide"), and that rejection happens inside `apply`, so the whole row fails to
+  // activate in a live Host -- which is exactly what happened the first time this plugin was loaded by a real Desktop.
+  // The disposer therefore doubles as the status handle: Cordis calls the returned function on unload and ignores extra
+  // properties, while a test can await `ready` without the plugin writing anything onto the host context.
+  dispose.ready = ready;
+  dispose.boundSessionIds = boundSessionIds.slice();
+  dispose.tokenFile = tokenFile;
+  dispose.endpointFile = listener.endpointFile;
+  dispose.port = listener.port;
 
   return dispose;
 }

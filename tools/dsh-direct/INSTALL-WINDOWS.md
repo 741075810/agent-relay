@@ -1,8 +1,11 @@
 # Installing dsh-direct into DSH Desktop on Windows
 
-> **Not performed in this round.** These are the exact steps for the operator. Nothing below was applied to the
-> installed Desktop: no plugin install, no profile edit, no Desktop restart, no Chrome change. Until they run, acceptance
-> stays at level **A** — see the table at the end.
+> **Status (T276).** Steps 1–4 were executed on this machine against the live Desktop and are recorded in the task
+> report: the token file, the plugin directory, the profile manifest dependency and the profile patch row all exist, and
+> a real Host process loaded the plugin and served `/health` — that last measurement was taken with an isolated
+> `DSH_HOME` and the *fixed* code, because the already-running Desktop had cached the module generation that failed to
+> load (see step 5). One restart of the Desktop is still owed before level B can be claimed for the live instance, and
+> level C needs the session that the restart re-creates.
 
 Target build: `@deepseek-ai/dsh-desktop 0.2.0-rc.2`, `dshBuildCommit 04f392c9ddd144fa426da2045178797da6db6c11`.
 That build ships `@deepseek-ai/cordis@4.0.4`, which satisfies this plugin's `peerDependencies.cordis: ">=4.0.0-rc <5"`.
@@ -23,6 +26,34 @@ read every path from the variable.
 Everything this plugin writes lives under **one** directory: `<HOME>/.dsh/dsh-direct/`. The token file is
 `<HOME>/.dsh/dsh-direct/host.token` in every step below — if two steps in an install guide disagree on that path, one of
 them is wrong, and `preflight` now fails on exactly that.
+
+## 0b. How a Desktop profile actually loads a plugin
+
+A Desktop install does **not** read `<HOME>/.dsh/cordis.patch.yml`; that root layer belongs to the CLI-era layout and does
+not exist on a Desktop machine. The Desktop keeps one profile per surface under `<HOME>/.dsh/profiles/<name>` — `desktop`
+for the app itself — and the app declares that profile *managed exclusively by the Electron application*: `dsh --profile
+desktop --dump-config` refuses with `profile "desktop" is managed exclusively by the Electron application`. Everything
+below therefore happens inside `<HOME>/.dsh/profiles/desktop`:
+
+| file | what it decides | who writes it |
+|---|---|---|
+| `package.json` `dependencies` | whether the package name `dsh-direct` resolves at all | `pnpm` via the profile's own plugin manager, or a hand-written `file:` entry |
+| `package.json` `dsh.profile.bundles` | which bundles are composed, in order | the profile's plugin manager (Plugins page in the app, or the `plugin_manager` tool) |
+| `cordis.patch.yml` | the user layer: per-row `config`, `disabled`, `insert` | you, or the plugin manager when it flips a switch |
+| `node_modules/<name>` | the resolved package (a symlink or junction for `file:` specs) | `pnpm`, or `New-Item -ItemType Junction` |
+
+What hot-applies and what does not, measured on `0.2.0-rc.2`: the base bundle composes `@deepseek-ai/dsh-hmr`
+(`include:hmr`) with `root: []`, so **Include refreshes and profile config changes apply to the running Host** — enabling
+a bundle answered `application: "applied"` and the plugin was imported immediately — while **JavaScript module
+generations do not change**: a plugin whose source was fixed on disk kept being executed from the old module
+(`at new apply (file:///…/lib/index.js:162:26)`), and re-pointing both the junction and the manifest dependency at a
+second copy still resolved to the cached URL. A new package, or a fixed one, needs a **Desktop restart**. The plugin
+manager says so itself: *"Package replacements require restarting the process to load a fresh JavaScript module
+generation."*
+
+One Cordis 4 rule that bites a first-time plugin: a property may not be assigned on `ctx` unless it was declared
+(`cannot set property "dshDirect" without provide`). That error is thrown *inside* `apply`, so the whole row fails to
+activate — it does not degrade, it just shows up as `1 entry did not activate`. Keep state on the value `apply` returns.
 
 ## 1. Run the preflight first (read-only)
 
@@ -78,27 +109,67 @@ Get-ChildItem -Recurse $dst -File | Select-Object FullName, Length
 Expected files: `package.json`, `cordis.patch.yml`, `README.md`, and `lib\` with `index.js`, `protocol.mjs`,
 `session_api.mjs`, `endpoint.mjs`, `adapters.mjs`, `host_bridge.mjs`.
 
-## 4. Add the profile row, with a listener the MCP side can find
+## 4. Wire the package into the `desktop` profile, enable it, then give it real values
 
-The bundle patch (`cordis.patch.yml`) inserts the row with an empty config. Real values go in the profile's own patch
-file, `%USERPROFILE%\.dsh\cordis.patch.yml`. Append one row; leave the existing rows untouched.
+Three edits, in this order. Do them against `$PROFILE = <HOME>\.dsh\profiles\desktop`; back up first, because the app
+rewrites these files itself:
 
-Preferred — an endpoint descriptor, which survives a Desktop restart because the plugin rewrites it every bind:
+```powershell
+$PROFILE = Join-Path $HOME_DIR '.dsh\profiles\desktop'
+Copy-Item (Join-Path $PROFILE 'package.json')        (Join-Path $PROFILE 'package.json.bak-before-dsh-direct')
+Copy-Item (Join-Path $PROFILE 'cordis.patch.yml')    (Join-Path $PROFILE 'cordis.patch.yml.bak-before-dsh-direct')
+```
+
+**4a — make the name resolvable.** Add the dependency (relative to the profile, like every other local plugin there):
+
+```json
+"dependencies": {
+  "dsh-direct": "file:../../plugins/dsh-direct"
+}
+```
+
+and make `node_modules` agree with it, without running `pnpm` (a `file:` spec needs no download; the app's own
+package operations would otherwise prune a hand-made link later — run them if you install anything else):
+
+```powershell
+$link = Join-Path $PROFILE 'node_modules\dsh-direct'
+if (-not (Test-Path $link)) { New-Item -ItemType Junction -Path $link -Target (Join-Path $HOME_DIR '.dsh\plugins\dsh-direct') | Out-Null }
+node -e "const {createRequire}=require('node:module');console.log(createRequire(String.raw`$PROFILE\noop.js`).resolve('dsh-direct/package.json'))"
+```
+
+**4b — enable the bundle.** Either the app's **Settings → Plugins** page, or the `plugin_manager` tool from any session:
+
+```
+plugin_manager {"action":"set_bundle","target":"dsh-direct","enabled":true}
+```
+
+The answer matters: `"application":"applied"` means the running Host recomposed and imported the package;
+`"application":"failed"` carries the loader diagnostic for that one entry (see step 5 for the two failures seen in
+practice); `"restart-required"` means this build does not recompose at all and the next step must be a restart anyway.
+
+**4c — the values.** The bundle patch (`cordis.patch.yml` inside the package) already inserts the row with an empty
+config, so the profile layer carries an **override**, not a second `insert:`. Append to
+`<HOME>\.dsh\profiles\desktop\cordis.patch.yml`:
 
 ```yaml
-- insert:
-    - id: dsh-direct
-      name: 'dsh-direct'
-      config:
-        tokenFile: '<HOME>/.dsh/dsh-direct/host.token'
-        endpointFile: '<HOME>/.dsh/dsh-direct/endpoint.json'
-        port: 42731
-        boundSessionIds:
-          - 'session-XXXXXXXX-XXXX-4XXX-8XXX-XXXXXXXXXXXX'
+- id: dsh-direct
+  disabled: false
+  config:
+    tokenFile: '<HOME>/.dsh/dsh-direct/host.token'
+    endpointFile: '<HOME>/.dsh/dsh-direct/endpoint.json'
+    port: 42731
+    boundSessionIds:
+      - 'session-XXXXXXXX-XXXX-4XXX-8XXX-XXXXXXXXXXXX'
 ```
 
 Use `<HOME>` expanded, e.g. under `C:\Users\alice` the token line becomes
-`tokenFile: 'C:/Users/alice/.dsh/dsh-direct/host.token'`. Forward slashes are fine on Windows and avoid YAML escaping.
+`tokenFile: 'C:/Users/alice/.dsh/dsh-direct/host.token'`. Forward slashes avoid YAML escaping; single quotes keep a
+backslash path literal. Parse the file before trusting it — the app hot-reloads this layer and a YAML error takes every
+patch row with it:
+
+```powershell
+node -e "const {createRequire}=require('node:module');const Y=createRequire(String.raw`$PROFILE\noop.js`)('yaml');const t=Y.parse(require('node:fs').readFileSync(String.raw`$PROFILE\cordis.patch.yml`,'utf8'),{customTags:[{tag:'!!js',resolve:v=>v}]});console.log('rows',t.length, 'dsh-direct', t.filter(r=>r&&r.id==='dsh-direct').length)"
+```
 
 `port` is optional next to `endpointFile`; leave it out to let the OS choose. If you omit `port` **and** `endpointFile`,
 the plugin refuses to start — that configuration cannot be reached after a restart, and pretending otherwise is what T272
@@ -124,25 +195,34 @@ Rules enforced at start; each refusal is logged at `error` and nothing is bound:
 
 The last row is a T273 fix: before it, `EADDRINUSE` was an unhandled `error` event and took the Host process down.
 
-## 5. Restart the Desktop and read the log
+## 5. Restart the Desktop once, then read what it says
 
-Close every Desktop window, start it again, then check the log line the plugin writes at `info`:
+A **new or changed module** needs a fresh process (step 0b). Restart the Desktop now — that is the one unavoidable
+restart, and it is why an install must not be attempted from inside the very session it would kill: prepare everything,
+then restart when the work that needs the session is finished and recorded.
 
-```powershell
-$log = Join-Path $HOME_DIR '.dsh\dsh-direct\plugin.log'   # wherever the profile writes plugin logs
-Select-String -Path (Join-Path $HOME_DIR '.dsh\*.log') -Pattern 'dsh-direct' -ErrorAction SilentlyContinue |
-  Select-Object -Last 5
+The plugin's own `info` line is the confirmation:
+
+```
+serving http://127.0.0.1:<port> for 1 bound session(s), protocol dsh-api-session-controller@0.2.0-rc.2
 ```
 
-Expected: `serving http://127.0.0.1:<port> for 1 bound session(s), protocol dsh-api-session-controller@0.2.0-rc.2` and,
-when `endpointFile` is configured, `endpoint <path>`. On a refusal you get `refusing to start: <reason>` instead — fix
-that reason before going on. If the log says `bind_failed`, another process owns the port:
+with `, endpoint <path>` appended when `endpointFile` is configured. Where that line lands depends on the host surface;
+the two independent witnesses that do not depend on logs at all are the descriptor and the port:
+
+```powershell
+node "$REPO\tools\dsh-direct\preflight.mjs" --config (Join-Path $HOME_DIR '.dsh\dsh-direct\config.json')
+Get-Content (Join-Path $HOME_DIR '.dsh\dsh-direct\endpoint.json')     # base, kind, protocol, endpointId, pid
+```
+
+`refusing to start: <reason>` in the log, or no descriptor and a dead port, means fix that reason before going on. If the
+log says `bind_failed`, another process owns the port:
 
 ```powershell
 Get-NetTCPConnection -LocalPort 42731 -State Listen | Select-Object LocalAddress, LocalPort, OwningProcess
 ```
 
-Pick a different port in step 4 (any free port in 1024..65535) and restart the Desktop again.
+Pick a different port in step 4c (any free port in 1024..65535) and restart the Desktop again.
 
 ## 6. Point the MCP server at the bridge, then re-run the preflight
 
@@ -263,9 +343,13 @@ that is done deliberately, with a decision about exposure.
 ## Uninstall, and the socket it must release
 
 ```powershell
-# 1. remove the dsh-direct row from <HOME>/.dsh/cordis.patch.yml  (row first, directory second)
+$PROFILE = Join-Path $HOME_DIR '.dsh\profiles\desktop'
+# 1. disable the bundle first (app Plugins page, or plugin_manager set_bundle target=dsh-direct enabled=false),
+#    then remove the override row from the profile patch and the dependency from the profile manifest
+#    ($PROFILE\cordis.patch.yml, $PROFILE\package.json), then the files:
 Remove-Item -Recurse -Force (Join-Path $HOME_DIR '.dsh\plugins\dsh-direct')
 Remove-Item -Recurse -Force (Join-Path $HOME_DIR '.dsh\dsh-direct')
+Remove-Item -Force (Join-Path $PROFILE 'node_modules\dsh-direct')      # the junction, not its target
 # 2. restart the Desktop, then prove the listener is gone:
 node "$REPO\tools\dsh-direct\preflight.mjs" --port 42731
 ```
@@ -279,8 +363,8 @@ socket sweep — a test asserts that a second instance can bind the same port im
 | level | requirement | status |
 |---|---|---|
 | **A** | plugin, MCP server (stdio and Streamable HTTP) and preflight verified in isolation against a fake Host; the HTTP layer driven over a real socket, including a full submit→result→duplicate run | met by the repo's tests |
-| **B** | the real Desktop loads the plugin and the bridge answers on loopback | requires steps 1–6 by hand |
-| **C** | an existing session received a real prompt without the Bridge | requires step 7 |
+| **B** | the real Desktop loads the plugin and the bridge answers on loopback | met for a **real Host process** built from the installed package and this document's patch row (`/health` answered `cordis_session_controller` / `dsh-api-session-controller@0.2.0-rc.2`, `list_sessions` answered over stdio MCP), measured in an isolated `DSH_HOME`; **not yet** for the already-running Desktop instance, which holds the pre-fix module generation until step 5's restart |
+| **C** | an existing session received a real prompt without the Bridge | not yet: needs the restart from step 5, then step 7 against the bound session |
 
 `mcp_server.mjs` is a working MCP server on both transports, but nothing in this repository registers it with ChatGPT's
 custom-MCP settings: that registration is a Web-side action in the ChatGPT UI, and it needs a transport that reaches this

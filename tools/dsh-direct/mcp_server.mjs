@@ -314,10 +314,15 @@ export function serve(server) {
       return;
     }
     const id = request.id === undefined ? null : request.id;
+    // A JSON-RPC notification (no `id`) must never be answered -- including when handling it fails. Answering
+    // `notifications/initialized` with an error was what a real stdio probe saw, because only the success path skipped
+    // the reply: the rejection fell through to the catch below and emitted an error object with id null.
+    const isNotification = request.id === undefined;
     handle(server, request).then((result) => {
-      if (id === null && request.method && request.method.startsWith('notifications/')) return;
+      if (isNotification) return;
       send({ jsonrpc: '2.0', id, result });
     }).catch((err) => {
+      if (isNotification) return;
       const error = err instanceof DirectError
         ? { code: -32000, message: err.code + ': ' + err.message, data: err.toJSON() }
         : { code: -32603, message: 'internal error', data: { message: String(err && err.message) } };

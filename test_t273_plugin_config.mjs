@@ -89,7 +89,7 @@ test('T273: dispose releases the socket and its descriptor, and the port rebinds
     const first = fakeCtx();
     const disposeFirst = apply(first, config);
     assert.equal(typeof disposeFirst, 'function');
-    const started = await first.dshDirect.ready;
+    const started = await disposeFirst.ready;
     assert.ok(started, 'the bridge must start when a descriptor is configured: ' + errorsOf(first).join('; '));
     assert.equal(openBridgeCount(), 1);
 
@@ -106,7 +106,7 @@ test('T273: dispose releases the socket and its descriptor, and the port rebinds
     // The same fixed port, immediately: this is what "released" means in practice.
     const second = fakeCtx();
     const disposeSecond = apply(second, { ...config, endpointFile: null, port: written.port });
-    const restarted = await second.dshDirect.ready;
+    const restarted = await disposeSecond.ready;
     assert.ok(restarted, 'the freed port must be usable at once: ' + errorsOf(second).join('; '));
     assert.equal(restarted.port, written.port);
     await disposeSecond();
@@ -120,8 +120,8 @@ test('T273: the dispose event tears down as well, and the bridge is gone before 
   const sc = scene();
   try {
     const ctx = fakeCtx();
-    apply(ctx, { tokenFile: sc.tokenFile, boundSessionIds: [SESSION], endpointFile: sc.endpointFile });
-    const started = await ctx.dshDirect.ready;
+    const dispose = apply(ctx, { tokenFile: sc.tokenFile, boundSessionIds: [SESSION], endpointFile: sc.endpointFile });
+    const started = await dispose.ready;
     assert.ok(started);
     await ctx.emit('dispose');
     assert.equal(openBridgeCount(), 0);
@@ -139,12 +139,12 @@ test('T273: a taken port fails the plugin closed instead of crashing the Host', 
   let holderDispose = null;
   try {
     holderDispose = apply(holder, { tokenFile: sc.tokenFile, boundSessionIds: [SESSION], port: 42751 });
-    const holderStarted = await holder.dshDirect.ready;
+    const holderStarted = await holderDispose.ready;
     assert.ok(holderStarted, errorsOf(holder).join('; '));
 
     const blocked = fakeCtx();
     const disposeBlocked = apply(blocked, { tokenFile: sc.tokenFile, boundSessionIds: [SESSION], port: 42751 });
-    const result = await blocked.dshDirect.ready;
+    const result = await disposeBlocked.ready;
     assert.equal(result, null, 'the second instance must not pretend to serve');
     const errors = errorsOf(blocked);
     assert.equal(errors.length, 1);
@@ -177,6 +177,35 @@ test('T273: inspectHost reports whether the configured listener is discoverable'
 
     const pinned = inspectHost(fakeCtx(), { tokenFile: sc.tokenFile, boundSessionIds: [SESSION], port: 42761 });
     assert.deepEqual(pinned.listener, { port: 42761, endpointFile: null, discoverable: true });
+  } finally {
+    rmSync(sc.dir, { recursive: true, force: true });
+  }
+});
+
+test('T273: apply writes nothing onto the host context (Cordis 4 refuses undeclared properties)', async () => {
+  // The first real Desktop load failed with `cannot set property "dshDirect" without provide`: Cordis 4 turns an
+  // assignment to an undeclared context property into a thrown error *inside* apply, so the row never activates. This
+  // ctx reproduces that rule, so the suite fails if the plugin ever publishes itself onto ctx again.
+  const sc = scene();
+  const allowed = new Set(['sessionController', 'on', 'emit', 'logger', 'logs']);
+  const ctx = new Proxy(fakeCtx(), {
+    set(target, key, value) {
+      if (typeof key === 'string' && !allowed.has(key)) {
+        throw new Error('cannot set property "' + key + '" without provide');
+      }
+      target[key] = value;
+      return true;
+    },
+  });
+  try {
+    const dispose = apply(ctx, { tokenFile: sc.tokenFile, boundSessionIds: [SESSION], endpointFile: sc.endpointFile });
+    assert.equal(typeof dispose, 'function', 'a strict host context must not make apply throw');
+    const started = await dispose.ready;
+    assert.ok(started, 'the bridge must still start under a strict context: ' + errorsOf(ctx).join('; '));
+    assert.deepEqual(dispose.boundSessionIds, [SESSION]);
+    assert.equal(dispose.endpointFile, sc.endpointFile);
+    await dispose();
+    assert.equal(openBridgeCount(), 0);
   } finally {
     rmSync(sc.dir, { recursive: true, force: true });
   }

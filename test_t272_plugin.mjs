@@ -109,7 +109,7 @@ test('T272: apply serves only the bound session and dispose releases the port', 
   try {
     const dispose = apply(ctx, { tokenFile: sc.tokenFile, boundSessionIds: [SESSION], endpointFile: sc.endpointFile });
     assert.equal(typeof dispose, 'function', 'apply must hand back a disposer');
-    const bridge = await ctx.dshDirect.ready;
+    const bridge = await dispose.ready;
     assert.ok(bridge && bridge.base, 'the bridge must be listening after apply');
 
     const listed = await fetch(bridge.base + '/sessions', { headers: { authorization: 'Bearer ' + TOKEN } })
@@ -155,8 +155,8 @@ test('T272: the dispose lifecycle event closes the bridge even if the disposer i
   const sc = scene();
   const ctx = fakeCtx({ sessionController: controller() });
   try {
-    apply(ctx, { tokenFile: sc.tokenFile, boundSessionIds: [SESSION], endpointFile: sc.endpointFile });
-    const bridge = await ctx.dshDirect.ready;
+    const dispose = apply(ctx, { tokenFile: sc.tokenFile, boundSessionIds: [SESSION], endpointFile: sc.endpointFile });
+    const bridge = await dispose.ready;
     assert.equal((await health(bridge.base)).status, 200);
     await ctx.emit('dispose');
     assert.equal(openBridgeCount(), 0);

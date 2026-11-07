@@ -61,6 +61,7 @@ function startServer(configFile) {
   const child = spawn(process.execPath, [SERVER, '--config', configFile], { stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true });
   const pending = new Map();
+  const stray = [];
   let nextId = 1;
   let stderr = '';
   child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
@@ -72,6 +73,9 @@ function startServer(configFile) {
     if (waiter) {
       pending.delete(message.id);
       waiter(message);
+    } else {
+      // Anything nobody asked for. A notification reply lands here, which is how the suite catches one.
+      stray.push(message);
     }
   });
   const call = (method, params) => new Promise((resolve, reject) => {
@@ -80,7 +84,12 @@ function startServer(configFile) {
     pending.set(id, (message) => { clearTimeout(timer); resolve(message); });
     child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
   });
-  return { child, call, stderr: () => stderr,
+  const notify = (method, params) => {
+    const payload = { jsonrpc: '2.0', method };
+    if (params !== undefined) payload.params = params;
+    child.stdin.write(JSON.stringify(payload) + '\n');
+  };
+  return { child, call, notify, stray: () => stray.slice(), stderr: () => stderr,
     async stop() {
       await new Promise((resolve) => {
         child.once('exit', resolve);
@@ -240,6 +249,29 @@ test('T271: an unbound, unknown or project-mismatched session is refused', async
     const mismatch = await tool(server, 'submit_task', { requestId: 't271-mismatch-1', sessionId: BOUND,
       prompt: 'hi', projectId: '/work/somewhere-else' });
     assert.equal(mismatch.structured.code, 'project_mismatch');
+  } finally {
+    await server.stop();
+    await bridge.close();
+    rmSync(sc.dir, { recursive: true, force: true });
+  }
+});
+
+test('T271: a notification is never answered, not even when it names an unknown method', async () => {
+  // A real stdio probe of the installed server got `-32000 unknown_tool: unsupported method` back for
+  // `notifications/initialized`: the reply-skip only covered the success path, so the rejection for a method the
+  // dispatcher does not know produced an error object with id null. JSON-RPC forbids answering a notification at all.
+  const sc = scene();
+  const bridge = await startBridge(sc);
+  writeConfig(sc, bridge);
+  const server = startServer(sc.configFile);
+  try {
+    server.notify('notifications/initialized');
+    server.notify('notifications/totally-made-up');
+    // A request afterwards proves the server kept running and any pending reply would have had time to arrive.
+    const pong = await server.call('ping', {});
+    assert.deepEqual(pong.result, {});
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.deepEqual(server.stray(), [], 'a notification must produce no output at all');
   } finally {
     await server.stop();
     await bridge.close();
