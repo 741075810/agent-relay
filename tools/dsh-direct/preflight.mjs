@@ -478,7 +478,7 @@ export function checkInstallState(home = process.env.USERPROFILE || process.env.
     ? 'no patch layer exists under .dsh (neither a profile layer nor the legacy root layer)'
     : (naming.length === 0
       ? 'no patch layer mentions dsh-direct (' + patches.map((p) => p.label).join(', ') + ')'
-      : 'enabled in ' + naming.join(', '));
+      : 'mentioned in ' + naming.join(', ') + ' (text presence only; not an activation check)');
   // Informational either way: an absent install is the documented pre-install state, not a defect.
   checks.push(result('install.state', 'ok',
     'plugin directory ' + (present ? 'exists' : 'is absent') + '; ' + where

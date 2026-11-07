@@ -63,8 +63,8 @@ export function describeListener(settings = {}) {
 }
 
 /**
- * `apply` is the Cordis entry point. Returns a disposer; the same work is also attached to `dispose` so a host that
- * ignores the return value still tears the server down.
+ * `apply` is the Cordis entry point. Its ctx.effect owns the listener; the returned disposer also exposes readiness
+ * to offline checks, without assigning undeclared properties to the host context.
  */
 export function apply(ctx, config) {
   const settings = config || {};
@@ -131,53 +131,41 @@ export function apply(ctx, config) {
     },
   };
 
-  let bridge = null;
-  let closed = false;
-  const ready = startHostBridge({ adapter: guarded, token, port: listener.port,
-    endpointFile: listener.endpointFile }).then((started) => {
-    bridge = started;
+  // Keep binding separate from logging: an exception after listen must not replace the only socket handle with null.
+  const binding = startHostBridge({ adapter: guarded, token, port: listener.port,
+    endpointFile: listener.endpointFile });
+  let closing = null;
+  const dispose = () => {
+    closing ??= binding.then((started) => started.close(), () => {});
+    return closing;
+  };
+  const ready = binding.then(async (started) => {
+    if (closing) { await closing; return null; }
     note(ctx, 'info', 'serving ' + started.base + ' for ' + boundSessionIds.length + ' bound session(s), protocol '
       + String(started.protocol) + (started.endpointFile ? ', endpoint ' + started.endpointFile : ''));
     return started;
-  }).catch((err) => {
-    // `bind_failed` is the one to look for when a fixed port is already taken: this is a rejection, not a crashed Host.
-    note(ctx, 'error', 'bridge failed to start: ' + String(err && err.code ? err.code + ': ' : '')
-      + String(err && err.message));
+  }).catch(async (err) => {
+    await dispose();
+    try {
+      note(ctx, 'error', 'bridge failed to start: ' + String(err?.code ? err.code + ': ' : '') + String(err?.message));
+    } catch { /* a broken logger must not prevent teardown or reject an unobserved ready promise */ }
     return null;
   });
-
-  const dispose = async () => {
-    if (closed) return;
-    closed = true;
-    const started = await ready;
-    if (started) {
-      await started.close();
-      note(ctx, 'info', 'bridge on ' + started.base + ' closed');
-    }
-  };
-  // Everything after the bind runs inside one guard. If any of it throws -- a Host whose `on` is not the shape we
-  // expect, a context proxy that rejects a property, anything -- the socket must not stay listening for the life of the
-  // process. That is not hypothetical: the first real Desktop load threw after the bind, Cordis reported `1 entry did
-  // not activate`, and the listener stayed up as an ownerless socket answering /health on the fixed port; the next
-  // activation then failed with `bind_failed` because the corpse of the previous one still owned the port.
   try {
-    if (ctx && typeof ctx.on === 'function') ctx.on('dispose', () => dispose());
-    // Nothing is published onto `ctx`. Cordis 4 rejects an assignment to a property it was not told about ("cannot set
-    // property \"dshDirect\" without provide"), and that rejection happens inside `apply`, so the whole row fails to
-    // activate in a live Host -- which is exactly what happened the first time this plugin was loaded by a real Desktop.
-    // The disposer therefore doubles as the status handle: Cordis calls the returned function on unload and ignores extra
-    // properties, while a test can await `ready` without the plugin writing anything onto the host context.
+    // Cordis 4 constructs ordinary `function apply` with `new` and does NOT register its returned function.
+    // Nor is on('dispose') a lifecycle hook: unload just unregisters that ordinary event listener. An effect is owned
+    // by the fiber and awaited on unload, including config reload and startup failure.
+    if (typeof ctx?.effect !== 'function') throw new TypeError('the Host must expose ctx.effect for bridge ownership');
+    ctx.effect(() => dispose, 'dsh-direct.bridge');
+    // Status lives on our return value, never on an undeclared Cordis context property.
     dispose.ready = ready;
     dispose.boundSessionIds = boundSessionIds.slice();
     dispose.tokenFile = tokenFile;
     dispose.endpointFile = listener.endpointFile;
     dispose.port = listener.port;
-    // Returning the promise still matters: a host that awaits its dispose handlers must see the socket actually
-    // closed, not merely asked to close, and a host that ignores the return value still gets the teardown.
     return dispose;
   } catch (err) {
-    // Close whatever bound, then let the failure surface as the failure it is.
-    ready.then((started) => (started ? started.close() : null)).catch(() => {});
+    void dispose().catch(() => {});
     throw err;
   }
 }

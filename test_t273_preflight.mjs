@@ -278,9 +278,15 @@ test('T273: the install state is read from the profile patch layers a Desktop ac
     const detail = byId(checks, 'install.state').detail;
     assert.equal(byId(checks, 'install.state').status, 'ok');
     assert.match(detail, /plugin directory exists/);
-    assert.match(detail, /enabled in profile desktop/);
-    assert.doesNotMatch(detail, /enabled in profile web/, 'a profile whose patch does not name the plugin is not a hit');
+    assert.match(detail, /mentioned in profile desktop/);
+    assert.doesNotMatch(detail, /mentioned in profile web/, 'a profile whose patch does not name the plugin is not a hit');
     assert.doesNotMatch(detail, /does not exist/);
+    for (const patch of ['- id: dsh-direct\n  disabled: true\n', '# dsh-direct is not installed\n[]\n']) {
+      writeFileSync(desktopPatch, patch, 'utf8');
+      const again = byId(await runPreflight({ home, docsRoot: REPO }), 'install.state').detail;
+      assert.match(again, /text presence only; not an activation check/);
+      assert.doesNotMatch(again, /enabled in/, 'comments and disabled rows must not be reported as enabled');
+    }
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

@@ -181,6 +181,8 @@ export class HostClient {
       done: body.done === true,
       assistantText: typeof body.assistantText === 'string' ? body.assistantText : null,
       admission: body.admission || null,
+      turnId: typeof body.turnId === 'string' ? body.turnId : null,
+      terminal: body.terminal && typeof body.terminal.kind === 'string' ? body.terminal : null,
     };
   }
 

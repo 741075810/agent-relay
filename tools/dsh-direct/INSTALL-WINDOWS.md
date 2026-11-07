@@ -1,155 +1,126 @@
 # Installing dsh-direct into DSH Desktop on Windows
 
-> **Status (T276).** Steps 1–4 were executed on this machine against the live Desktop and are recorded in the task
-> report: the token file, the plugin directory, the profile manifest dependency and the profile patch row all exist, and
-> a real Host process loaded the plugin and served `/health` — that last measurement was taken with an isolated
-> `DSH_HOME` and the *fixed* code, because the already-running Desktop had cached the module generation that failed to
-> load (see step 5). One restart of the Desktop is still owed before level B can be claimed for the live instance, and
-> level C needs the session that the restart re-creates.
+A passing suite or isolated Host proves neither that the running Desktop loaded the current module nor that the
+original session received a prompt. Record A/B/C independently (last section). When installing from inside that
+Desktop, finish and save the task first; defer any required process restart until the task ends. Reopen the **existing**
+session after restart, never a replacement.
 
-Target build: `@deepseek-ai/dsh-desktop 0.2.0-rc.2`, `dshBuildCommit 04f392c9ddd144fa426da2045178797da6db6c11`.
-That build ships `@deepseek-ai/cordis@4.0.4`, which satisfies this plugin's `peerDependencies.cordis: ">=4.0.0-rc <5"`.
+Target: `@deepseek-ai/dsh-desktop 0.2.0-rc.2`, build `04f392c9ddd144fa426da2045178797da6db6c11`,
+`@deepseek-ai/cordis@4.0.4`. Node 22 or 24 supplies the MCP process and `AbortSignal.timeout`.
 
-## 0. Path convention used in this document
+## 0. Paths and profile loading
 
-One placeholder per thing, used identically everywhere. Do not translate them by hand — set them once in PowerShell and
-read every path from the variable.
+| placeholder | meaning / PowerShell variable |
+|---|---|
+| `<HOME>` | Windows profile: `$HOME_DIR = $env:USERPROFILE` |
+| `<REPO>` | repository root: `$REPO = (Resolve-Path '<REPO>').Path` |
+| `<DSH_INSTALL>` | Desktop installation: `$env:DSH_INSTALL = '<DSH_INSTALL>'` |
+| `<NODE_EXE>` | Node executable: `$NODE = (Get-Command node).Source` |
+| `<WORKSPACE>` | the existing session's working directory |
 
-| placeholder | meaning | how to get it |
-|---|---|---|
-| `<HOME>` | your Windows profile directory | `$HOME_DIR = $env:USERPROFILE` |
-| `<REPO>` | this repository on disk | `$REPO = (Resolve-Path '<REPO>').Path` |
-| `<DSH_INSTALL>` | the Desktop install directory | `$DSH = '<DSH_INSTALL>'` |
-| `<NODE_EXE>` | the Node the MCP client will launch | `(Get-Command node).Source` |
-| `<WORKSPACE>` | the cwd of the session you bind to | shown in the Desktop session header |
+Runtime state is isolated under `<HOME>/.dsh/dsh-direct/`. The Host token is always
+`<HOME>/.dsh/dsh-direct/host.token`. Package files live separately under `<HOME>/.dsh/plugins/dsh-direct/`.
 
-Everything this plugin writes lives under **one** directory: `<HOME>/.dsh/dsh-direct/`. The token file is
-`<HOME>/.dsh/dsh-direct/host.token` in every step below — if two steps in an install guide disagree on that path, one of
-them is wrong, and `preflight` now fails on exactly that.
+On the tested Desktop, the active profile is `<HOME>/.dsh/profiles/desktop`, not the legacy
+`<HOME>/.dsh/cordis.patch.yml` layout. `preflight` inspects both layouts. The CLI rejects composing the Electron-owned
+profile with `profile "desktop" is managed exclusively by the Electron application`.
 
-## 0b. How a Desktop profile actually loads a plugin
+| profile file | purpose |
+|---|---|
+| `package.json` → `dependencies` | resolves the local `dsh-direct` package |
+| `package.json` → `dsh.profile.bundles` | lists enabled bundles |
+| `cordis.patch.yml` | user override for the bundle's existing `dsh-direct` row |
+| `node_modules/dsh-direct` | package-manager link or local directory junction |
 
-A Desktop install does **not** read `<HOME>/.dsh/cordis.patch.yml`; that root layer belongs to the CLI-era layout and does
-not exist on a Desktop machine. The Desktop keeps one profile per surface under `<HOME>/.dsh/profiles/<name>` — `desktop`
-for the app itself — and the app declares that profile *managed exclusively by the Electron application*: `dsh --profile
-desktop --dump-config` refuses with `profile "desktop" is managed exclusively by the Electron application`. Everything
-below therefore happens inside `<HOME>/.dsh/profiles/desktop`:
+Official `plugin_manager`/Plugins settings can hot-apply Include/configuration changes. On this build `include:hmr`
+has `root: []`: changing an **already imported** JavaScript file does not replace its cached module generation. A first
+import may hot-load; a failed import followed by source repair may require a process restart. Do not promise that
+bundle disable/enable reloads source. The manager documents: "Package replacements require restarting the process to
+load a fresh JavaScript module generation."
 
-| file | what it decides | who writes it |
-|---|---|---|
-| `package.json` `dependencies` | whether the package name `dsh-direct` resolves at all | `pnpm` via the profile's own plugin manager, or a hand-written `file:` entry |
-| `package.json` `dsh.profile.bundles` | which bundles are composed, in order | the profile's plugin manager (Plugins page in the app, or the `plugin_manager` tool) |
-| `cordis.patch.yml` | the user layer: per-row `config`, `disabled`, `insert` | you, or the plugin manager when it flips a switch |
-| `node_modules/<name>` | the resolved package (a symlink or junction for `file:` specs) | `pnpm`, or `New-Item -ItemType Junction` |
-
-What hot-applies and what does not, measured on `0.2.0-rc.2`: the base bundle composes `@deepseek-ai/dsh-hmr`
-(`include:hmr`) with `root: []`, so **Include refreshes and profile config changes apply to the running Host** — enabling
-a bundle answered `application: "applied"` and the plugin was imported immediately — while **JavaScript module
-generations do not change**: a plugin whose source was fixed on disk kept being executed from the old module
-(`at new apply (file:///…/lib/index.js:162:26)`), and re-pointing both the junction and the manifest dependency at a
-second copy still resolved to the cached URL. A new package, or a fixed one, needs a **Desktop restart**. The plugin
-manager says so itself: *"Package replacements require restarting the process to load a fresh JavaScript module
-generation."*
-
-One Cordis 4 rule that bites a first-time plugin: a property may not be assigned on `ctx` unless it was declared
-(`cannot set property "dshDirect" without provide`). That error is thrown *inside* `apply`, so the whole row fails to
-activate — it does not degrade, it just shows up as `1 entry did not activate`. Keep state on the value `apply` returns.
-
-## 1. Run the preflight first (read-only)
-
-```powershell
-$REPO = 'E:\ApkTest\agent-relay'   # adapt; nothing is written
-node "$REPO\tools\dsh-direct\preflight.mjs" --package "$REPO\tools\dsh-direct\plugin" --port 42731
-```
-
-Expected: `package.manifest`, `package.imports`, `package.patch`, `cordis.compat`, `docs.consistency` all `ok`, and
-`port.availability` reporting `port 42731 is free on 127.0.0.1`. `config.schema` is `not-checked` until you pass
-`--config`; do that in step 6. `install.state` reports the plugin as absent, which is the truth before step 3.
-
-The preflight never binds a port, never restarts the Desktop, never writes anywhere, and never prints the token: it
-measures the file and reports the length.
-
-## 2. Create the token file
+## 1. Preflight and backups (before editing profile files)
 
 ```powershell
 $HOME_DIR = $env:USERPROFILE
+$REPO = (Resolve-Path '<REPO>').Path
+$NODE = (Get-Command node).Source
+$env:DSH_INSTALL = '<DSH_INSTALL>'
+$PROFILE_DIR = Join-Path $HOME_DIR '.dsh\profiles\desktop'
+& $NODE "$REPO\tools\dsh-direct\preflight.mjs" --package "$REPO\tools\dsh-direct\plugin" --port 42731
+if ($LASTEXITCODE -ne 0) { throw 'Resolve the preflight failures before installing.' }
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+foreach ($name in 'package.json','cordis.patch.yml','pnpm-lock.yaml') {
+  $file = Join-Path $PROFILE_DIR $name
+  if (Test-Path -LiteralPath $file) { Copy-Item -LiteralPath $file -Destination "$file.bak-dsh-direct-$stamp" }
+}
+```
+
+Expect package/import/patch/compatibility/document checks `ok`; a new install needs port 42731 free.
+`config.schema` remains `not-checked` until step 4 creates the MCP config. Preflight never writes or restarts anything.
+For an upgrade, preserve existing plugin files and runtime config too; keep the token and task ledger.
+
+## 2. Generate the local Host token
+
+```powershell
 $base = Join-Path $HOME_DIR '.dsh\dsh-direct'
 New-Item -ItemType Directory -Path $base -Force | Out-Null
 $tokenFile = Join-Path $base 'host.token'
 if (-not (Test-Path -LiteralPath $tokenFile)) {
   $bytes = New-Object byte[] 32
-  [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+  $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+  try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
   (($bytes | ForEach-Object { $_.ToString('x2') }) -join '') |
     Set-Content -LiteralPath $tokenFile -NoNewline -Encoding ascii
 }
-icacls $tokenFile /inheritance:r /grant:r "$($env:USERNAME):(R)" | Out-Null
-(Get-Content -LiteralPath $tokenFile -Raw).Length     # expect 64
+icacls $tokenFile /inheritance:r /grant:r "$($env:USERNAME):(R)"
+if ($LASTEXITCODE -ne 0) { throw 'Token ACL update failed.' }
 ```
 
-32 random bytes rendered as 64 hex characters. The plugin refuses anything shorter than 32 characters, and the MCP
-server refuses an empty or unreadable file. `icacls` matters because Node cannot set a Windows ACL: `0600` is honoured on
-POSIX only.
+The token contains 32 random bytes as 64 hex characters; preflight reports length, never the value. Verify the ACL with
+`icacls $tokenFile`. A Windows mode `0600` alone does not establish a private ACL. Never replace an existing token
+while its Host is running: that Host reads its token at initialization.
 
-## 3. Copy the plugin package
-
-Copy **exactly what `package.json` `files[]` declares**, plus `package.json` itself. Copying the whole `plugin/`
-directory also works, but it drags `sync.mjs` into the plugin home — a build script has no business there, and the
-preflight checks the shipped set rather than the directory contents.
+## 3. Copy the declared package and resolve it in the profile
 
 ```powershell
-$REPO = 'E:\ApkTest\agent-relay'
-$src  = Join-Path $REPO 'tools\dsh-direct\plugin'
-$dst  = Join-Path $HOME_DIR '.dsh\plugins\dsh-direct'
-New-Item -ItemType Directory -Path $dst -Force | Out-Null
-Copy-Item -Path (Join-Path $src 'lib') -Destination $dst -Recurse -Force
-Copy-Item -Path (Join-Path $src 'cordis.patch.yml'),(Join-Path $src 'package.json'),(Join-Path $src 'README.md') -Destination $dst -Force
-Get-ChildItem -Recurse $dst -File | Select-Object FullName, Length
+$src = Join-Path $REPO 'tools\dsh-direct\plugin'
+$dst = Join-Path $HOME_DIR '.dsh\plugins\dsh-direct'
+New-Item -ItemType Directory -Path (Join-Path $dst 'lib') -Force | Out-Null
+Copy-Item -Path (Join-Path $src 'lib\*') -Destination (Join-Path $dst 'lib') -Force
+Copy-Item -Path (Join-Path $src 'package.json'),(Join-Path $src 'cordis.patch.yml'),(Join-Path $src 'README.md') -Destination $dst -Force
+Get-ChildItem -LiteralPath $dst -Recurse -File | Select-Object FullName,Length
 ```
 
-Expected files: `package.json`, `cordis.patch.yml`, `README.md`, and `lib\` with `index.js`, `protocol.mjs`,
-`session_api.mjs`, `endpoint.mjs`, `adapters.mjs`, `host_bridge.mjs`.
+Nine files: `package.json`, `cordis.patch.yml`, `README.md`, and `lib/{index.js,protocol.mjs,session_api.mjs,endpoint.mjs,
+adapters.mjs,host_bridge.mjs}`. `sync.mjs` is a development script, not a runtime dependency.
 
-## 4. Wire the package into the `desktop` profile, enable it, then give it real values
-
-Three edits, in this order. Do them against `$PROFILE = <HOME>\.dsh\profiles\desktop`; back up first, because the app
-rewrites these files itself:
-
-```powershell
-$PROFILE = Join-Path $HOME_DIR '.dsh\profiles\desktop'
-Copy-Item (Join-Path $PROFILE 'package.json')        (Join-Path $PROFILE 'package.json.bak-before-dsh-direct')
-Copy-Item (Join-Path $PROFILE 'cordis.patch.yml')    (Join-Path $PROFILE 'cordis.patch.yml.bak-before-dsh-direct')
-```
-
-**4a — make the name resolvable.** Add the dependency (relative to the profile, like every other local plugin there):
+Merge this **one property** into the existing profile manifest's `dependencies`, preserving every other dependency
+and setting. This fragment is not a replacement for the manifest:
 
 ```json
-"dependencies": {
-  "dsh-direct": "file:../../plugins/dsh-direct"
-}
+"dsh-direct": "file:../../plugins/dsh-direct"
 ```
 
-and make `node_modules` agree with it, without running `pnpm` (a `file:` spec needs no download; the app's own
-package operations would otherwise prune a hand-made link later — run them if you install anything else):
+For the local package, create a junction without replacing the profile's dependency tree or invoking a profile-wide
+package upgrade. The manifest entry and junction must agree:
 
 ```powershell
-$link = Join-Path $PROFILE 'node_modules\dsh-direct'
-if (-not (Test-Path $link)) { New-Item -ItemType Junction -Path $link -Target (Join-Path $HOME_DIR '.dsh\plugins\dsh-direct') | Out-Null }
-node -e "const {createRequire}=require('node:module');console.log(createRequire(String.raw`$PROFILE\noop.js`).resolve('dsh-direct/package.json'))"
+$link = Join-Path $PROFILE_DIR 'node_modules\dsh-direct'
+if (-not (Test-Path -LiteralPath $link)) {
+  New-Item -ItemType Junction -Path $link -Target $dst | Out-Null
+}
+Get-Item -LiteralPath $link | Select-Object FullName,LinkType,Target
 ```
 
-**4b — enable the bundle.** Either the app's **Settings → Plugins** page, or the `plugin_manager` tool from any session:
+If the link exists, check that its target is `$dst`; do not delete an unknown directory. The manifest records the local
+dependency, but this manual junction does not refresh `pnpm-lock.yaml`. Use the profile's official package manager for
+future package operations and recheck package resolution afterwards; do not claim a frozen-lockfile install was run.
 
-```
-plugin_manager {"action":"set_bundle","target":"dsh-direct","enabled":true}
-```
+## 4. Configure one existing session, then enable the bundle
 
-The answer matters: `"application":"applied"` means the running Host recomposed and imported the package;
-`"application":"failed"` carries the loader diagnostic for that one entry (see step 5 for the two failures seen in
-practice); `"restart-required"` means this build does not recompose at all and the next step must be a restart anyway.
-
-**4c — the values.** The bundle patch (`cordis.patch.yml` inside the package) already inserts the row with an empty
-config, so the profile layer carries an **override**, not a second `insert:`. Append to
-`<HOME>\.dsh\profiles\desktop\cordis.patch.yml`:
+The package's patch already inserts `id: dsh-direct`. Add or update **one plain override**, not another `insert:` in
+`<HOME>/.dsh/profiles/desktop/cordis.patch.yml`. Expand `<HOME>` and replace the synthetic session id with the existing
+session id before saving. Preserve other rows and the file's custom YAML tags.
 
 ```yaml
 - id: dsh-direct
@@ -162,71 +133,11 @@ config, so the profile layer carries an **override**, not a second `insert:`. Ap
       - 'session-XXXXXXXX-XXXX-4XXX-8XXX-XXXXXXXXXXXX'
 ```
 
-Use `<HOME>` expanded, e.g. under `C:\Users\alice` the token line becomes
-`tokenFile: 'C:/Users/alice/.dsh/dsh-direct/host.token'`. Forward slashes avoid YAML escaping; single quotes keep a
-backslash path literal. Parse the file before trusting it — the app hot-reloads this layer and a YAML error takes every
-patch row with it:
+Single-quoted YAML keeps backslashes literal; forward slashes work too. The listener is fixed to `127.0.0.1` in the
+plugin: no public-host configuration is exposed. Keep both endpoint descriptor and pinned port for this deployment.
+Omitting `port` is supported only when `endpointFile` is present; that configuration chooses a dynamic port.
 
-```powershell
-node -e "const {createRequire}=require('node:module');const Y=createRequire(String.raw`$PROFILE\noop.js`)('yaml');const t=Y.parse(require('node:fs').readFileSync(String.raw`$PROFILE\cordis.patch.yml`,'utf8'),{customTags:[{tag:'!!js',resolve:v=>v}]});console.log('rows',t.length, 'dsh-direct', t.filter(r=>r&&r.id==='dsh-direct').length)"
-```
-
-`port` is optional next to `endpointFile`; leave it out to let the OS choose. If you omit `port` **and** `endpointFile`,
-the plugin refuses to start — that configuration cannot be reached after a restart, and pretending otherwise is what T272
-shipped.
-
-Alternative — a pinned port and no descriptor (then the MCP side uses `hostUrl`):
-
-```yaml
-        tokenFile: '<HOME>/.dsh/dsh-direct/host.token'
-        port: 42731
-```
-
-Rules enforced at start; each refusal is logged at `error` and nothing is bound:
-
-| condition | result |
-|---|---|
-| `ctx.sessionController` lacks `list` / `prompt` / `page` | refuse, naming the missing methods and any T271-guessed names present |
-| `config.tokenFile` missing, unreadable, or shorter than 32 characters | refuse |
-| `config.boundSessionIds` empty | refuse |
-| neither `port` nor `endpointFile` | refuse |
-| `port` outside 1024..65535, or not an integer | refuse |
-| the port is already taken (`EADDRINUSE`) | `bind_failed` — logged, no crash, no half-open bridge |
-
-The last row is a T273 fix: before it, `EADDRINUSE` was an unhandled `error` event and took the Host process down.
-
-## 5. Restart the Desktop once, then read what it says
-
-A **new or changed module** needs a fresh process (step 0b). Restart the Desktop now — that is the one unavoidable
-restart, and it is why an install must not be attempted from inside the very session it would kill: prepare everything,
-then restart when the work that needs the session is finished and recorded.
-
-The plugin's own `info` line is the confirmation:
-
-```
-serving http://127.0.0.1:<port> for 1 bound session(s), protocol dsh-api-session-controller@0.2.0-rc.2
-```
-
-with `, endpoint <path>` appended when `endpointFile` is configured. Where that line lands depends on the host surface;
-the two independent witnesses that do not depend on logs at all are the descriptor and the port:
-
-```powershell
-node "$REPO\tools\dsh-direct\preflight.mjs" --config (Join-Path $HOME_DIR '.dsh\dsh-direct\config.json')
-Get-Content (Join-Path $HOME_DIR '.dsh\dsh-direct\endpoint.json')     # base, kind, protocol, endpointId, pid
-```
-
-`refusing to start: <reason>` in the log, or no descriptor and a dead port, means fix that reason before going on. If the
-log says `bind_failed`, another process owns the port:
-
-```powershell
-Get-NetTCPConnection -LocalPort 42731 -State Listen | Select-Object LocalAddress, LocalPort, OwningProcess
-```
-
-Pick a different port in step 4c (any free port in 1024..65535) and restart the Desktop again.
-
-## 6. Point the MCP server at the bridge, then re-run the preflight
-
-Write `<HOME>/.dsh/dsh-direct/config.json` from `tools/dsh-direct/config.example.json`, filling in:
+Create `<HOME>/.dsh/dsh-direct/config.json` for the external MCP, using expanded paths and the **same** session id:
 
 ```json
 {
@@ -234,57 +145,75 @@ Write `<HOME>/.dsh/dsh-direct/config.json` from `tools/dsh-direct/config.example
   "tokenFile": "<HOME>/.dsh/dsh-direct/host.token",
   "stateDir": "<HOME>/.dsh/dsh-direct/state",
   "boundSessionIds": ["session-XXXXXXXX-XXXX-4XXX-8XXX-XXXXXXXXXXXX"],
-  "boundCwds": ["<WORKSPACE>/project"],
+  "boundCwds": [],
+  "boundProjectIds": [],
   "maxPolls": 3
 }
 ```
 
-`endpointFile` and `hostUrl` are mutually exclusive: the endpoint file is read on every call, so a restarted Desktop is
-followed automatically. Use `"hostUrl": "http://127.0.0.1:42731"` only when step 4 pinned the same port.
+Leave `boundCwds` empty for an id-only binding: ids and cwd bindings are alternatives, not an intersection.
+`endpointFile` and `hostUrl` are mutually exclusive. A fixed `hostUrl: http://127.0.0.1:42731` works only while that port
+remains pinned; the descriptor additionally carries a per-bind `endpointId` checked against `/health`.
 
-Then, with the Desktop running:
+Use the official Plugins settings or the host tool (list bundles first to confirm the exact identifier):
 
-```powershell
-node "$REPO\tools\dsh-direct\preflight.mjs" --config (Join-Path $HOME_DIR '.dsh\dsh-direct\config.json')
+```text
+plugin_manager {"action":"list_bundles"}
+plugin_manager {"action":"set_bundle","target":"dsh-direct","enabled":true}
 ```
 
-Expected: `config.schema ok`, `config.token ok` (64 characters), `endpoint.locate ok`, `endpoint.identity ok` naming
-`cordis_session_controller` and `dsh-api-session-controller@0.2.0-rc.2`. `endpoint.identity` is the check that the port
-actually belongs to this plugin: `/health` is unauthenticated, so without it a stale descriptor pointing at somebody
-else's local server would look fine right up until a prompt was sent.
+`application: applied` reports a composition change; `application: failed` includes the entry's loader error. Neither
+alone proves a current, functioning listener. Keep the bundle enabled as the requested installation; it is not a
+temporary diagnostic switch.
 
-Register the MCP server with your MCP client as a stdio server:
+## 5. Verify loading; defer a required restart until the current task ends
+
+For a repaired module already cached in the live Desktop, record the old descriptor's `pid` and `endpointId`, save the
+work and final recovery instructions, then have the operator exit/reopen Desktop **after this task ends**. Do not kill
+Desktop, schedule an automatic restart, replace its core modules, or create another session to bypass this condition.
+
+After restart, verify a fresh descriptor and a listener owned by the new Desktop Host process:
+
+```powershell
+& $NODE "$REPO\tools\dsh-direct\preflight.mjs" --package "$REPO\tools\dsh-direct\plugin" --config (Join-Path $base 'config.json')
+Get-NetTCPConnection -LocalPort 42731 -State Listen | Select-Object LocalAddress,LocalPort,OwningProcess
+Invoke-RestMethod 'http://127.0.0.1:42731/health'
+```
+
+Expect `127.0.0.1`, `kind: cordis_session_controller`, `protocol: dsh-api-session-controller@0.2.0-rc.2`, required
+capabilities `list,prompt,page,projections`, and matching endpointId. `/health` is intentionally unauthenticated;
+`/sessions`, `/prompt`, `/events` and `/admission` require the private bearer token.
+
+A health response is **not** a loaded-code fingerprint. A prior failed activation may have left an ownerless listener.
+If the old pid/endpointId still serves, or the manager reports activation failure, do not grade B as passed. Check
+`bind_failed` and port ownership; do not hide an old listener by choosing another port.
+
+Implementation contracts verified against this build: Cordis rejects undeclared `ctx` assignments; plugin lifetime is
+owned with `ctx.effect`, not an assumed `dispose` event. `prompt` and `page` require real AbortSignals. History `page`
+needs a finite cursor from `projections().asOfSeq`; `throughSeq: -1` selects an empty prefix, not the latest history.
+
+## 6. Register the self-built MCP locally
+
+For a client launching a stdio server (substitute its absolute Node and repository paths):
 
 ```json
 {
   "mcpServers": {
     "dsh-direct": {
       "command": "<NODE_EXE>",
-      "args": ["<REPO>/tools/dsh-direct/mcp_server.mjs",
-               "--config", "<HOME>/.dsh/dsh-direct/config.json"]
+      "args": ["<REPO>/tools/dsh-direct/mcp_server.mjs", "--config", "<HOME>/.dsh/dsh-direct/config.json"]
     }
   }
 }
 ```
 
-## 6b. Optional: serve MCP over Streamable HTTP instead of stdio
+`preflight --config` should report config/token/endpoint identity checks `ok`. Registration here is for a local MCP
+client, not a cloud web connector. No public port, tunnel, Chrome extension change, or notification change is needed.
 
-Only needed when the MCP client speaks HTTP rather than launching a process. It is off by default and it uses a separate
-token: the HTTP listener is another credential surface, so it never reuses the Host token.
+### Optional Streamable HTTP transport
 
-```powershell
-$httpToken = Join-Path $HOME_DIR '.dsh\dsh-direct\http.token'
-if (-not (Test-Path -LiteralPath $httpToken)) {
-  $bytes = New-Object byte[] 32
-  [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
-  (($bytes | ForEach-Object { $_.ToString('x2') }) -join '') |
-    Set-Content -LiteralPath $httpToken -NoNewline -Encoding ascii
-}
-icacls $httpToken /inheritance:r /grant:r "$($env:USERNAME):(R)" | Out-Null
-(Get-Content -LiteralPath $httpToken -Raw).Length     # expect 64
-```
-
-Add the `http` block to `<HOME>/.dsh/dsh-direct/config.json` (the example ships it disabled):
+Stdio is the default. For a local HTTP MCP client only, generate another 32-random-byte token in
+`<HOME>/.dsh/dsh-direct/http.token` using step 2's method and ACL, then add this block to the MCP config:
 
 ```json
 "http": {
@@ -300,74 +229,53 @@ Add the `http` block to `<HOME>/.dsh/dsh-direct/config.json` (the example ships 
 }
 ```
 
-`enabled` must be the JSON boolean `true`; the string `"true"` is refused by name. The listener is always `127.0.0.1` —
-`host` is not a knob. `allowedOrigins` stays empty for a CLI client, which sends no `Origin` header; a browser-based
-client must have its exact origin listed, otherwise every request from it is `403`.
+Never reuse `host.token` for this surface. The HTTP listener remains `127.0.0.1`; an empty Origin allowlist is appropriate
+for a local CLI. Start `node <REPO>/tools/dsh-direct/mcp_server.mjs --config <HOME>/.dsh/dsh-direct/config.json` from a
+separate terminal. POST `initialize` with bearer auth, JSON content type and `Accept: application/json`; expect 200,
+`Mcp-Session-Id` and negotiated protocol `2025-11-25`. GET returns 405; missing auth 401; foreign Origin 403; oversized
+body 413. This local transport does not provide a remotely reachable ChatGPT Web connector, and one is not needed for C.
 
-Start it and smoke-test the handshake:
+## 7. One live dispatch into the original session (C)
 
-```powershell
-Start-Process -FilePath '<NODE_EXE>' -ArgumentList @("$REPO\tools\dsh-direct\mcp_server.mjs", '--config',
-  (Join-Path $HOME_DIR '.dsh\dsh-direct\config.json'))
-# stderr banner: dsh-direct: MCP Streamable HTTP on http://127.0.0.1:42732/mcp (loopback only, 0 allowed origin(s), ...)
+1. Run the verifier from a separate local terminal after the installation task ends. `list_sessions` must return exactly
+   the bound original id with `running: false` and `agentAvailable: true`. Busy, missing or unknown means **stop**.
+2. Send exactly one inert prompt with one recorded requestId, for example
+   `submit_task {"requestId":"manual-check-0001","sessionId":"<bound>","prompt":"Reply only: DIRECT-OK"}`.
+3. Preserve taskId, requestId and receipt. If state is running, poll `get_result {taskId}` every 5 seconds for at most
+   180 seconds; `task_not_finished` means wait, not resend. A timeout is pending evidence, not permission for another
+   requestId. `get_result` refreshes history without re-admitting the prompt.
+4. Success requires the exact request's `user/message.data.source.rpcId`, the associated turn, a completed `turn/end`
+   and the expected assistant reply. Old/intermediate assistant text is not proof. Record the direct endpointId/pid,
+   MCP task ledger and `(sessionId, requestId, turnId)` join. This path is MCP → private loopback listener →
+   `ctx.sessionController`; the separate Bridge connector is a consumer of that service, not a hop on this path.
+5. If admission is unsettled, preserve its ledger. `reconcile_task {taskId}` first checks durable evidence; supplying
+   the original `prompt` permits a same-requestId retry **only after idle is confirmed**. Never erase the ledger or
+   invent a new requestId to bypass an unresolved task. Restarting with an in-flight task is not success evidence.
 
-$body = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"smoke","version":"1.0.0"}}}'
-$token = Get-Content -LiteralPath $httpToken -Raw
-Invoke-WebRequest -Method Post -Uri 'http://127.0.0.1:42732/mcp' -Body $body -ContentType 'application/json' `
-  -Headers @{ Authorization = "Bearer $token"; Accept = 'application/json' }
-```
+A dynamic-port restart check is a separate optional test. With pinned port 42731, `hostUrl` may still work after restart;
+there is no requirement that it fail. Do not inject extra test prompts or kill MCP clients during the one-message check.
 
-Expect `200`, a 32-hex `Mcp-Session-Id`, and `protocolVersion: "2025-11-25"` in the body. `GET` on the same URL answers
-`405` with `Allow: POST, DELETE`: this server pushes nothing, so it never holds a stream open. A missing token answers
-`401`, a foreign `Origin` answers `403`, and a body over `maxBodyBytes` answers `413`.
+## Rollback and uninstall
 
-Re-run the preflight with the same `--config`: `http.config`, `http.origins` and `http.token` appear, and `http.token`
-fails if the file is missing, short, or is the same file as the Host token.
+First disable the bundle through `plugin_manager` (`set_bundle`, `target: dsh-direct`, `enabled: false`). Verify whether
+the listener closes; a known old leaked generation needs a deferred Desktop process restart. Keep authentication and
+ledger files until that listener has stopped. Do not terminate the Desktop hosting an active task.
 
-**This is not a ChatGPT Web connection.** The listener is loopback-only and plain HTTP, so nothing outside this machine
-can reach it by design. Registering a custom MCP connector in ChatGPT is a user action in the ChatGPT settings, and it
-would need an HTTPS endpoint this repository does not create and does not authorise. Level C below stays unmet until
-that is done deliberately, with a decision about exposure.
+To uninstall after exit, remove only the `dsh-direct` override, its dependency, and its bundle entry, preserving all
+unrelated settings. Remove the junction itself (`cmd /c rmdir "<HOME>\.dsh\profiles\desktop\node_modules\dsh-direct"`,
+no `/s`); then archive/remove the package and plugin runtime directory. Retain task evidence first.
 
-## 7. First live check (level C)
+For emergency restoration with Desktop closed, restore the timestamped package/patch/lock backups **only if no later
+unrelated configuration edits occurred**. Otherwise remove only the plugin-specific additions. Reopen Desktop and run
+`preflight --port 42731`: it should report that port free. This does not require uninstalling other plugins.
 
-1. `list_sessions` → exactly the bound session, plus `protocol: dsh-api-session-controller@0.2.0-rc.2`.
-2. `submit_task { "requestId": "manual-0001", "sessionId": "<bound>", "prompt": "Reply with the single word: ok" }` →
-   the Desktop session itself must show that user message, and the tool result must carry the assistant text.
-3. Restart the Desktop (not the MCP client), then `submit_task` again with a fresh requestId: with `endpointFile` the
-   call must succeed on the new port. With a pinned `hostUrl` it must fail with `host_unreachable` — that is the
-   difference the descriptor buys, and worth seeing once.
-4. Kill the MCP client between send and answer, start it again: `get_task` → `unsettled`, `submit_task` → `session_busy`,
-   `reconcile_task { taskId, prompt: "<same text>" }` → settles with no second message in the Desktop session.
+## Acceptance record
 
-## Uninstall, and the socket it must release
+| level | required evidence |
+|---|---|
+| **A** | exact committed SHA; targeted suites; full clean-clone release gate; Windows and Ubuntu CI for that SHA |
+| **B** | current real Desktop loads the installed module; fresh descriptor; correct loopback listener/process; authenticated session list |
+| **C** | original session confirmed idle; one MCP dispatch; exact request/turn/result correlation; direct-path receipt |
 
-```powershell
-$PROFILE = Join-Path $HOME_DIR '.dsh\profiles\desktop'
-# 1. disable the bundle first (app Plugins page, or plugin_manager set_bundle target=dsh-direct enabled=false),
-#    then remove the override row from the profile patch and the dependency from the profile manifest
-#    ($PROFILE\cordis.patch.yml, $PROFILE\package.json), then the files:
-Remove-Item -Recurse -Force (Join-Path $HOME_DIR '.dsh\plugins\dsh-direct')
-Remove-Item -Recurse -Force (Join-Path $HOME_DIR '.dsh\dsh-direct')
-Remove-Item -Force (Join-Path $PROFILE 'node_modules\dsh-direct')      # the junction, not its target
-# 2. restart the Desktop, then prove the listener is gone:
-node "$REPO\tools\dsh-direct\preflight.mjs" --port 42731
-```
-
-After the restart `port 42731 is free on 127.0.0.1` must come back `ok`. The plugin closes its listener on both the return
-value of `apply` and the Cordis `dispose` event, and `close()` resolves on the server's `close` event with a 250 ms
-socket sweep — a test asserts that a second instance can bind the same port immediately after dispose.
-
-## What this proves, and what it does not
-
-| level | requirement | status |
-|---|---|---|
-| **A** | plugin, MCP server (stdio and Streamable HTTP) and preflight verified in isolation against a fake Host; the HTTP layer driven over a real socket, including a full submit→result→duplicate run | met by the repo's tests |
-| **B** | the real Desktop loads the plugin and the bridge answers on loopback | met for a **real Host process** built from the installed package and this document's patch row (`/health` answered `cordis_session_controller` / `dsh-api-session-controller@0.2.0-rc.2`, `list_sessions` answered over stdio MCP), measured in an isolated `DSH_HOME`; **not yet** for the already-running Desktop instance, which holds the pre-fix module generation until step 5's restart |
-| **C** | an existing session received a real prompt without the Bridge | not yet: needs the restart from step 5, then step 7 against the bound session |
-
-`mcp_server.mjs` is a working MCP server on both transports, but nothing in this repository registers it with ChatGPT's
-custom-MCP settings: that registration is a Web-side action in the ChatGPT UI, and it needs a transport that reaches this
-machine. Stdio means the client launches the process locally, which works for a desktop MCP client; the HTTP transport is
-loopback-only, which works for a local HTTP MCP client. A Web client needs an HTTPS endpoint reachable from the internet,
-and no part of this repository creates one or authorises one. That gap is stated rather than papered over.
+An isolated real Host test is supporting integration evidence, not B for the user's Desktop. A healthy leaked listener
+or an accepted-but-unfinished request is not C. Keep per-machine logs/status outside this source repository.

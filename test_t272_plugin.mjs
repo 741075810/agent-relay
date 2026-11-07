@@ -50,16 +50,23 @@ function controller() {
       state.running = true;
       return { accepted: true };
     },
+    async projections(request, signal) {
+      signal.throwIfAborted();
+      return { asOfSeq: 3, values: {} };
+    },
     async page(request, signal) {
       assert.equal(typeof signal?.throwIfAborted, 'function', 'page() takes the same signal contract as prompt()');
+      assert.equal(request.throughSeq, 3);
       state.pages += 1;
       return { records: [
-        { type: 'event', event: { type: 'turn/start', seq: 1, time: 0, data: { turn: 0 } } },
-        { type: 'event', event: { type: 'user/message', seq: 2, time: 0, data: { message: {
+        { type: 'event', event: { type: 'turn/start', seq: 0, time: 0, data: { turn: 0 } } },
+        { type: 'event', event: { type: 'user/message', seq: 1, time: 0, data: {
           content: [{ type: 'text', text: state.lastText }],
-          source: { kind: 'user', rpcId: state.requestIds[state.requestIds.length - 1] } } } } },
-        { type: 'event', event: { type: 'assistant/message', seq: 3, time: 0, data: { turn: 0, step: 1, message: {
+          source: { kind: 'user', rpcId: state.requestIds[state.requestIds.length - 1] } } } },
+        { type: 'event', event: { type: 'assistant/message', seq: 2, time: 0, data: { turn: 0, step: 1, message: {
           content: [{ type: 'text', text: 'final answer' }] } } } },
+        { type: 'event', event: { type: 'turn/end', seq: 3, time: 0,
+          data: { turn: 0, reason: { kind: 'completed' } } } },
       ], hasMore: false };
     },
   };
@@ -68,8 +75,11 @@ function controller() {
 /** Just enough Cordis: `inject`-style services, `on('dispose')`, and a logger that records. */
 function fakeCtx(services = {}) {
   const listeners = new Map();
+  const effects = [];
   const logs = [];
   return {
+    effect(setup) { effects.push(setup()); },
+    async unload() { await Promise.all(effects.splice(0).map((dispose) => dispose())); },
     ...services,
     logs,
     on(event, handler) {
@@ -155,14 +165,14 @@ test('T272: apply serves only the bound session and dispose releases the port', 
   }
 });
 
-test('T272: the dispose lifecycle event closes the bridge even if the disposer is ignored', async () => {
+test('T272: fiber effect closes the bridge even when constructed apply return is ignored', async () => {
   const sc = scene();
   const ctx = fakeCtx({ sessionController: controller() });
   try {
-    const dispose = apply(ctx, { tokenFile: sc.tokenFile, boundSessionIds: [SESSION], endpointFile: sc.endpointFile });
+    const dispose = new apply(ctx, { tokenFile: sc.tokenFile, boundSessionIds: [SESSION], endpointFile: sc.endpointFile });
     const bridge = await dispose.ready;
     assert.equal((await health(bridge.base)).status, 200);
-    await ctx.emit('dispose');
+    await ctx.unload();
     assert.equal(openBridgeCount(), 0);
     assert.equal(await fetch(bridge.base + '/health').then(() => 'up').catch(() => 'down'), 'down');
   } finally {
@@ -218,7 +228,7 @@ test('T272: inspectHost reports capabilities without starting anything', async (
   const report = inspectHost(ctx, { tokenFile: '<TOKEN_DIR>/host.token', boundSessionIds: [SESSION] });
   assert.equal(report.name, 'dsh-direct');
   assert.deepEqual(report.capabilities.missing, []);
-  assert.deepEqual(report.capabilities.available, ['list', 'prompt', 'page']);
+  assert.deepEqual(report.capabilities.available, ['list', 'prompt', 'page', 'projections']);
   assert.deepEqual(report.boundSessionIds, [SESSION]);
   assert.equal(openBridgeCount(), 0, 'a report must not bind a port');
 });

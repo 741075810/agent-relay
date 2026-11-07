@@ -242,7 +242,7 @@ export const TOOLS = Object.freeze([
   {
     name: 'submit_task',
     description: 'Submit one prompt into an EXISTING bound DSH session. No session is ever created. '
-      + 'Idempotent on `requestId`; one active task per session.',
+      + 'Requires confirmed Host idle/availability; idempotent on `requestId`; one active task per session.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -267,8 +267,8 @@ export const TOOLS = Object.freeze([
   },
   {
     name: 'get_result',
-    description: 'Read the result of a finished task. Refuses with task_not_finished while it is still active, and '
-      + 'with task_unsettled when the submission never got an answer and must be reconciled first.',
+    description: 'Refresh bounded Host history for a running task, without sending another prompt, then read its result. '
+      + 'Returns task_not_finished while still active, or task_unsettled when admission must be reconciled first.',
     inputSchema: {
       type: 'object',
       properties: { taskId: { type: 'string' } },

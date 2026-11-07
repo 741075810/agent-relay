@@ -9,6 +9,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { pathToFileURL } from 'node:url';
 
 import { createFakeHost } from './tools/dsh-direct/adapters.mjs';
 import { openBridgeCount } from './tools/dsh-direct/plugin/lib/host_bridge.mjs';
@@ -20,8 +21,11 @@ const TOKEN = 'listener-token-' + 'q'.repeat(40);
 
 function fakeCtx() {
   const listeners = new Map();
+  const effects = [];
   const logs = [];
   return {
+    effect(setup) { effects.push(setup()); },
+    async unload() { await Promise.all(effects.splice(0).map((dispose) => dispose())); },
     sessionController: createFakeHost({ sessions: [{ sessionId: SESSION, cwd: '/work/alpha', title: 'alpha',
       running: false, blank: false, agentAvailable: true, updatedAt: 1794000000000 }], turnsPerTask: 1 }),
     logs,
@@ -116,14 +120,14 @@ test('T273: dispose releases the socket and its descriptor, and the port rebinds
   }
 });
 
-test('T273: the dispose event tears down as well, and the bridge is gone before it resolves', async () => {
+test('T273: the fiber effect tears down and the bridge is gone before unload resolves', async () => {
   const sc = scene();
   try {
     const ctx = fakeCtx();
     const dispose = apply(ctx, { tokenFile: sc.tokenFile, boundSessionIds: [SESSION], endpointFile: sc.endpointFile });
     const started = await dispose.ready;
     assert.ok(started);
-    await ctx.emit('dispose');
+    await ctx.unload();
     assert.equal(openBridgeCount(), 0);
     assert.equal(existsSync(sc.endpointFile), false);
     const reachable = await fetch(started.base + '/health').then(() => true).catch(() => false);
@@ -187,7 +191,7 @@ test('T273: apply writes nothing onto the host context (Cordis 4 refuses undecla
   // assignment to an undeclared context property into a thrown error *inside* apply, so the row never activates. This
   // ctx reproduces that rule, so the suite fails if the plugin ever publishes itself onto ctx again.
   const sc = scene();
-  const allowed = new Set(['sessionController', 'on', 'emit', 'logger', 'logs']);
+  const allowed = new Set(['sessionController', 'on', 'emit', 'effect', 'unload', 'logger', 'logs']);
   const ctx = new Proxy(fakeCtx(), {
     set(target, key, value) {
       if (typeof key === 'string' && !allowed.has(key)) {
@@ -217,7 +221,7 @@ test('T273: a host that throws while the plugin wires itself up leaves no listen
   // `bind_failed`. `apply` now closes what it bound before it rethrows, so the port is free again immediately.
   const sc = scene();
   const ctx = fakeCtx();
-  ctx.on = () => { throw new Error('cannot set property "anything" without provide'); };
+  ctx.effect = () => { throw new Error('cannot set property "anything" without provide'); };
   try {
     assert.throws(() => apply(ctx, { tokenFile: sc.tokenFile, boundSessionIds: [SESSION], endpointFile: sc.endpointFile }),
       /without provide/);
@@ -232,6 +236,71 @@ test('T273: a host that throws while the plugin wires itself up leaves no listen
     rmSync(sc.dir, { recursive: true, force: true });
   }
 });
+
+test('T276: logger failure after binding still closes the listener and descriptor', async () => {
+  const sc = scene();
+  const ctx = fakeCtx();
+  ctx.logger.info = () => { throw new Error('logger failed after bind'); };
+  ctx.logger.error = () => { throw new Error('logger failed reporting failure'); };
+  let dispose;
+  try {
+    dispose = apply(ctx, { tokenFile: sc.tokenFile, boundSessionIds: [SESSION], endpointFile: sc.endpointFile });
+    assert.equal(await dispose.ready, null);
+    assert.equal(openBridgeCount(), 0);
+    assert.equal(existsSync(sc.endpointFile), false);
+    const closing = dispose();
+    assert.equal(dispose(), closing, 'repeat disposal must return the in-flight close promise');
+    await closing;
+  } finally {
+    if (dispose) await dispose();
+    rmSync(sc.dir, { recursive: true, force: true });
+  }
+});
+
+test('T276: immediate fiber unload waits for a pending listener bind', async () => {
+  const sc = scene();
+  const ctx = fakeCtx();
+  try {
+    const dispose = new apply(ctx, { tokenFile: sc.tokenFile, boundSessionIds: [SESSION], endpointFile: sc.endpointFile });
+    await ctx.unload();
+    assert.equal(await dispose.ready, null);
+    assert.equal(openBridgeCount(), 0);
+    assert.equal(existsSync(sc.endpointFile), false);
+  } finally {
+    await ctx.unload();
+    rmSync(sc.dir, { recursive: true, force: true });
+  }
+});
+
+// Optional standalone runtime integration. Only imports the installed Cordis library; no Desktop profile, services,
+// sessions, or processes are touched. The full gate may leave DSH_CORDIS_TEST_MODULE unset.
+test('T276: installed Cordis fiber actually owns and awaits listener teardown',
+  { skip: !process.env.DSH_CORDIS_TEST_MODULE }, async () => {
+    const { Context } = await import(pathToFileURL(process.env.DSH_CORDIS_TEST_MODULE).href);
+    const sc = scene();
+    const root = new Context();
+    const remove = root.provide('sessionController', fakeCtx().sessionController);
+    let fiber;
+    try {
+      let handle;
+      fiber = root.plugin({ name: 'dsh-direct-lifecycle-check', inject: ['sessionController'],
+        apply: function TestPlugin(ctx, config) { handle = apply(ctx, config); return handle; } },
+      { tokenFile: sc.tokenFile, boundSessionIds: [SESSION], endpointFile: sc.endpointFile });
+      await fiber;
+      const bridge = await handle.ready;
+      assert.ok(bridge);
+      assert.equal((await fetch(bridge.base + '/health')).status, 200);
+      assert.ok(fiber.getEffects().some((effect) => effect.label === 'dsh-direct.bridge'));
+      await fiber.dispose();
+      assert.equal(openBridgeCount(), 0);
+      assert.equal(existsSync(sc.endpointFile), false);
+      assert.equal(await fetch(bridge.base + '/health').then(() => true).catch(() => false), false);
+    } finally {
+      if (fiber) await fiber.dispose();
+      await remove();
+      rmSync(sc.dir, { recursive: true, force: true });
+    }
+  });
 
 test('T273: the plugin copies stay byte-identical to their sources', () => {
   const dir = path.join(process.cwd(), 'tools', 'dsh-direct');

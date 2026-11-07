@@ -16,8 +16,9 @@
 //   page(request: SessionPageRequest, signal): Promise<SessionPage>
 //       SessionPageRequest = { address, throughSeq, beforeSeq?, maxMessages?, turnWindow? }
 //       SessionPage        = { records: readonly SessionHistoryRecord[], hasMore: boolean }
-//       throughSeq === -1 means "from the current cursor"      (lib/index.js:1417)
-//   follow / control are *streams*; cancel takes { sessionId }.
+//       throughSeq === -1 means the EMPTY prefix (paginate ends at throughSeq + 1).
+//   projections({ sessionId }, signal) -> { asOfSeq, values } | null supplies the cold-safe current cursor.
+//   follow / control are *streams*; follow may activate a cold Agent, so history reads use projections + page.
 //
 // Two facts from `lib/index.js` decide the whole submission story, so they are encoded here:
 //
@@ -31,7 +32,7 @@
 import { CODES, DirectError, fail } from './protocol.mjs';
 
 /** The Remote methods this module needs. `page` replaced T271's invented `getEvents`. */
-export const REMOTE_METHODS = Object.freeze(['list', 'prompt', 'page']);
+export const REMOTE_METHODS = Object.freeze(['list', 'prompt', 'page', 'projections']);
 
 /** `session/*` and `gateway/*` codes reach us as `err.code` from RemoteError. Map the ones we act on. */
 export function mapRemoteError(err) {
@@ -78,7 +79,7 @@ function requireRow(raw) {
     sessionId: raw.sessionId,
     cwd: typeof raw.cwd === 'string' ? raw.cwd : null,
     updatedAt: Number.isFinite(raw.updatedAt) ? raw.updatedAt : null,
-    running: raw.running === true,
+    running: typeof raw.running === 'boolean' ? raw.running : null,
     blank: raw.blank === true,
     agentAvailable: raw.agentAvailable === true,
     parentSessionId: typeof raw.parentSessionId === 'string' ? raw.parentSessionId : null,
@@ -121,10 +122,21 @@ export function readPromptValue(value) {
   return { accepted: false, reason: 'host_did_not_accept' };
 }
 
-/** `page` request for the newest page: `throughSeq: -1` is the Host's "current cursor" sentinel. */
-export function buildPageRequest({ sessionId, throughSeq = -1, beforeSeq, maxMessages = 60 }) {
+/** An exact inclusive history cut; -1 is empty, never a request for the newest page. */
+export function buildPageRequest({ sessionId, throughSeq, beforeSeq, maxMessages = 60 }) {
+  if (!Number.isSafeInteger(throughSeq) || throughSeq < -1 || Object.is(throughSeq, -0)) {
+    fail(CODES.invalid_arguments, 'page needs an explicit throughSeq cursor greater than or equal to -1');
+  }
+  if (!Number.isSafeInteger(maxMessages) || maxMessages <= 0) {
+    fail(CODES.invalid_arguments, 'maxMessages must be a positive safe integer');
+  }
   const request = { address: { kind: 'session', sessionId }, throughSeq, maxMessages };
-  if (Number.isFinite(beforeSeq)) request.beforeSeq = beforeSeq;
+  if (beforeSeq !== undefined) {
+    if (!Number.isSafeInteger(beforeSeq) || beforeSeq < 0 || Object.is(beforeSeq, -0)) {
+      fail(CODES.invalid_arguments, 'beforeSeq must be a non-negative safe integer');
+    }
+    request.beforeSeq = beforeSeq;
+  }
   return request;
 }
 
@@ -135,62 +147,61 @@ export function normalizePage(value) {
   return { records: value.records, hasMore: value.hasMore === true };
 }
 
-/**
- * Find the durable echo of one `requestId` in history records.
- *
- * The Host stamps `source.rpcId = request.requestId` on the user message it creates (`lib/index.js:856-879`), so a
- * request id present anywhere in a record under an `rpcId` key is proof the prompt was admitted. The walk is by key,
- * not by substring: a prompt whose *text* mentions another request id must not be mistaken for that admission.
- */
+/** rc.2 appends the UserMessage itself as event.data, not event.data.message. */
+function isAdmission(event, requestId) {
+  return typeof requestId === 'string' && requestId.length > 0 && event?.type === 'user/message'
+    && event.data?.source?.kind === 'user' && event.data.source.rpcId === requestId;
+}
+
 export function findAdmission(records, requestId) {
-  if (!Array.isArray(records) || !requestId) return { found: false, seq: null, eventType: null };
-  for (const record of records) {
-    const hit = findKeyValue(record, 'rpcId', requestId);
-    if (hit) {
-      const event = record && record.event;
-      return { found: true, seq: Number.isFinite(event && event.seq) ? event.seq : null,
-        eventType: event && typeof event.type === 'string' ? event.type : null };
+  const event = Array.isArray(records) ? records.find((record) => isAdmission(record?.event, requestId))?.event : null;
+  return event ? { found: true, seq: event.seq, eventType: event.type }
+    : { found: false, seq: null, eventType: null };
+}
+
+/** Only literal text blocks, never reasoning text or a tool argument named `text`. */
+function messageText(message) {
+  const text = (Array.isArray(message?.content) ? message.content : [])
+    .filter((part) => part?.type === 'text' && typeof part.text === 'string')
+    .map((part) => part.text).join('\n').trim();
+  return text || null;
+}
+
+/** Correlate one request to its enclosing turn and the matching durable turn/end. */
+export function correlateResult(records, requestId) {
+  const events = Array.isArray(records) ? records.map((record) => record?.event).filter(Boolean) : [];
+  const admission = findAdmission(records, requestId);
+  const result = { admission, turnId: null, terminal: null, done: false, assistantText: null };
+  const at = events.findIndex((event) => isAdmission(event, requestId));
+  if (at < 0) return result;
+  let start = at - 1;
+  while (start >= 0 && events[start].type !== 'turn/start' && events[start].type !== 'turn/end') start -= 1;
+  const turn = events[start]?.type === 'turn/start' ? events[start].data?.turn : undefined;
+  if (!Number.isSafeInteger(turn) || turn < 0) return result;
+  result.turnId = String(turn);
+  let lastAssistant = null;
+  for (let i = at + 1; i < events.length; i += 1) {
+    const event = events[i];
+    if (event.type === 'turn/start') break;
+    if (event.type === 'assistant/message' && event.data?.turn === turn) lastAssistant = event.data;
+    if (event.type !== 'turn/end') continue;
+    if (event.data?.turn !== turn || typeof event.data.reason?.kind !== 'string') break;
+    result.terminal = { kind: event.data.reason.kind, seq: event.seq };
+    // A tool step can have text too; only the final non-tool, uninterrupted assistant message is an answer.
+    const content = lastAssistant?.message?.content;
+    if (result.terminal.kind === 'completed' && lastAssistant?.interrupted !== true
+        && Array.isArray(content) && !content.some((part) => part?.type === 'tool-call')) {
+      result.assistantText = messageText(lastAssistant.message);
+      result.done = result.assistantText !== null;
     }
+    break;
   }
-  return { found: false, seq: null, eventType: null };
+  return result;
 }
 
-function findKeyValue(node, key, value) {
-  if (!node || typeof node !== 'object') return false;
-  if (Array.isArray(node)) return node.some((item) => findKeyValue(item, key, value));
-  for (const [name, child] of Object.entries(node)) {
-    if (name === key && child === value) return true;
-    if (typeof child === 'object' && child !== null && findKeyValue(child, key, value)) return true;
-  }
-  return false;
-}
-
-/**
- * Collect assistant text from a page. The reply body is not part of the prompt contract, so this is deliberately
- * tolerant: it takes every `text` string that sits under an `assistant/message` event, in record order.
- */
-export function extractAssistantText(records) {
-  if (!Array.isArray(records)) return null;
-  const parts = [];
-  for (const record of records) {
-    const event = record && record.event;
-    if (!event || event.type !== 'assistant/message') continue;
-    collectText(event.data, parts);
-  }
-  const text = parts.join('\n').trim();
-  return text.length ? text : null;
-}
-
-function collectText(node, out) {
-  if (!node || typeof node !== 'object') return;
-  if (Array.isArray(node)) {
-    for (const item of node) collectText(item, out);
-    return;
-  }
-  for (const [name, child] of Object.entries(node)) {
-    if (name === 'text' && typeof child === 'string' && child.length) out.push(child);
-    else if (typeof child === 'object' && child !== null) collectText(child, out);
-  }
+/** Result extraction always requires a request id and a matching completed turn. */
+export function extractAssistantText(records, requestId) {
+  return correlateResult(records, requestId).assistantText;
 }
 
 /** True when a page contains any event newer than `afterSeq`. */

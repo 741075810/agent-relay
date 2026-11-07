@@ -99,6 +99,15 @@ export function assertBound(config, session) {
   }
 }
 
+/** Absence of busy evidence is not idle evidence. Never inject into an already-running or unavailable Agent. */
+export function assertSessionIdle(session) {
+  if (session.running !== false || session.agentAvailable !== true) {
+    fail(CODES.session_busy, 'the Host has not confirmed an idle, available session; no prompt sent', {
+      sessionId: session.sessionId, running: session.running ?? null,
+      agentAvailable: session.agentAvailable ?? null, reason: 'host_idle_not_confirmed' });
+  }
+}
+
 export class DirectServer {
   constructor(config, { client, store, worktree = precheckWorktree } = {}) {
     this.config = config;
@@ -144,6 +153,11 @@ export class DirectServer {
       fail(CODES.project_mismatch, 'the session belongs to a different cwd', {
         sessionId: input.sessionId, expected: session.cwd, got: input.projectId });
     }
+    // Duplicate keys and local locks are checked by the ledger without sending a second prompt. A genuinely new
+    // request additionally needs positive Host-side idle evidence; a busy/unknown session is not a queue target here.
+    if (!this.store.byRequestId(input.requestId) && !this.store.activeFor(input.sessionId)) {
+      assertSessionIdle(session);
+    }
     const accepted = this.store.accept({ ...input, projectId: session.cwd });
     if (accepted.duplicate) {
       return { ok: true, host: this.client.kind, duplicate: true, worktree, task: this.#view(accepted.task) };
@@ -186,6 +200,17 @@ export class DirectServer {
     if (digest !== task.promptSha256) {
       fail(CODES.invalid_arguments, 'the supplied prompt does not match the digest recorded for this task', {
         taskId, expected: task.promptSha256, got: digest });
+    }
+    const listed = await this.client.listSessions();
+    const session = listed.find((item) => item.sessionId === task.sessionId);
+    if (!session) fail(CODES.session_not_found, 'the bound session is absent; no reconcile prompt sent');
+    assertBound(this.config, session);
+    assertSessionIdle(session);
+    if (this.config.worktreeRoot) {
+      const check = await this.worktree(this.config.worktreeRoot);
+      if (!check.clean && !this.config.allowDirtyWorktree) {
+        fail(CODES.worktree_dirty, 'the worktree is dirty; no reconcile prompt sent', check);
+      }
     }
     this.store.stage(taskId, 'reconcile_reprompt', { requestId: task.requestId });
     const settled = await this.#admit(task, { prompt }, null, { reconciling: true });
@@ -240,9 +265,19 @@ export class DirectServer {
       const text = page.assistantText || null;
       this.store.stage(taskId, 'host_events', { poll, events: page.events.length, done: page.done,
         admission: page.admission ? page.admission.found : null });
-      if (page.done) {
+      // The bridge must join this exact requestId to an admitted user event and a completed same-turn terminal.
+      // An old assistant message, an intermediate tool step, or an unrelated turn is never a successful result.
+      if (page.admission?.found === true && page.terminal && page.terminal.kind !== 'completed') {
+        return this.store.transition(taskId, 'failed', { turnId: page.turnId ?? task.turnId,
+          error: { code: CODES.host_refused, phase: 'host_turn', reason: page.terminal.kind },
+          result: { text, cursor, admission: page.admission, terminal: page.terminal } });
+      }
+      if (page.done && page.admission?.found === true && page.terminal?.kind === 'completed'
+          && typeof page.turnId === 'string') {
         return this.store.transition(taskId, 'succeeded', {
-          result: { text, events: page.events.map((event) => ({ seq: event.seq, kind: event.kind })), cursor, polls: poll },
+          turnId: page.turnId ?? task.turnId,
+          result: { text, events: page.events.map((event) => ({ seq: event.seq, kind: event.kind })), cursor, polls: poll,
+            admission: page.admission },
         });
       }
     }
@@ -257,8 +292,13 @@ export class DirectServer {
     return { ok: true, task: this.#view(task) };
   }
 
-  getResult(args) {
+  async getResult(args) {
     const taskId = validateTaskId(args);
+    const task = this.store.find(taskId);
+    if (!task) fail(CODES.task_not_found, 'no such task', { taskId });
+    // A normal model answer outlives the three immediate polls in submit_task. Subsequent reads must refresh
+    // history rather than consulting a permanently running ledger. This path never calls prompt/reconcile.
+    if (task.state === 'running') await this.#collect(taskId);
     return { ok: true, task: this.#view(this.store.finished(taskId)) };
   }
 

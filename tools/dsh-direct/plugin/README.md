@@ -21,10 +21,11 @@ sync.mjs            the copy step (idempotent; `--dry-run` reports only)
 
 ## Lifecycle
 
-`apply` returns a disposer and also registers the same teardown on the Cordis `dispose` event, so a host that ignores
-the return value still gets the socket closed. `dispose` returns a promise that resolves only after the listener is
-gone — a plugin that unloads must not leave a bound port behind, and `test_t273_plugin_config.mjs` proves it by binding
-the same port again immediately afterwards.
+`apply` owns its teardown through Cordis `ctx.effect`. Cordis 4 constructs ordinary function entrypoints: returning a
+function alone does not register teardown, and `ctx.on('dispose')` is not a lifecycle subscription in this build.
+The returned disposer also carries a `ready` handle for integration tests without assigning undeclared context fields.
+Disposal closes the socket and descriptor; startup failures release any listener already bound. The tests exercise
+fiber-owned cleanup, not only a manually emitted mock event.
 
 ```js
 export const name = 'dsh-direct';
@@ -48,3 +49,12 @@ anything, for a dry check before installing.
 | the port is taken | `bind_failed`, logged; the Host process survives and nothing is left half-open |
 
 `tokenFile` (32+ characters) and a non-empty `boundSessionIds` are required in every case.
+
+## Session-controller contract
+
+The installed rc.2 service must expose `list`, `prompt`, `page` and `projections`. `prompt` and `page` require a real
+AbortSignal. `projections({sessionId}, signal).asOfSeq` supplies the finite history cut; `page(throughSeq: -1)` is an
+empty prefix, not a latest-page sentinel. Results join the exact `user/message.data.source.rpcId` to its containing
+turn and a matching completed `turn/end`. Text from an old turn or intermediate tool step never completes a task.
+`get_result` on the MCP side refreshes a running task without sending another prompt. New submits require explicit
+Host idle evidence (`running === false` and `agentAvailable === true`).

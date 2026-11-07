@@ -36,7 +36,7 @@ function scene(options = {}) {
 }
 
 async function startBridge(sceneRef, options = {}) {
-  const adapter = options.adapter || createFakeHost({ sessions: sceneRef.sessions, turnsPerTask: options.turnsPerTask || 2,
+  const adapter = options.adapter || createFakeHost({ sessions: sceneRef.sessions, pagesPerTurn: options.turnsPerTask || 2,
     failPrompt: options.failPrompt === true });
   return startHostBridge({ adapter, token: TOKEN });
 }

@@ -101,8 +101,9 @@ async function closeBridge(bridge) {
   assert.equal(openBridgeCount(), 0, 'no bridge may be left open: ' + bridge.base);
 }
 
-function host() {
+function host(extra = {}) {
   return createFakeHost({
+    ...extra,
     sessions: [
       { sessionId: SESSION, cwd: '/workspace/project', title: 'alpha' },
       { sessionId: OTHER, cwd: '/work/other', title: 'beta' },
@@ -154,7 +155,7 @@ test('T272: a lost prompt answer leaves the task unsettled, keeps the lock, and 
 test('T272: reconcile without log evidence needs the original text, and re-sending it stays a single admission',
   async () => {
     const sc = scene();
-    const fake = host();
+    const fake = host({ pagesPerTurn: 100 });
     const bridge = await startHostBridge({ adapter: fake, token: TOKEN });
     config(sc, bridge);
     const srv = server(sc.configFile);
@@ -172,6 +173,9 @@ test('T272: reconcile without log evidence needs the original text, and re-sendi
       const wrong = await call(srv, 'reconcile_task', { taskId: first.task.taskId, prompt: 'different text' });
       assert.equal(wrong.code, 'invalid_arguments', 'the digest is the guard against reconciling with other content');
 
+      const busyRetry = await call(srv, 'reconcile_task', { taskId: first.task.taskId, prompt: 'original text' });
+      assert.equal(busyRetry.code, 'session_busy', 'no blind reprompt while the Host still runs');
+      fake.control.setRunning(SESSION, false);
       const fixed = await call(srv, 'reconcile_task', { taskId: first.task.taskId, prompt: 'original text' });
       assert.equal(fixed.ok, true, JSON.stringify(fixed));
       assert.equal(fixed.reconciledBy, 'idempotent_reprompt');
@@ -234,6 +238,7 @@ test('T272: an unsettled task survives a server restart and still holds the sess
     const blocked = await call(srv, 'submit_task', { requestId: 't272-rest-0002', sessionId: SESSION, prompt: 'again' });
     assert.equal(blocked.code, 'session_busy', 'the lock survives the restart too');
 
+    fake.control.setRunning(SESSION, false);
     const settled = await call(srv, 'reconcile_task', { taskId, prompt: 'linger' });
     assert.equal(settled.ok, true, JSON.stringify(settled));
     assert.equal(fake.control.admissions().length, 1);

@@ -123,14 +123,14 @@ test('T271: a short token file is refused at load time', () => {
 
 test('T271: a session-controller object without the required methods is refused, and named', () => {
   const caps = describeCapabilities({ listSessions() {} });
-  assert.deepEqual(caps.missing, ['list', 'prompt', 'page'],
+  assert.deepEqual(caps.missing, ['list', 'prompt', 'page', 'projections'],
     '0.2.0-rc.2 exposes list/prompt/page; listSessions/getEvents never existed');
   assert.deepEqual(caps.legacyGuessPresent, ['listSessions'],
     'the names this build does have are reported, so the refusal explains itself');
   assert.throws(() => createSessionControllerAdapter({ listSessions() {} }), (err) => {
     assert.equal(err.code, 'host_capability_missing');
-    assert.deepEqual(err.details.missing, ['list', 'prompt', 'page']);
-    assert.deepEqual(err.details.required, ['list', 'prompt', 'page']);
+    assert.deepEqual(err.details.missing, ['list', 'prompt', 'page', 'projections']);
+    assert.deepEqual(err.details.required, ['list', 'prompt', 'page', 'projections']);
     return true;
   });
 });

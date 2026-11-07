@@ -152,12 +152,12 @@ export function startHostBridge({ adapter, token, port = 0, host = '127.0.0.1', 
         const sessionId = url.searchParams.get('sessionId');
         const requestId = url.searchParams.get('requestId');
         if (!sessionId) throw new DirectError(CODES.invalid_arguments, 'events needs `sessionId`');
-        const page = await target.getEvents({ sessionId, throughSeq: -1 });
-        const admission = requestId && typeof target.findAdmission === 'function'
-          ? await target.findAdmission({ sessionId, requestId }) : null;
+        const page = await target.getEvents({ sessionId, requestId });
+        // Admission, end reason, and answer must all come from the SAME exact history cut.
         return json(res, 200, { ok: true, host: name, protocol, events: page.events,
-          cursor: page.events.length ? page.events[page.events.length - 1].seq : null,
-          done: Boolean(page.assistantText), assistantText: page.assistantText || null, admission });
+          cursor: page.cursor ?? null, done: page.done === true && page.admission?.found === true,
+          assistantText: page.assistantText || null, admission: page.admission || null,
+          turnId: page.turnId ?? null, terminal: page.terminal ?? null });
       }
       if (req.method === 'GET' && url.pathname === '/admission') {
         const sessionId = url.searchParams.get('sessionId');
@@ -182,7 +182,7 @@ export function startHostBridge({ adapter, token, port = 0, host = '127.0.0.1', 
     // died mid-request can leave one behind -- which keeps the listener alive and, in a test process, keeps it from
     // exiting. Destroying tracked sockets makes `close()` mean "closed", not "asked to close".
     const sockets = new Set();
-    let closed = false;
+    let closing = null;
     const destroyAll = () => {
       for (const socket of sockets) socket.destroy();
       sockets.clear();
@@ -236,10 +236,9 @@ export function startHostBridge({ adapter, token, port = 0, host = '127.0.0.1', 
         // So: ask, destroy everything we know about, and fall back after 250 ms rather than wait on a FIN that may
         // never arrive. `openBridgeCount()` lets a caller (and a test) prove the listener was actually released.
         close: () => {
-          if (closed) return Promise.resolve();
-          closed = true;
+          if (closing) return closing;
           if (endpointFile) removeEndpointFile(endpointFile, id);
-          return new Promise((done) => {
+          closing = new Promise((done) => {
             let settled = false;
             const finish = () => {
               if (settled) return;
@@ -260,6 +259,7 @@ export function startHostBridge({ adapter, token, port = 0, host = '127.0.0.1', 
             }, 250);
             guard.unref?.();
           });
+          return closing;
         },
       });
     });
