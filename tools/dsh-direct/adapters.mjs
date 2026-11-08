@@ -84,7 +84,7 @@ export function createSessionControllerAdapter(candidate, { kind = 'cordis_sessi
     }
     // Validate even for an empty snapshot: undefined is not an implicit latest cursor.
     buildPageRequest({ sessionId, throughSeq, maxMessages });
-    const records = [];
+    let records = [];
     let beforeSeq;
     let hasMore = false;
     const MAX_HISTORY_PAGES = 32;
@@ -98,7 +98,9 @@ export function createSessionControllerAdapter(candidate, { kind = 'cordis_sessi
           || (page.hasMore && (page.records.length === 0 || first === 0))) {
         fail(CODES.host_error, 'session page was not a contiguous prefix of the requested cursor');
       }
-      records.unshift(...page.records);
+      // A message-aligned page can contain arbitrarily many non-message events.
+      // Do not turn its length into a function argument count (RangeError on large pages).
+      records = page.records.concat(records);
       hasMore = page.hasMore;
       const matched = correlateResult(records, requestId);
       if (!hasMore || (admissionOnly ? matched.admission.found : matched.turnId !== null)) break;

@@ -164,7 +164,7 @@ jobs:
       - name: dsh-direct portable contract and transport tests
         shell: bash
         run: |
-          for suite in test_t27*.mjs test_t285_restart_recovery.mjs; do
+          for suite in test_t27*.mjs test_t285_restart_recovery.mjs test_t287_history_allocations.mjs; do
             node --test --test-timeout=120000 "$suite" || exit $?
           done
 

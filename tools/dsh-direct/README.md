@@ -34,6 +34,20 @@ noninterrupted non-tool `assistant/message`, and a completed `turn/end`. Old rep
 The history search uses one fixed snapshot and at most 32 backward pages. Missing correlation or a completed turn with
 no final text does not become success; inspect `get_task` and history rather than sending another prompt.
 
+T287 removes two reproducible allocation hazards: message-aligned pages are prepended without spreading each event
+as a function argument, and the MCP client requests `/events?…&eventFormat=summary`. The Host then serializes only
+`{ seq, kind }` for each event, retaining the same correlated `assistantText`, `admission`, `turnId`, `terminal`,
+`cursor` and `done`. Full tool/result bodies are not needed by the collector. Legacy callers (no summary parameter)
+keep the existing payload; older Hosts ignore the new parameter and still work, without the allocation improvement.
+This is not a byte-bounded history API: the Host may materialize its Session prefix before paging, and a final answer
+or metadata for many events can still be large. The 32-page limit is not an event/byte limit or an OOM guarantee.
+
+These changes require the Host plugin's synced runtime modules to be deployed and loaded before their Host-side
+benefits apply. Publishing source or updating only the separate MCP process does not replace an already loaded plugin.
+Do not restart the Desktop hosting an active maintenance session; defer deployment to an explicitly approved window.
+The bounded synthetic regression uses 140,000 small records and a separate 1 MiB unused payload, not production
+history or heap-exhaustion experiments (`node --max-old-space-size=128 --test --test-timeout=20000 test_t287_history_allocations.mjs`).
+
 There is also no `events`/`state`/`wait` in rc.2 (those are master-only). The read path here is `page`, and the
 plugin does not pretend otherwise: `protocol` in every receipt says `dsh-api-session-controller@0.2.0-rc.2`.
 

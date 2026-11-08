@@ -181,8 +181,9 @@ export class HostClient {
   }
 
   async getEvents({ sessionId, requestId }) {
+    // Older Host bridges ignore this query and keep returning full events; both shapes remain valid.
     const query = '?sessionId=' + encodeURIComponent(sessionId)
-      + (requestId ? '&requestId=' + encodeURIComponent(requestId) : '');
+      + (requestId ? '&requestId=' + encodeURIComponent(requestId) : '') + '&eventFormat=summary';
     const body = await this.#request('GET', '/events' + query);
     return {
       events: Array.isArray(body.events) ? body.events : [],

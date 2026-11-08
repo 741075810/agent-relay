@@ -153,8 +153,12 @@ export function startHostBridge({ adapter, token, port = 0, host = '127.0.0.1', 
         const requestId = url.searchParams.get('requestId');
         if (!sessionId) throw new DirectError(CODES.invalid_arguments, 'events needs `sessionId`');
         const page = await target.getEvents({ sessionId, requestId });
+        // MCP collection needs only event identities/counts, not tool payloads already held by the Host.
+        // Opt-in preserves legacy clients. Project BEFORE JSON.stringify/UTF-8 conversion, not after transport.
+        const events = url.searchParams.get('eventFormat') === 'summary'
+          ? page.events.map(({ seq, kind }) => ({ seq, kind })) : page.events;
         // Admission, end reason, and answer must all come from the SAME exact history cut.
-        return json(res, 200, { ok: true, host: name, protocol, events: page.events,
+        return json(res, 200, { ok: true, host: name, protocol, events,
           cursor: page.cursor ?? null, done: page.done === true && page.admission?.found === true,
           assistantText: page.assistantText || null, admission: page.admission || null,
           turnId: page.turnId ?? null, terminal: page.terminal ?? null });
