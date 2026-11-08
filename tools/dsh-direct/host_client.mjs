@@ -42,7 +42,16 @@ export class HostClient {
     if (!baseUrl && !endpointFile) {
       fail(CODES.invalid_arguments, 'the client needs config.hostUrl or config.endpointFile', {});
     }
-    const initial = resolveEndpoint({ hostUrl: baseUrl, endpointFile });
+    let initial = null;
+    try {
+      initial = resolveEndpoint({ hostUrl: baseUrl, endpointFile });
+    } catch (err) {
+      // The Host removes its descriptor during a graceful restart. Discovery and
+      // ledger reads need no Host; keep stdio alive through that ENOENT gap only.
+      // Malformed descriptors, invalid locators and access failures still surface.
+      if (!(endpointFile && err instanceof DirectError && err.code === CODES.host_unreachable
+          && err.details?.reason === 'ENOENT')) throw err;
+    }
     this.locator = endpointFile ? { endpointFile } : { hostUrl: baseUrl };
     this.expected = { kind: expectKind || null, protocol: expectProtocol || null };
     this.tokenFile = tokenFile;
@@ -52,7 +61,7 @@ export class HostClient {
     this.kind = kind;
     this.protocol = null;
     this.endpoint = initial;
-    this.baseUrl = initial.base.replace(/\/+$/, '');
+    this.baseUrl = initial ? initial.base.replace(/\/+$/, '') : null;
     this.verified = false;
   }
 

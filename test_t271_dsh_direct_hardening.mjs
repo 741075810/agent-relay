@@ -233,8 +233,9 @@ test('T271: a task that was running when the server died comes back as unknown',
     assert.equal(after.task.unknownReason, 'process_restart');
     assert.ok(after.task.stages.some((stage) => stage.stage === 'recovered_as_unknown'));
     const result = await call(srv, 'get_result', { taskId });
-    assert.equal(result.ok, true, 'an unknown task is finished-with-unknown, not pending');
-    assert.equal(result.task.result, null);
+    assert.equal(result.ok, false, 'restart is not a terminal result; history is collected without a resend');
+    assert.equal(result.code, 'task_not_finished');
+    assert.equal((await call(srv, 'get_task', { taskId })).task.state, 'unknown');
   } finally {
     await srv.stop();
     await bridge.close();

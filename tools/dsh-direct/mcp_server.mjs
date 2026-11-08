@@ -23,7 +23,7 @@ import {
   validateListSessions, validateSubmitTask, validateTaskId,
 } from './protocol.mjs';
 import { HostClient } from './host_client.mjs';
-import { TaskStore, promptSha } from './store.mjs';
+import { TaskStore, isRecoverableUnknown, promptSha } from './store.mjs';
 import { precheckWorktree } from './worktree.mjs';
 
 /** Codes that mean "the Host answered, and the answer was no". Everything else is an unanswered call. */
@@ -267,15 +267,16 @@ export class DirectServer {
         admission: page.admission ? page.admission.found : null });
       // The bridge must join this exact requestId to an admitted user event and a completed same-turn terminal.
       // An old assistant message, an intermediate tool step, or an unrelated turn is never a successful result.
-      if (page.admission?.found === true && page.terminal && page.terminal.kind !== 'completed') {
-        return this.store.transition(taskId, 'failed', { turnId: page.turnId ?? task.turnId,
+      if (page.admission?.found === true && typeof page.turnId === 'string'
+          && page.terminal && page.terminal.kind !== 'completed') {
+        return this.store.transition(taskId, 'failed', { turnId: page.turnId, unknownReason: null,
           error: { code: CODES.host_refused, phase: 'host_turn', reason: page.terminal.kind },
           result: { text, cursor, admission: page.admission, terminal: page.terminal } });
       }
       if (page.done && page.admission?.found === true && page.terminal?.kind === 'completed'
           && typeof page.turnId === 'string') {
         return this.store.transition(taskId, 'succeeded', {
-          turnId: page.turnId ?? task.turnId,
+          turnId: page.turnId, unknownReason: null,
           result: { text, events: page.events.map((event) => ({ seq: event.seq, kind: event.kind })), cursor, polls: poll,
             admission: page.admission },
         });
@@ -298,7 +299,7 @@ export class DirectServer {
     if (!task) fail(CODES.task_not_found, 'no such task', { taskId });
     // A normal model answer outlives the three immediate polls in submit_task. Subsequent reads must refresh
     // history rather than consulting a permanently running ledger. This path never calls prompt/reconcile.
-    if (task.state === 'running') await this.#collect(taskId);
+    if (task.state === 'running' || isRecoverableUnknown(task)) await this.#collect(taskId);
     return { ok: true, task: this.#view(this.store.finished(taskId)) };
   }
 

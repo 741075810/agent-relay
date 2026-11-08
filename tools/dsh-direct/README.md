@@ -53,10 +53,17 @@ Therefore:
 | prompt accepted | `running` → `succeeded` or `failed` | held until correlated terminal | poll `get_result`; it refreshes history without another prompt |
 | Host explicitly refused (`session/writer-held`, `session/agent-busy`, `gateway/bad-request`, `session/not-found`, …) | `failed` | released | fix the cause, submit again |
 | no answer (`host_unreachable`, `host_error`, `cancelled`, `internal`) | **`unsettled`** | **kept** | `reconcile_task` |
-| process restart while active | `unknown` (`unknownReason: process_restart`) | kept | `get_task` |
+| process restart while active | `unknown` (`unknownReason: process_restart`) | kept | `get_result` reads exact request history; never sends a prompt |
 | process restart while `unsettled` | `unsettled` (unchanged) | kept | `reconcile_task` |
 
 `get_result` refuses an unsettled task with `task_unsettled`: an unknown outcome is not a result.
+A recovered `unknown/process_restart` retains the session lock and returns `task_not_finished` until history proves
+an admitted matching terminal. It needs no idle session, calls no prompt/reconcile path, and clears `unknownReason`
+only when that evidence settles the task. `get_task` remains a ledger-only read.
+
+A temporarily absent `endpointFile` (`ENOENT`) no longer prevents stdio discovery or ledger reads at startup.
+Host-dependent tools report `host_unreachable` until the descriptor returns, then re-read and identity-check it.
+Invalid locators/descriptors and identity mismatches still fail closed; no stale URL fallback or retry timer is added.
 
 `reconcile_task` then settles it in the cheapest correct order:
 

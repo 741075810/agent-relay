@@ -26,6 +26,16 @@ export function promptSha(prompt) {
   return createHash('sha256').update(prompt, 'utf8').digest('hex');
 }
 
+// A restart is not a terminal observation. Keep this predicate shared by collection,
+// result eligibility and locking so a recovery path never silently releases a session.
+export function isRecoverableUnknown(task) {
+  return task?.state === 'unknown' && task.unknownReason === 'process_restart';
+}
+
+function holdsSession(task) {
+  return ACTIVE_STATES.includes(task.state) || isRecoverableUnknown(task);
+}
+
 export class TaskStore {
   constructor(stateDir, now = () => Date.now()) {
     this.stateDir = stateDir;
@@ -97,7 +107,7 @@ export class TaskStore {
   }
 
   activeFor(sessionId) {
-    return this.doc.tasks.find((task) => task.sessionId === sessionId && ACTIVE_STATES.includes(task.state)) || null;
+    return this.doc.tasks.find((task) => task.sessionId === sessionId && holdsSession(task)) || null;
   }
 
   /**
@@ -172,7 +182,7 @@ export class TaskStore {
       fail(CODES.task_unsettled, 'the submission never got an answer; reconcile it with its requestId first', {
         taskId, requestId: task.requestId, stages: task.stages.length });
     }
-    if (ACTIVE_STATES.includes(task.state)) {
+    if (holdsSession(task)) {
       fail(CODES.task_not_finished, 'the task has not finished', { taskId, state: task.state,
         stages: task.stages.length });
     }
