@@ -156,6 +156,7 @@ jobs:
           test_t095b241_install_preflight
           test_t095b242_local_install_config
           test_t095b245_passive_observer
+          test_t286_ledger_read_lifetime
 
       - name: MCPB outbound client mock protocol tests
         run: node test_t095b259_mcpb_adapter.mjs

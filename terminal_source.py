@@ -148,7 +148,12 @@ def read_runs(path):
     """Validated runs. Strict: a changed shape is refused, never guessed at."""
     try:
         with open(path, 'r', encoding='utf-8') as handle:
-            runs = json.load(handle)
+            raw = handle.read()
+        # The Bridge publishes by rename(.tmp, ledger). Windows readers can deny
+        # that replacement. Release the file before CPU-heavy JSON parsing; the
+        # immutable bytes still describe one snapshot, not a second path read.
+        # This removes the parse-time lock, not all possible read-time contention.
+        runs = json.loads(raw)
     except (OSError, ValueError) as exc:
         raise SourceError('cannot read %s: %s' % (path, exc))
     if not isinstance(runs, list):
