@@ -332,6 +332,104 @@ test('T307: default-off raw-ledger guard precedes restored offline coordinator s
   }
 });
 
+test('T310: test-only storage barrier proves recovery and lease bytes before fake handoff', async () => {
+  const { createCoordinator, restore } = await import('./tools/continuation/coordinator.mjs');
+  const now = 100000;
+  const sessionId = 'offline-t310-session';
+  const tasks = [{ id: 'next', scope: 'offline-fixture', title: 'synthetic next' }];
+  const grant = { kind: 'continuation', epoch: 'offline-t310', sessionId,
+    armedAt: 1000, expiresAt: 200000, maxTasks: 2, scopes: ['offline-fixture'] };
+  const seed = createCoordinator({ sessionId, tasks, now: () => now });
+  assert.equal(seed.status().enabled, false);
+  await seed.enable(grant);
+  seed.poll({ ok: true, armEpoch: grant.epoch, count: 1, truncated: false,
+    candidates: [{ runId: 'aa11bb22-cc33-4d44-8e55-ff6677889902', status: 'completed',
+      origin: 'bridge', startedAt: 2, endedAtMs: 3000, postArm: true }] }, now);
+  const initial = seed.checkpoint();
+  const raw = JSON.stringify(row('settled', 'R1', 'done'));
+
+  // In-memory durable-store MODEL only. Exact readback is a model contract, not fsync proof.
+  function harness(mode, checkpoint = initial) {
+    let durable = null;
+    let submitted = 0;
+    let writes = 0;
+    let context;
+    const write = async bytes => {
+      writes += 1;
+      if (mode === 'throw') throw new Error('synthetic storage error');
+      if (mode === 'lost') return; // even an apparently successful write may lose bytes
+      durable = mode === 'torn' ? bytes.slice(0, -1) : bytes;
+    };
+    const co = restore(checkpoint, { sessionId, tasks, now: () => now,
+      bridge: { request: async request => {
+        const bytes = JSON.stringify({ ...context, checkpoint: co.checkpoint() });
+        const saved = JSON.parse(JSON.parse(bytes).checkpoint);
+        const job = saved.store.jobs[request.key];
+        assert.equal(job.state, 'leased');
+        assert.equal(job.taskId, request.taskId);
+        assert.equal(job.attempts, request.attempt);
+        await write(bytes);
+        if (durable !== bytes) throw new Error('checkpoint persistence unverified');
+        // The only outbound fake submit in this fixture occurs AFTER exact readback.
+        submitted += 1;
+        return mode === 'unknown' ? undefined : { outcome: 'ack' };
+      } } });
+    return { co, get durable() { return durable; }, get submitted() { return submitted; },
+      get writes() { return writes; },
+      async next({ enabled = false, tailText = raw, snapshot = goal() } = {}) {
+        if (enabled !== true) return { code: 'offline_barrier_disabled' };
+        if (typeof tailText !== 'string') return { code: 'raw_input_missing' };
+        const recovery = RC.assessRecovery({ goal: snapshot, plan: PLAN, tailText });
+        if (recovery.code !== RC.DECISION.RESUME_OK) return { code: 'recovery_refused', recovery };
+        // Clone at assessment time; no borrowed mutable authorization/ledger objects.
+        context = structuredClone({ tailText, goal: snapshot, plan: PLAN, recovery });
+        return co.step(now);
+      } };
+  }
+
+  const off = harness('ok');
+  const offBefore = off.co.checkpoint();
+  assert.equal((await off.next()).code, 'offline_barrier_disabled');
+  assert.equal(off.writes, 0);
+  assert.equal(off.submitted, 0);
+  assert.equal(off.co.checkpoint(), offBefore);
+  const unknownRaw = JSON.stringify(row('unfinished', 'R1', null));
+  assert.equal((await off.next({ enabled: true, tailText: unknownRaw })).code, 'recovery_refused');
+  assert.equal(off.writes, 0);
+  assert.equal(off.submitted, 0);
+  assert.equal(off.co.checkpoint(), offBefore);
+
+  for (const mode of ['throw', 'lost', 'torn']) {
+    const h = harness(mode);
+    assert.equal((await h.next({ enabled: true })).code, 'in_flight', mode);
+    assert.equal(h.submitted, 0, mode + ': persistence failure prevents fake submit');
+    assert.equal((await h.next({ enabled: true })).code, 'in_flight');
+    assert.equal(h.writes, 1, 'retained lease prevents silent retry after storage failure');
+    if (mode === 'torn') assert.throws(() => JSON.parse(h.durable), SyntaxError);
+  }
+  assert.throws(() => restore(initial.slice(0, -1), {
+    bridge: { request: () => assert.fail('torn checkpoint must never submit') },
+  }), SyntaxError);
+
+  const ok = harness('ok');
+  assert.equal((await ok.next({ enabled: true })).code, null);
+  assert.equal(ok.submitted, 1);
+  const persisted = JSON.parse(ok.durable);
+  assert.equal(persisted.tailText, raw);
+  assert.deepEqual(persisted.goal, goal());
+  assert.equal(persisted.recovery.code, RC.DECISION.RESUME_OK);
+
+  const unknown = harness('unknown');
+  assert.equal((await unknown.next({ enabled: true })).code, 'in_flight');
+  assert.equal(unknown.submitted, 1, 'first acceptance becomes unknown only after handoff');
+  const restart = harness('ok', JSON.parse(unknown.durable).checkpoint);
+  assert.equal((await restart.next({ enabled: true })).code, 'in_flight');
+  await restart.co.recover(now + 60001);
+  assert.equal((await restart.next({ enabled: true })).code, 'unknown_outcome');
+  assert.equal(restart.submitted, 0, 'unknown acceptance is never silently retried after restore');
+  assert.equal(restart.writes, 0);
+});
+
 test('T161-2: no goal is its own answer', () => {
   for (const bad of [null, {}, { id: '' }]) {
     assert.equal(RC.assessRecovery({ goal: bad }).code, 'goal_missing');
