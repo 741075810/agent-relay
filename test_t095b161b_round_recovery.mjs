@@ -252,6 +252,86 @@ test('T306: resume_ok advice is an assessment, not dispatch authority', () => {
   assert.match(out.steps.join(' '), /not dispatch authorization/i);
 });
 
+test('T307: default-off raw-ledger guard precedes restored offline coordinator step', async () => {
+  const { createCoordinator, restore } = await import('./tools/continuation/coordinator.mjs');
+  const now = 100000;
+  const sessionId = 'offline-t307-session';
+  const grant = { kind: 'continuation', epoch: 'offline-t307', sessionId,
+    armedAt: 1000, expiresAt: 200000, maxTasks: 2, scopes: ['offline-fixture'] };
+  const tasks = [{ id: 'fixture-next', scope: 'offline-fixture', title: 'synthetic next step' }];
+  const seed = createCoordinator({ sessionId, tasks, now: () => now });
+  assert.equal(seed.status().enabled, false);
+  assert.equal(await seed.enable(grant), null);
+  seed.poll({ ok: true, armEpoch: grant.epoch, count: 1, truncated: false,
+    candidates: [{ runId: 'aa11bb22-cc33-4d44-8e55-ff6677889901', status: 'completed',
+      origin: 'bridge', startedAt: 2, endedAtMs: 3000, postArm: true }] }, now);
+  const checkpoint = seed.checkpoint();
+
+  // Test-only integration seam. No exports, files, real transport, timer or driver.
+  // Missing raw input must not fall back to a caller's filtered records.
+  async function guardedStep(co, { enabled = false, tailText, goal: snapshot, plan }) {
+    if (enabled !== true) return { code: 'offline_guard_disabled' };
+    if (typeof tailText !== 'string' || !snapshot || typeof snapshot !== 'object') {
+      return { code: 'recovery_input_missing' };
+    }
+    let recovery;
+    try { recovery = RC.assessRecovery({ goal: snapshot, plan, tailText }); }
+    catch { return { code: 'recovery_assessment_error' }; }
+    if (recovery.code !== RC.DECISION.RESUME_OK) return { code: 'recovery_refused', recovery };
+    return { code: 'offline_step', recovery, next: await co.step(now) };
+  }
+
+  const clean = JSON.stringify(row('settled', 'R1', 'done'));
+  const unfinished = JSON.stringify(row('uncertain', 'R2', null,
+    { failure_code: 'desktop_host_exited', acceptance: 'unknown' }));
+  const cases = [
+    { label: 'default off', tailText: clean, enabled: undefined, code: 'offline_guard_disabled' },
+    { label: 'filtered-only', tailText: undefined, code: 'recovery_input_missing' },
+    { label: 'interior syntax', tailText: clean + '\n{bad\n' + clean, recovery: RC.DECISION.BLOCKED },
+    { label: 'interior non-object', tailText: clean + '\nnull\n' + clean, recovery: RC.DECISION.BLOCKED },
+    { label: 'torn tail', tailText: clean + '\n{"partial"', recovery: RC.DECISION.DISCARD_TAIL },
+    { label: 'unknown work', tailText: clean + '\n' + unfinished, recovery: RC.DECISION.FINISH_OPEN_FIRST },
+    { label: 'disarmed', tailText: clean, activation: 'disarmed', recovery: RC.DECISION.NEEDS_HUMAN_RESUME },
+    { label: 'malformed object', tailText: '{"revision":1}', recovery: RC.DECISION.PLAN_CHANGED },
+    { label: 'missing goal', tailText: clean, snapshot: {}, recovery: 'goal_missing' },
+    { label: 'clean', tailText: clean, allow: true },
+  ];
+  for (const fixture of cases) {
+    let submits = 0;
+    let steps = 0;
+    const co = restore(checkpoint, { sessionId, tasks, now: () => now,
+      bridge: { request: async () => { submits += 1; return { outcome: 'ack' }; } } });
+    const originalStep = co.step;
+    co.step = (...args) => { steps += 1; return originalStep(...args); };
+    const input = { enabled: true, goal: fixture.snapshot ?? goal({ activation: fixture.activation ?? 'armed' }),
+      plan: PLAN, records: [row('filtered', 'R1', 'done')], ...fixture };
+    const originalInput = structuredClone(input);
+    const before = co.checkpoint();
+    const stateBefore = structuredClone(co.state);
+    const out = await guardedStep(co, input);
+    assert.deepEqual(input, originalInput, fixture.label + ': raw input unchanged');
+    if (fixture.allow) {
+      assert.equal(out.recovery.code, RC.DECISION.RESUME_OK);
+      assert.equal(out.next.code, null);
+      assert.equal(steps, 1);
+      assert.equal(submits, 1, 'positive control must reach fake transport');
+      assert.notEqual(co.checkpoint(), before);
+    } else {
+      assert.equal(out.code, fixture.code ?? 'recovery_refused', fixture.label);
+      if (fixture.recovery) assert.equal(out.recovery.code, fixture.recovery, fixture.label);
+      if (fixture.label.startsWith('interior')) {
+        assert.equal(out.recovery.why, 'ledger_corrupt');
+        assert.deepEqual(fixture.label === 'interior syntax' ? out.recovery.unparsableLineIndexes
+          : out.recovery.invalidLineIndexes, [1]);
+      }
+      assert.equal(steps, 0, fixture.label + ': guard must precede step mutation');
+      assert.equal(submits, 0, fixture.label + ': no submit');
+      assert.equal(co.checkpoint(), before, fixture.label + ': checkpoint bytes preserved');
+      assert.deepEqual(co.state, stateBefore, fixture.label + ': no hidden state mutation');
+    }
+  }
+});
+
 test('T161-2: no goal is its own answer', () => {
   for (const bad of [null, {}, { id: '' }]) {
     assert.equal(RC.assessRecovery({ goal: bad }).code, 'goal_missing');
