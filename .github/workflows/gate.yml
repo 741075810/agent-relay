@@ -20,7 +20,15 @@ name: gate
 on:
   push:
     branches: [main, master]
+    # Diagnostics-only changes have their own bounded Windows mock workflow.
+    # Any other changed path (including this gate) still runs the full gate.
+    paths-ignore:
+      - 'tools/diagnostics/**'
+      - '.github/workflows/diagnostics.yml'
   pull_request:
+    paths-ignore:
+      - 'tools/diagnostics/**'
+      - '.github/workflows/diagnostics.yml'
   workflow_dispatch:
 
 jobs:
