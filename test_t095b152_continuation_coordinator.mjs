@@ -386,6 +386,46 @@ test('T262 coordinator captures task and session identity before awaited ACK', a
   assert.equal(out.dispatch.taskId, 'task-1'); assert.equal(out.dispatch.sessionId, SESSION);
   assert.deepEqual(co.state.used, ['task-1']); assert.equal(co.tasks[0].id, 'edited-unsubmitted-task-fixture');
 });
+test('T314: configured fake response has no authoritative identity fields', async () => {
+  const bridge = TB.createFakeBridge();
+  const request = { sessionId: SESSION, taskId: 'task-1', key: 'synthetic-key',
+    title: 'synthetic handoff', epoch: 'epoch-A', attempt: 1 };
+  bridge.script.push({ outcome: 'ack', sessionId: 'other-session', taskId: 'other-task',
+    key: 'other-key', attempt: 99 });
+  const reply = await bridge.request(request);
+  assert.deepEqual(reply, { outcome: 'ack', code: undefined });
+  for (const field of ['sessionId', 'taskId', 'key', 'attempt', 'epoch']) {
+    assert.equal(Object.hasOwn(reply, field), false, field + ' is not returned by configured fake');
+  }
+  assert.equal(bridge.calls[0].sessionId, SESSION);
+  assert.equal(bridge.calls[0].taskId, 'task-1');
+  assert.equal(bridge.calls[0].attempt, 1);
+});
+
+test('T314: legacy ACK settles captured request only and duplicate step does not submit', async () => {
+  const { co, bridge } = boot();
+  const requestFake = bridge.request.bind(bridge);
+  let captured;
+  co.bridge.request = async request => {
+    captured = request;
+    assert.equal(Object.isFrozen(request), true);
+    return requestFake(request); // actual configured response shape, no invented receipt fields
+  };
+  await co.enable(grant());
+  co.poll(listReply([completion(1)]), T0 + 1000);
+  const out = await co.step(T0 + 2000);
+  assert.equal(out.code, null);
+  const job = co.status().jobs[captured.key];
+  assert.equal(out.dispatch.sessionId, captured.sessionId);
+  assert.equal(out.dispatch.taskId, captured.taskId);
+  assert.equal(job.attempts, captured.attempt);
+  assert.equal(job.state, 'acked');
+  assert.deepEqual(co.state.used, [captured.taskId]);
+  assert.equal(co.status().tasksDone, 1, 'accepted handoffs, not upstream completed tasks');
+  assert.equal((await co.step(T0 + 3000)).code, 'no_events');
+  assert.equal(bridge.calls.length, 1);
+});
+
 test('T262 coordinator invalid clock retains source without any request', async () => {
   const { bridge, co } = boot(); await co.enable(grant()); co.poll(listReply([completion(1)]), T0);
   const before = co.checkpoint(); assert.equal((await co.step(NaN)).code, 'clock_unverified');
