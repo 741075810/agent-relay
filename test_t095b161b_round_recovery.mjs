@@ -749,7 +749,8 @@ test('T313: post-ACK crash window never replays a durably leased handoff', async
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
 
-test('T316: filesystem barrier plus bound receipts preserve uncertainty across fresh adapter restart', async () => {
+test('T316/T317: reusable offline boundary preserves uncertainty across fresh adapter restart', async () => {
+  const { createOfflineHandoff } = await import('./tools/continuation/offline_handoff.mjs');
   const fs = await import('node:fs/promises');
   const { tmpdir } = await import('node:os');
   const { createCoordinator, restore } = await import('./tools/continuation/coordinator.mjs');
@@ -761,7 +762,7 @@ test('T316: filesystem barrier plus bound receipts preserve uncertainty across f
   const deps = { sessionId: identity.sessionId, now: () => now,
     tasks: [{ id: 'next', scope: 'fixture', title: 'synthetic handoff' }] };
   try {
-    for (const mode of ['corrupt-ledger', 'storage-error', 'missing', 'mismatch', 'throw', 'unknown', 'lost-settlement', 'clean']) {
+    for (const mode of ['malformed', 'corrupt-ledger', 'storage-error', 'write-loss', 'missing', 'mismatch', 'throw', 'unknown', 'lost-settlement', 'clean']) {
       const directory = path.join(root, mode); await fs.mkdir(directory);
       const store = createOfflineCheckpointStore({ directory, identity, enabled: true,
         fault: stage => { if (mode === 'storage-error' && stage === 'after_write') throw new Error('fixture'); } });
@@ -770,7 +771,9 @@ test('T316: filesystem barrier plus bound receipts preserve uncertainty across f
         calls += 1; // entry counter, even if an assertion/throw later becomes unknown
         const disk = await store.read();
         assert.equal(disk.code, null);
-        assert.deepEqual(disk.envelope, envelope);
+        envelope = disk.envelope;
+        assert.equal(envelope.tailText, tailText);
+        assert.deepEqual(envelope.goal, goal());
         const lease = JSON.parse(disk.envelope.checkpoint).store.jobs[request.key];
         assert.equal(lease.state, 'leased');
         assert.equal(lease.attempts, request.attempt);
@@ -785,13 +788,11 @@ test('T316: filesystem barrier plus bound receipts preserve uncertainty across f
         return { outcome: 'ack', receipt: { version: 1, receiptId: 'synthetic-receipt',
           ...observedBinding, attempt: mode === 'mismatch' ? request.attempt + 1 : request.attempt } };
       } };
-      const adapter = createOfflineBoundReceiptAdapter({ enabled: true, transport });
-      const co = createCoordinator({ ...deps, bridge: { request: async request => {
-        envelope.checkpoint = co.checkpoint();
-        if ((await store.write(envelope)).code !== null) throw new Error('storage barrier');
-        assert.deepEqual((await store.read()).envelope, envelope);
-        return adapter.request(request);
-      } } });
+      const persistence = mode === 'write-loss' ? { read: () => store.read(),
+        write: async () => ({ code: null }) } : store;
+      const config = { identity, planDigest: OWN, store: persistence, transport };
+      const boundary = createOfflineHandoff({ ...config, enabled: true });
+      const co = createCoordinator({ ...deps, bridge: boundary.bridge });
       await co.enable({ kind: 'continuation', epoch: 't316', sessionId: identity.sessionId,
         armedAt: 1000, expiresAt: 200000, maxTasks: 2, scopes: ['fixture'] });
       co.poll({ ok: true, armEpoch: 't316', count: 1, truncated: false, candidates: [{
@@ -799,26 +800,26 @@ test('T316: filesystem barrier plus bound receipts preserve uncertainty across f
         startedAt: 2, endedAtMs: 3000, postArm: true }] }, now);
       const raw = JSON.stringify(row('settled', 'R1', 'done'));
       const tailText = mode === 'corrupt-ledger' ? raw + '\n{bad\n' + raw : raw;
-      async function start(enabled = false) {
-        if (enabled !== true) return { code: 'disabled' };
-        const recovery = RC.assessRecovery({ goal: goal(), plan: PLAN, tailText });
-        if (recovery.code !== RC.DECISION.RESUME_OK) return { code: 'recovery_refused' };
-        envelope = { version: 1, ...identity, tailText, goal: goal(), plan: PLAN, recovery };
-        return co.step(now);
-      }
-      assert.equal((await start()).code, 'disabled'); assert.equal(calls, 0);
+      const input = { tailText: mode === 'malformed' ? undefined : tailText, goal: goal(), plan: PLAN, at: now };
+      const disabled = createOfflineHandoff(config);
+      assert.equal((await disabled.step(co, input)).code, 'disabled'); assert.equal(calls, 0);
       const before = co.checkpoint();
-      const out = await start(true);
-      const preError = ['corrupt-ledger', 'storage-error'].includes(mode);
+      const out = await boundary.step(co, input);
+      assert.equal((await boundary.step(co, input)).code, 'offline_boundary_used');
+      const preError = ['malformed', 'corrupt-ledger', 'storage-error', 'write-loss'].includes(mode);
       assert.equal(calls, preError ? 0 : 1, mode);
       assert.equal(barrierChecks, calls, 'every actual transport entry saw a verified persisted lease');
-      assert.equal(out.code, mode === 'corrupt-ledger' ? 'recovery_refused'
+      assert.equal(out.code, mode === 'malformed' ? 'offline_input_invalid' : mode === 'corrupt-ledger' ? 'recovery_refused'
         : ['clean', 'lost-settlement'].includes(mode) ? null : 'in_flight');
-      if (mode === 'corrupt-ledger') {
+      if (['malformed', 'corrupt-ledger'].includes(mode)) {
         assert.equal(co.checkpoint(), before); assert.deepEqual(await fs.readdir(directory), []); continue;
       }
       if (mode === 'storage-error') {
         assert.equal((await store.read()).code, 'unsettled_write'); continue;
+      }
+      if (mode === 'write-loss') {
+        assert.equal((await store.read()).code, 'missing');
+        assert.equal((await co.step(now)).code, 'in_flight'); continue;
       }
       assert.equal(co.state.tasksDone, ['clean', 'lost-settlement'].includes(mode) ? 1 : 0);
       if (mode === 'clean') {
@@ -831,10 +832,10 @@ test('T316: filesystem barrier plus bound receipts preserve uncertainty across f
       const durable = await freshStore.read(); assert.equal(durable.code, null);
       assert.equal(durable.envelope.tailText, tailText);
       let restartCalls = 0;
-      const freshAdapter = createOfflineBoundReceiptAdapter({ enabled: true,
+      const freshBoundary = createOfflineHandoff({ enabled: true, identity, planDigest: OWN, store: freshStore,
         transport: { request: async () => { restartCalls += 1; return { outcome: 'unknown' }; } } });
-      const restarted = restore(durable.envelope.checkpoint, { ...deps, bridge: freshAdapter });
-      assert.equal((await restarted.step(now)).code, mode === 'clean' ? 'no_events' : 'in_flight');
+      const restarted = restore(durable.envelope.checkpoint, { ...deps, bridge: freshBoundary.bridge });
+      assert.equal((await freshBoundary.step(restarted, input)).code, mode === 'clean' ? 'no_events' : 'in_flight');
       if (mode !== 'clean') {
         await restarted.recover(now + 60001);
         assert.equal((await restarted.step(now + 60001)).code, 'unknown_outcome');
