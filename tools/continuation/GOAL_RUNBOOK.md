@@ -113,13 +113,14 @@ functions decide what the finished round left behind and whether another may sta
 
 ## 8. Surviving and reviewing a real run
 
-`tools/continuation/round_evidence.mjs` closes the three gaps a real run leaves behind. All of its
-functions take their input as arguments; none reads production state.
+`tools/continuation/round_evidence.mjs` provides offline evidence helpers. Its decision functions
+operate on supplied values; `readLedgerFile(file)` reads only the caller-specified file and returns
+the complete parser result. Do not point it at production history as part of these offline tests.
 
 | Function | What it answers |
 |---|---|
-| `recoverTail(text)` | which rounds survived a write that was cut off: complete lines are kept, a partial **last** line comes back as `torn`, and a broken line that is *not* last is reported as `unparsable` (corruption, not a tear) |
-| `openRounds(records)` | which rounds did not close — `no_outcome`, or an outcome other than `done`/`blocked`/`stop_and_report` for a task that never reached one |
+| `recoverTail(text)` | returns valid `records` plus `invalid` (non-object JSON), `unparsable` (syntax errors before the final physical line), and `torn` (unparsable final physical line); no file is rewritten |
+| `openRounds(records)` | each record without a terminal outcome stays open; another terminal record for the same task, including an older completion or conflicting duplicate, does not settle it |
 | `planDigestOf(plan)` | the same digest `goal_plan.mjs` prints, recomputed from the plan, so the two cannot disagree |
 | `verifyPlanBinding({records, plan})` | `ok`, or `plan_drift` naming the rounds recorded against a different plan, or `plan_missing` |
 | `buildEvidence({plan, records, commit, gates})` | one entry per round — task, outcome, gates, `recordDigest`, commit, and whether the task is even in the plan (`knownTask`) |
@@ -131,9 +132,23 @@ visible one: `out_of_plan:<round>:<task>`, `missing_record_digest:<round>`, `dup
 renderer prints `Problems:` whenever it is not -- so a done-looking round against a task the plan never
 had cannot close the run.
 
-A resumed run should call `recoverTail` on the ledger and stop on a non-empty `openRounds` before
-starting a new task; `verifyPlanBinding` returning `plan_drift` means the plan was edited mid-run and
-the operator must re-approve rather than let rounds continue under the old approval.
+For raw-ledger integrity, pass the original text as `assessRecovery({goal, plan, tailText})`.
+Do not pass only `recoverTail(text).records`: that projection discards evidence of rejected lines.
+The `records` input is for a complete, independently validated record set, not filtered survivors.
+`verifyPlanBinding` returning `plan_drift` still requires explicit re-approval; no helper creates it.
+
+The existing executable offline contract is `test_t095b161b_round_recovery.mjs`: T303 fixtures pass
+raw text directly into `assessRecovery`, assert `blocked / ledger_corrupt` and line indexes, and
+check input immutability and rejected-content non-disclosure. Clean-text and torn-tail-only controls
+remain covered. Run only that suite from the repository root:
+
+```powershell
+node --test --test-timeout=10000 test_t095b161b_round_recovery.mjs
+```
+
+No new adapter is needed to exercise this route. These synthetic strings do not read a ledger file,
+contact a Host/Bridge, or dispatch work. The decision reports zero-based diagnostic line indexes,
+not raw rejected content; retain the original text separately as evidence.
 
 ## 9. Proving a round came from the driver
 
@@ -156,22 +171,37 @@ no log was supplied so existence was never checked. The renderer prints `unverif
 
 ## 10. What to do after a restart
 
-`tools/continuation/round_recovery.mjs` decides, from artefacts, what a returning run may do next. One
-decision, and the steps that follow from it:
+`tools/continuation/round_recovery.mjs` returns an offline assessment, not authority to dispatch.
+The T304 repository audit found no non-test caller of `assessRecovery` or `readLedgerFile`.
+The non-test `recoverTail` calls are internal to those two helpers and preserve diagnostics.
+This is not evidence of deployed integration: external consumers and runtime wiring were not inspected.
+No helper resumes goals, clears ledgers, releases leases or calls a production service.
+
+Decision codes and conservative handling:
 
 | Decision | When | First step |
 |---|---|---|
-| `discard_tail` | the ledger's last line was cut off -- checked **before** `complete`, because completion may have been decided from a view missing that round | drop the torn line, keep the complete rounds, record the index |
-| `nothing_to_do` | the goal is `complete` | report the finished run |
-| `revision_drift` | a round ran under a newer goal revision than the goal now reports | stop; compare `roundsStarted`, do not re-run the round |
-| `plan_changed` | a round's `planDigest` differs from the approved plan | stop; re-approve, record the new digest |
-| `blocked` | the plan is missing, or a row cannot name its revision (`row_revision_missing`) | stop and report the code |
-| `finish_open_round_first` | any round has no terminal outcome | record how it ended before any new work |
-| `needs_human_resume` | the goal is `disarmed` | ask for `update_goal action=resume`; do not create a second goal |
-| `resume_ok` | armed, no open round, plan matches | let the driver start the next round; never start one by hand |
+| `blocked`, `why=ledger_corrupt` | parser reports invalid/non-object or unparsable interior lines, even alongside a torn tail or complete goal | preserve **all** original evidence; no deletion, rewrite, resume or retry |
+| `discard_tail` | only the final physical line is unparsable, with no other rejected lines; checked before complete | preserve the original first; the code is legacy repair advice, not an automatic file operation or dispatch permission; reconcile unknown work before any repair/reassessment |
+| `nothing_to_do` | goal is complete after raw-text integrity checks | no new round; this does not prove unknown upstream work settled |
+| `revision_drift` | a round claims a revision newer than the goal | stop; report the gap without replay |
+| `plan_changed` | plan digest differs | stop; retain evidence and require explicit re-approval |
+| `blocked` (other reasons) | missing plan or missing row revision | stop and report the specific reason |
+| `finish_open_round_first` | a record remains nonterminal | establish authoritative settlement, not a synthetic terminal record merely to clear this check |
+| `needs_human_resume` | goal is disarmed | remain stopped until explicit resume; do not create a replacement goal |
+| `resume_ok` | the helper's supplied inputs pass its checks | assessment only; not proof of runtime permission, upstream rejection or a runnable production driver |
 
-The order is the design: an unreadable tail beats every judgement, drift beats a plan mismatch, an open
-round beats "armed", and a disarmed goal beats "resume ok".
+With a valid goal, rejected-line corruption blocks first; otherwise torn-tail-only handling precedes
+complete. Revision drift precedes plan mismatch, open rounds precede activation, and disarmed never
+means automatic resume. A trailing newline makes an earlier syntax failure an interior failure;
+`torn` is a parser classification, not forensic proof of why a write ended.
+
+**Unknown accepted work:** `desktop_host_exited`, a lost callback or an unreadable record does not
+prove the upstream rejected the task. Do not automatically retry, clear history, release a lease,
+rearm a goal or discard uncommitted Git work. Existing step strings mentioning `stop_and_report`
+or dropping a tail must not be used to manufacture settlement or erase acceptance uncertainty.
+Preserve original session identity, consent and task history. Any future production integration needs
+its own authoritative reconciliation and authorization contract; this runbook does not enable one.
 
 ## 11. Files
 
