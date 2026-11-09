@@ -45,19 +45,17 @@ export function recoverTail(text) {
   return { records, torn, invalid, unparsable };
 }
 
-/** A round is open when it has no terminal outcome, or its outcome is `continue` for its task. */
+/** Each nonterminal record remains open; a task-level completion cannot settle another round. */
 export function openRounds(records, { terminalOutcomes = ['done', 'blocked', 'stop_and_report'] } = {}) {
   const terminal = new Set(terminalOutcomes);
   const open = [];
-  const closedTasks = new Set();
-  for (const row of Array.isArray(records) ? records : []) {
-    const outcome = row && row.outcome;
-    if (terminal.has(outcome)) closedTasks.add(row.taskId);
-  }
+  // Ledger rows are per-round evidence, not an ordered callback settlement protocol.
+  // A terminal row (even a conflicting duplicate) is no proof another record's
+  // unknown work ended. Preserve it for reconciliation; never infer last-write-wins.
   for (const row of Array.isArray(records) ? records : []) {
     if (!row || typeof row !== 'object') continue;
     if (!row.outcome) open.push({ roundId: row.roundId, taskId: row.taskId, why: 'no_outcome' });
-    else if (!terminal.has(row.outcome) && !closedTasks.has(row.taskId)) {
+    else if (!terminal.has(row.outcome)) {
       open.push({ roundId: row.roundId, taskId: row.taskId, why: 'outcome_' + row.outcome });
     }
   }

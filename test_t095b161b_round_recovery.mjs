@@ -132,6 +132,39 @@ test('T301: Host exit with no round outcome stays open despite stale duplicate c
   assert.deepEqual(out.open, ['new-round(no_outcome)']);
 });
 
+test('T302: another round terminal record cannot settle later nonterminal work', () => {
+  for (const outcome of ['continue', 'unknown', 'desktop_host_exited']) {
+    for (const closedOutcome of ['done', 'blocked', 'stop_and_report']) {
+      const older = row('older', 'R1', closedOutcome, { at: 1 });
+      const later = row('later', 'R1', outcome, { at: 2 });
+      for (const records of [[older, later], [later, older], [older, later, older]]) {
+        for (const activation of ['armed', 'disarmed']) {
+          const input = { goal: goal({ activation }), plan: PLAN, records };
+          const before = structuredClone(input);
+          assert.deepEqual(RE.openRounds(records), [
+            { roundId: 'later', taskId: 'R1', why: 'outcome_' + outcome },
+          ]);
+          assert.equal(RC.assessRecovery(input).code, RC.DECISION.FINISH_OPEN_FIRST);
+          assert.equal(RE.buildEvidence({ plan: PLAN, records }).complete, false);
+          assert.deepEqual(input, before);
+        }
+      }
+    }
+  }
+});
+
+test('T302: terminal-only rounds remain settled; conflicting duplicate stays conservative', () => {
+  const done = row('settled', 'R1', 'done');
+  assert.deepEqual(RE.openRounds([done, done]), []);
+  assert.equal(RC.assessRecovery({ goal: goal(), plan: PLAN, records: [done, done] }).code,
+    RC.DECISION.RESUME_OK);
+  const conflict = row('settled', 'R1', 'unknown');
+  for (const records of [[done, conflict], [conflict, done]]) {
+    assert.equal(RC.assessRecovery({ goal: goal(), plan: PLAN, records }).code,
+      RC.DECISION.FINISH_OPEN_FIRST);
+  }
+});
+
 test('T161-2: no goal is its own answer', () => {
   for (const bad of [null, {}, { id: '' }]) {
     assert.equal(RC.assessRecovery({ goal: bad }).code, 'goal_missing');
