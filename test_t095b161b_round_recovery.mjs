@@ -215,6 +215,43 @@ test('T303: clean raw ledgers still resume with blank lines, BOM and CRLF', () =
   assert.equal(result.ledgerRounds, 1);
 });
 
+test('T306: torn-tail advice preserves original evidence without deletion or dispatch', () => {
+  const input = { goal: goal(), plan: PLAN,
+    tailText: JSON.stringify(row('r1', 'R1', 'done')) + '\n{"unfinished"' };
+  const before = structuredClone(input);
+  const out = RC.assessRecovery(input);
+  assert.equal(out.code, RC.DECISION.DISCARD_TAIL);
+  const text = out.steps.join(' ');
+  assert.doesNotMatch(text, /drop the torn last line|after the drop/i);
+  assert.match(text, /preserve the original ledger/i);
+  assert.match(text, /do not delete or rewrite/i);
+  assert.match(text, /not permission to retry or dispatch/i);
+  assert.deepEqual(input, before);
+});
+
+test('T306: unknown work advice requires evidence rather than a synthetic terminal record', () => {
+  for (const activation of ['armed', 'disarmed']) {
+    const input = { goal: goal({ activation }), plan: PLAN,
+      records: [row('unknown-round', 'R1', null, { failure_code: 'desktop_host_exited' })] };
+    const before = structuredClone(input);
+    const out = RC.assessRecovery(input);
+    assert.equal(out.code, RC.DECISION.FINISH_OPEN_FIRST);
+    const text = RC.renderRecoveryMarkdown(out);
+    assert.doesNotMatch(text, /mark it stop_and_report|only then allow the next round/i);
+    assert.match(text, /authoritative settlement evidence/i);
+    assert.match(text, /do not invent a terminal outcome/i);
+    assert.match(text, /do not retry, release leases or rearm/i);
+    assert.deepEqual(input, before);
+  }
+});
+
+test('T306: resume_ok advice is an assessment, not dispatch authority', () => {
+  const out = RC.assessRecovery({ goal: goal(), plan: PLAN, records: [] });
+  assert.equal(out.code, RC.DECISION.RESUME_OK);
+  assert.doesNotMatch(out.steps.join(' '), /let the driver start/i);
+  assert.match(out.steps.join(' '), /not dispatch authorization/i);
+});
+
 test('T161-2: no goal is its own answer', () => {
   for (const bad of [null, {}, { id: '' }]) {
     assert.equal(RC.assessRecovery({ goal: bad }).code, 'goal_missing');

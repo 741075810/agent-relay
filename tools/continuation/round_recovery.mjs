@@ -25,17 +25,17 @@ export const DECISION = {
 const STEPS = {
   [DECISION.RESUME_OK]: [
     'verify the plan digest still matches the approved plan',
-    'let the driver start the next round; do not start one by hand',
+    'this offline assessment is not dispatch authorization; do not start one by hand',
   ],
   [DECISION.FINISH_OPEN_FIRST]: [
-    'record how the open round ended (done or stop_and_report) before any new work',
-    'if the round cannot be reconstructed, mark it stop_and_report with the reason instead of guessing',
-    'only then allow the next round',
+    'stop and require authoritative settlement evidence before any new work',
+    'preserve the ledger and report uncertainty; do not invent a terminal outcome to clear this check',
+    'desktop_host_exited does not prove rejection; do not retry, release leases or rearm on unknown acceptance',
   ],
   [DECISION.DISCARD_TAIL]: [
-    'drop the torn last line; keep every complete round ahead of it',
-    're-check for open rounds after the drop',
-    'record the torn line index in the run log so the loss is visible',
+    'stop and preserve the original ledger including the torn tail; keep every complete round',
+    'do not delete or rewrite evidence; report the torn line index and reconcile unknown work',
+    'discard_tail is a legacy classification, not permission to retry or dispatch; preserve leases and consent',
   ],
   [DECISION.NEEDS_HUMAN_RESUME]: [
     'stop: a disarmed goal does not continue on its own',

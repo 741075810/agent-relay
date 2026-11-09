@@ -198,8 +198,9 @@ means automatic resume. A trailing newline makes an earlier syntax failure an in
 
 **Unknown accepted work:** `desktop_host_exited`, a lost callback or an unreadable record does not
 prove the upstream rejected the task. Do not automatically retry, clear history, release a lease,
-rearm a goal or discard uncommitted Git work. Existing step strings mentioning `stop_and_report`
-or dropping a tail must not be used to manufacture settlement or erase acceptance uncertainty.
+rearm a goal or discard uncommitted Git work. T306 advisory regressions require original-tail
+preservation, authoritative settlement evidence and assessment-only `resume_ok` wording. The legacy
+`discard_tail` code remains for compatibility; it is not an instruction to delete evidence.
 Preserve original session identity, consent and task history. Any future production integration needs
 its own authoritative reconciliation and authorization contract; this runbook does not enable one.
 
