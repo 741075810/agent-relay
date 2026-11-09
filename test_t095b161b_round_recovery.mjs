@@ -430,6 +430,89 @@ test('T310: test-only storage barrier proves recovery and lease bytes before fak
   assert.equal(restart.writes, 0);
 });
 
+test('T311: isolated default-off filesystem checkpoints refuse ambiguous replacement', async () => {
+  const fs = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { createOfflineCheckpointStore, MAX_CHECKPOINT_BYTES } =
+    await import('./tools/continuation/offline_checkpoint_store.mjs');
+  const identity = { sessionId: 'offline-t311', goalId: 'synthetic-goal', goalRevision: 1 };
+  const envelope = { version: 1, ...identity, checkpoint: JSON.stringify({ version: 1,
+    sessionId: identity.sessionId, state: {}, store: {} }) };
+  const root = await fs.mkdtemp(path.join(tmpdir(), 't311-'));
+  let serial = 0;
+  const fresh = async () => {
+    const directory = path.join(root, String(++serial));
+    await fs.mkdir(directory);
+    return directory;
+  };
+  const make = (directory, extra = {}) => createOfflineCheckpointStore({ directory, identity,
+    enabled: true, ...extra });
+  try {
+    const directory = await fresh();
+    const off = make(directory, { enabled: false });
+    assert.equal((await off.write(envelope)).code, 'disabled');
+    assert.equal((await off.read()).code, 'disabled');
+    assert.deepEqual(await fs.readdir(directory), []);
+    const store = make(directory);
+    assert.equal((await store.read()).code, 'missing');
+    assert.equal((await store.write(envelope)).code, null);
+    assert.deepEqual((await make(directory).read()).envelope, envelope);
+    const replacement = { ...envelope, note: 'new' };
+    assert.equal((await store.write(replacement)).code, null);
+    assert.deepEqual((await make(directory).read()).envelope, replacement);
+    assert.deepEqual(await fs.readdir(directory), ['checkpoint.json']);
+    assert.equal((await make(directory, { identity: { ...identity, goalId: 'other' } }).read()).code,
+      'identity_mismatch');
+    await fs.writeFile(path.join(directory, 'checkpoint.json'), '{"version":');
+    assert.equal((await make(directory).read()).code, 'stored_json_invalid');
+    assert.equal(await fs.readFile(path.join(directory, 'checkpoint.json'), 'utf8'), '{"version":');
+
+    for (const stage of ['after_intent', 'after_write', 'before_rename', 'after_rename']) {
+      const dir = await fresh();
+      await make(dir).write(envelope);
+      const old = await fs.readFile(path.join(dir, 'checkpoint.json'), 'utf8');
+      const broken = make(dir, { fault: at => { if (at === stage) throw new Error('injected'); } });
+      assert.equal((await broken.write(replacement)).code, 'storage_error');
+      assert.equal((await broken.read()).code, 'unsettled_write');
+      assert.equal((await make(dir).read()).code, 'unsettled_write', stage + ': no old fallback');
+      assert.ok((await fs.readdir(dir)).includes('checkpoint.intent'));
+      if (stage !== 'after_rename') assert.equal(await fs.readFile(path.join(dir, 'checkpoint.json'), 'utf8'), old);
+    }
+    for (const invalid of [{ ...envelope, version: 2 }, { ...envelope, goalId: 'wrong' },
+      { ...envelope, checkpoint: '{bad' }, { ...envelope, checkpoint: JSON.stringify({ version: 2 }) },
+      { ...envelope, checkpoint: 'x'.repeat(MAX_CHECKPOINT_BYTES + 1) }]) {
+      const dir = await fresh();
+      await make(dir).write(envelope);
+      assert.notEqual((await make(dir).write(invalid)).code, null);
+      assert.equal((await make(dir).read()).code, 'unsettled_write');
+    }
+    const dir = await fresh();
+    await make(dir).write(envelope);
+    const file = path.join(dir, 'checkpoint.json');
+    const damaged = JSON.parse(await fs.readFile(file, 'utf8'));
+    damaged.payload += ' ';
+    await fs.writeFile(file, JSON.stringify(damaged));
+    assert.equal((await make(dir).read()).code, 'integrity_mismatch');
+    await fs.writeFile(file, Buffer.alloc(256 * 1024 + 1));
+    assert.equal((await make(dir).read()).code, 'file_size');
+    const mismatchDir = await fresh();
+    const mismatch = make(mismatchDir, { fault: async stage => {
+      if (stage === 'after_rename') await fs.writeFile(path.join(mismatchDir, 'checkpoint.json'), 'torn');
+    } });
+    assert.equal((await mismatch.write(envelope)).code, 'readback_mismatch');
+    assert.equal((await make(mismatchDir).read()).code, 'unsettled_write');
+    const corruptDir = await fresh();
+    await fs.writeFile(path.join(corruptDir, 'checkpoint.json'), 'original-corrupt');
+    assert.equal((await make(corruptDir).write(envelope)).code, 'stored_json_invalid');
+    assert.equal(await fs.readFile(path.join(corruptDir, 'checkpoint.json'), 'utf8'), 'original-corrupt');
+    const partialDir = await fresh();
+    await fs.writeFile(path.join(partialDir, 'checkpoint.pending'), 'partial');
+    assert.equal((await make(partialDir).read()).code, 'unsettled_write');
+  } finally {
+    await fs.rm(root, { recursive: true, force: true }); // only these synthetic fixtures
+  }
+});
+
 test('T161-2: no goal is its own answer', () => {
   for (const bad of [null, {}, { id: '' }]) {
     assert.equal(RC.assessRecovery({ goal: bad }).code, 'goal_missing');
