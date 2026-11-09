@@ -513,6 +513,139 @@ test('T311: isolated default-off filesystem checkpoints refuse ambiguous replace
   }
 });
 
+test('T312: real filesystem barrier composes raw recovery with offline coordinator', async () => {
+  const fs = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { createCoordinator, restore } = await import('./tools/continuation/coordinator.mjs');
+  const { createOfflineCheckpointStore } = await import('./tools/continuation/offline_checkpoint_store.mjs');
+  const now = 100000;
+  const identity = { sessionId: 'offline-t312', goalId: 'goal-x', goalRevision: 1 };
+  const tasks = [{ id: 'next', scope: 'fixture', title: 'synthetic next task' }];
+  const deps = { sessionId: identity.sessionId, tasks, now: () => now };
+  const seed = createCoordinator(deps);
+  await seed.enable({ kind: 'continuation', epoch: 't312', sessionId: identity.sessionId,
+    armedAt: 1000, expiresAt: 200000, maxTasks: 2, scopes: ['fixture'] });
+  seed.poll({ ok: true, armEpoch: 't312', count: 1, truncated: false, candidates: [{
+    runId: 'aa11bb22-cc33-4d44-8e55-ff6677889903', status: 'completed', origin: 'bridge',
+    startedAt: 2, endedAtMs: 3000, postArm: true }] }, now);
+  const initial = seed.checkpoint();
+  const clean = JSON.stringify(row('settled', 'R1', 'done'));
+  const root = await fs.mkdtemp(path.join(tmpdir(), 't312-'));
+  const storeAt = (directory, extra = {}) => createOfflineCheckpointStore({
+    directory, identity, enabled: true, ...extra });
+  const envelopeOf = checkpoint => ({ version: 1, ...identity, checkpoint });
+
+  // Test-local default-off seam, not a runtime driver. Trusted single-owner directory.
+  function harness(directory, checkpoint = initial, mode = 'clean') {
+    let submits = 0;
+    let steps = 0;
+    let storageCode = null;
+    let context;
+    let selected = checkpoint;
+    const store = storeAt(directory, {
+      identity: mode === 'identity' ? { ...identity, goalId: 'wrong' } : identity,
+      fault: async stage => {
+        if (mode === 'write' && stage === 'after_write') throw new Error('injected write failure');
+        if (mode === 'rename' && stage === 'before_rename') {
+          // Actual rename then fails because its source has gone; preserve bytes under another name.
+          await fs.rename(path.join(directory, 'checkpoint.pending'), path.join(directory, 'held.pending'));
+        }
+        if (mode === 'readback' && stage === 'after_rename') {
+          await fs.writeFile(path.join(directory, 'checkpoint.json'), '{torn');
+        }
+      },
+    });
+    const co = restore(checkpoint, { ...deps, bridge: { request: async request => {
+      const prospective = co.checkpoint();
+      const parsed = JSON.parse(prospective);
+      const lease = parsed.store.jobs[request.key];
+      assert.equal(parsed.sessionId, identity.sessionId);
+      assert.equal(lease.state, 'leased');
+      assert.equal(lease.taskId, request.taskId);
+      assert.equal(lease.attempts, request.attempt);
+      const envelope = { ...envelopeOf(prospective), ...context };
+      const written = await store.write(envelope);
+      storageCode = written.code;
+      if (written.code !== null) throw new Error('persistence refused');
+      const readback = await store.read();
+      if (readback.code !== null || JSON.stringify(readback.envelope) !== JSON.stringify(envelope)) {
+        throw new Error('readback refused');
+      }
+      selected = prospective;
+      submits += 1; // only outbound fake submit, AFTER actual filesystem write/readback
+      return mode === 'unknown' ? undefined : { outcome: 'ack' };
+    } } });
+    return { co, get submits() { return submits; }, get steps() { return steps; },
+      get storageCode() { return storageCode; },
+      async next({ enabled = false, tailText = clean, snapshot = goal() } = {}) {
+        if (enabled !== true) return { code: 'disabled' };
+        if (typeof tailText !== 'string') return { code: 'raw_missing' };
+        if (snapshot.id !== identity.goalId || snapshot.revision !== identity.goalRevision) {
+          return { code: 'goal_identity_mismatch' };
+        }
+        const recovery = RC.assessRecovery({ goal: snapshot, plan: PLAN, tailText });
+        if (recovery.code !== RC.DECISION.RESUME_OK) return { code: 'recovery_refused', recovery };
+        const prior = await store.read();
+        if (prior.code !== null) return { code: prior.code };
+        if (prior.envelope.checkpoint !== selected) return { code: 'stale_snapshot' };
+        context = structuredClone({ tailText, goal: snapshot, plan: PLAN, recovery });
+        steps += 1;
+        return co.step(now);
+      } };
+  }
+  try {
+    const cases = [
+      { mode: 'off', enabled: false, code: 'disabled' },
+      { mode: 'interior', tailText: clean + '\n{bad\n' + clean, code: 'recovery_refused' },
+      { mode: 'tail', tailText: clean + '\n{torn', code: 'recovery_refused' },
+      { mode: 'disarmed', snapshot: goal({ activation: 'disarmed' }), code: 'recovery_refused' },
+      { mode: 'unfinished', tailText: JSON.stringify(row('unknown', 'R1', null)), code: 'recovery_refused' },
+      { mode: 'identity', code: 'identity_mismatch' },
+      { mode: 'stale', code: 'stale_snapshot' },
+      { mode: 'write', code: 'in_flight' }, { mode: 'rename', code: 'in_flight' },
+      { mode: 'readback', code: 'in_flight' },
+      { mode: 'clean', code: null }, { mode: 'unknown', code: 'in_flight' },
+    ];
+    for (const fixture of cases) {
+      const directory = path.join(root, fixture.mode);
+      await fs.mkdir(directory);
+      const stored = fixture.mode === 'stale' ? JSON.stringify({ ...JSON.parse(initial), stale: true }) : initial;
+      assert.equal((await storeAt(directory).write(envelopeOf(stored))).code, null);
+      const beforeFile = await fs.readFile(path.join(directory, 'checkpoint.json'), 'utf8');
+      const h = harness(directory, initial, fixture.mode);
+      const beforeState = structuredClone(h.co.state);
+      const beforeCheckpoint = h.co.checkpoint();
+      const out = await h.next({ enabled: true, ...fixture });
+      assert.equal(out.code, fixture.code, fixture.mode);
+      const sent = ['clean', 'unknown'].includes(fixture.mode);
+      assert.equal(h.submits, sent ? 1 : 0, fixture.mode);
+      if (h.steps === 0) {
+        assert.equal(h.co.checkpoint(), beforeCheckpoint);
+        assert.deepEqual(h.co.state, beforeState);
+        assert.equal(await fs.readFile(path.join(directory, 'checkpoint.json'), 'utf8'), beforeFile);
+      }
+      if (['write', 'rename', 'readback'].includes(fixture.mode)) {
+        assert.equal(h.storageCode, fixture.mode === 'readback' ? 'readback_mismatch' : 'storage_error');
+        assert.equal((await storeAt(directory).read()).code, 'unsettled_write');
+        await h.next({ enabled: true });
+        assert.equal(h.submits, 0);
+      }
+      if (sent) {
+        const durable = await storeAt(directory).read();
+        assert.equal(durable.code, null);
+        assert.equal(durable.envelope.tailText, clean);
+        assert.equal(durable.envelope.recovery.code, RC.DECISION.RESUME_OK);
+        // Even a clean ACK not durably recorded must restore as uncertain, never as replay permission.
+        const restarted = harness(directory, durable.envelope.checkpoint);
+        assert.equal((await restarted.next({ enabled: true })).code, 'in_flight');
+        await restarted.co.recover(now + 60001);
+        assert.equal((await restarted.next({ enabled: true })).code, 'unknown_outcome');
+        assert.equal(restarted.submits, 0);
+      }
+    }
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
 test('T161-2: no goal is its own answer', () => {
   for (const bad of [null, {}, { id: '' }]) {
     assert.equal(RC.assessRecovery({ goal: bad }).code, 'goal_missing');
