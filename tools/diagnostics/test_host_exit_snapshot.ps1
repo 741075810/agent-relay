@@ -41,9 +41,14 @@ function Get-WinEvent {
             [System.Management.Automation.ErrorCategory]::ObjectNotFound,$null)
         throw $record
     }
-    1..9 | ForEach-Object {
+    if ($global:T299_eventMode -eq 'empty') { return }
+    $count = 9
+    if ($global:T299_eventMode -eq 'eight') { $count = 8 }
+    $provider = 'Application Error'
+    if ($global:T299_eventMode -eq 'untrusted') { $provider = 'SECRET_PROVIDER_PRIVATE_PATH' }
+    1..$count | ForEach-Object {
         [pscustomobject]@{Id=1000;RecordId=$_;TimeCreated=[datetime]'2026-01-01T00:02:00Z';
-            ProviderName='Application Error';Message='SECRET_TOKEN';Properties=@('PRIVATE_PATH')}
+            ProviderName=$provider;Message='SECRET_TOKEN';Properties=@('PRIVATE_PATH')}
     }
 }
 $params = @{TargetProcessId=4242;ExpectedCreatedUtc='2026-01-01T00:00:00Z';
@@ -88,4 +93,24 @@ Assert ($text -notmatch 'SECRET_TOKEN') 'errors_redacted'
 $global:T299_mode='normal';$global:T299_eventMode='normal'
 $r = & $subject @params -IncludeServiceEvents | ConvertFrom-Json
 Assert ($r.systemService.records.Count -eq 8) 'service_optin'
+$global:T299_eventMode='untrusted'
+$text = & $subject @params
+$r = $text | ConvertFrom-Json
+Assert (@($r.application.records | Where-Object { $_.provider -ne 'other_redacted' }).Count -eq 0) 'unknown_provider_redacted'
+Assert ($r.application.records.Count -eq 8) 'redaction_retains_metadata'
+Assert ($text -notmatch 'SECRET_PROVIDER|PRIVATE_PATH|SECRET_TOKEN') 'unknown_provider_no_leak'
+$global:T299_eventMode='eight'
+$r = & $subject @params | ConvertFrom-Json
+Assert ($r.application.state -eq 'ok' -and $r.application.records.Count -eq 8) 'exactly_eight_records'
+Assert (!$r.application.truncated) 'exactly_eight_not_truncated'
+$global:T299_eventMode='empty'
+$r = & $subject @params | ConvertFrom-Json
+Assert ($r.application.state -eq 'ok' -and $r.application.records.Count -eq 0) 'empty_success_records'
+Assert (!$r.application.truncated -and $r.cause -eq 'UNKNOWN') 'empty_not_oom_or_truncated'
+$global:T299_eventMode='normal'
+$wrongCreation=$params.Clone();$wrongCreation.ExpectedCreatedUtc='2026-01-01T00:00:01Z'
+$r = & $subject @wrongCreation | ConvertFrom-Json
+Assert ($r.processBefore.pid -eq 4242 -and $r.processAfter.pid -eq 4242) 'same_pid_both_samples'
+Assert ($r.processBefore.createdUtc -eq $r.processAfter.createdUtc) 'stable_but_wrong_creation'
+Assert ($r.identity -eq 'mismatch_or_pid_reused' -and $r.cause -eq 'UNKNOWN') 'wrong_expected_creation_not_match'
 Write-Output "PASS: $global:T299_checks assertions; all OS queries mocked"

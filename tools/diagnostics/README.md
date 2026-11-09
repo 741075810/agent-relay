@@ -32,4 +32,8 @@ No same-Host guard is claimed: external execution is an operating precondition, 
 powershell.exe -NoProfile -File .\tools\diagnostics\test_host_exit_snapshot.ps1
 ```
 
-All CIM and Event Log calls are function mocks; no production collection. Tests cover no-argument/invalid-input zero-query behavior, UTC/window limits, exact PID/property/query caps, identity continuity/reuse/absence, memory fields, event truncation, optional SCM selection, errors vs absence, redaction and JSON size. Run in a fresh short-lived shell (the mock test uses namespaced global counters). No Pester dependency.
+All CIM and Event Log calls are function mocks; no production collection. Tests cover no-argument/invalid-input zero-query behavior, UTC/window limits, exact PID/property/query caps, identity continuity/reuse/absence, memory fields, event truncation, optional SCM selection, errors vs absence, redaction and JSON size. Run in a fresh short-lived shell (the mock test uses namespaced global counters). No Pester dependency. Additional boundaries explicitly cover unknown-provider redaction, exactly eight records without truncation, a successful empty event result (distinct from an event-query error), and a stable PID whose creation timestamp differs from the expected identity.
+
+## Windows Actions
+
+The dedicated `diagnostics.yml` workflow runs this same mock script using Windows PowerShell on `windows-latest`, with a three-minute job timeout and read-only repository permissions. Push/PR path filters include only `tools/diagnostics/**` and that workflow. No OS production collection or external Host deployment occurs. Diagnostics-only changes skip the broad gate; mixed changes and edits to the broad gate itself still run it. Manual workflow dispatch remains available; no Python/Node dependencies or live Host are required.

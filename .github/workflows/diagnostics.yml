@@ -1,0 +1,28 @@
+name: diagnostics (windows mock)
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'tools/diagnostics/**'
+      - '.github/workflows/diagnostics.yml'
+  pull_request:
+    paths:
+      - 'tools/diagnostics/**'
+      - '.github/workflows/diagnostics.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mock:
+    runs-on: windows-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, existing repository pin
+        with:
+          persist-credentials: false
+      - name: Hermetic Windows PowerShell boundaries
+        shell: powershell
+        run: .\tools\diagnostics\test_host_exit_snapshot.ps1
