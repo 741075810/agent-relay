@@ -158,6 +158,9 @@ jobs:
           test_t095b245_passive_observer
           test_t286_ledger_read_lifetime
 
+      - name: binding health race regressions
+        run: node --test --test-timeout=10000 test_t291_binding_health_race.mjs
+
       - name: MCPB outbound client mock protocol tests
         run: node test_t095b259_mcpb_adapter.mjs
 

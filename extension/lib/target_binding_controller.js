@@ -86,6 +86,10 @@ export function createTargetBindingController(api, options = {}) {
     'candidate-' + now().toString(36) + '-' +
     Math.random().toString(36).slice(2, 12));
   const epochs = new Map();
+  // In-flight health checks must also detect clear/rebind ABA, even when every
+  // persisted identity field (including revision and millisecond) is reused.
+  // Worker-local only: a restarted worker has no old health promise to settle.
+  let bindingGeneration = {};
   let writeTail = Promise.resolve();
   const probeOptions = { now, timeoutMs: options.timeoutMs };
   // T095B76: health checks may repair a lost content script; candidate binds may not.
@@ -155,6 +159,7 @@ export function createTargetBindingController(api, options = {}) {
         return { save: false, value: { ok: false,
           status: 'binding_changed_before_clear', sendEligible: false } };
       }
+      bindingGeneration = {};
       return {
         state: Object.assign({}, initialState(), { revision: state.revision + 1 }),
         value: { ok: true, status: 'binding_cleared', sendEligible: false,
@@ -322,6 +327,7 @@ export function createTargetBindingController(api, options = {}) {
       }
       const record = createBindingRecord(snapshot, now(), expectedRevision + 1);
       if (!record.ok) return { save: false, value: record };
+      bindingGeneration = {};
       const next = Object.assign({}, latest, {
         revision: expectedRevision + 1,
         binding: record.binding,
@@ -370,6 +376,9 @@ export function createTargetBindingController(api, options = {}) {
   }
 
   async function health() {
+    // Capture before the asynchronous read, not after it: clear/rebind may run
+    // while storage returns a snapshot of the previous binding.
+    const generation = bindingGeneration;
     let state;
     try {
       state = await read();
@@ -391,26 +400,41 @@ export function createTargetBindingController(api, options = {}) {
     } catch (_err) {
       snapshot = { status: 'probe_unavailable' };
     }
-    if ((epochs.get(binding.tabId) || 0) !== epoch) {
-      await invalidate(binding.tabId, 'navigation_during_health_check');
-      const latest = await read();
-      return assessBindingHealth(latest.binding, null, now());
-    }
-    const latest = await read();
-    if (!latest.binding || latest.binding.revision !== binding.revision) {
-      return { ok: false, status: 'binding_changed_during_health_check',
-        sendEligible: false, accountIdentity: 'unverified' };
-    }
-    if (latest.binding.invalidatedReason) {
-      return assessBindingHealth(latest.binding, null, now());
-    }
-    const assessed = assessBindingHealth(latest.binding, snapshot, now());
-    if (assessed.status === 'binding_invalidated') {
-      await invalidate(binding.tabId, assessed.reason || 'binding_identity_mismatch');
-      const invalid = await read();
-      return assessBindingHealth(invalid.binding, null, now());
-    }
-    return assessed;
+    // Identity comparison, assessment and any invalidation share one serialized
+    // mutation. A separate read/check followed by invalidate(tabId) lets an old
+    // probe invalidate a freshly confirmed binding or erase its candidates.
+    return mutate((latest) => {
+      const current = latest.binding;
+      const sameBinding = current && generation === bindingGeneration &&
+        ['revision', 'boundAt', 'tabId', 'windowId', 'url', 'conversationId',
+          'documentInstanceId'].every(key => current[key] === binding[key]);
+      if (!sameBinding) {
+        return { save: false, value: { ok: false,
+          status: 'binding_changed_during_health_check',
+          sendEligible: false, accountIdentity: 'unverified' } };
+      }
+      if (current.invalidatedReason) {
+        return { save: false, value: assessBindingHealth(current, null, now()) };
+      }
+      const assessed = (epochs.get(binding.tabId) || 0) !== epoch
+        ? assessBindingHealth(current, null, now(), 'navigation_during_health_check')
+        : assessBindingHealth(current, snapshot, now());
+      if (assessed.status !== 'binding_invalidated') {
+        return { save: false, value: assessed };
+      }
+      // No epoch/candidate changes until the initiating binding matched inside
+      // the queue. Real browser event invalidation remains unconditional above.
+      epochs.set(binding.tabId, (epochs.get(binding.tabId) || 0) + 1);
+      const invalid = Object.assign({}, current, {
+        invalidatedReason: assessed.reason || 'binding_identity_mismatch',
+        invalidatedAt: now(),
+      });
+      return {
+        state: Object.assign({}, latest, { binding: invalid,
+          candidates: latest.candidates.filter(item => item.tabId !== binding.tabId) }),
+        value: assessBindingHealth(invalid, null, now()),
+      };
+    });
   }
 
   return {
