@@ -1,0 +1,43 @@
+name: recovery (offline Node)
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - '.github/workflows/recovery.yml'
+      - 'tools/continuation/**'
+      - 'test_t095b159_round_evidence.mjs'
+      - 'test_t095b160_round_faults.mjs'
+      - 'test_t095b160c_evidence_honesty.mjs'
+      - 'test_t095b161b_round_recovery.mjs'
+  pull_request:
+    paths:
+      - '.github/workflows/recovery.yml'
+      - 'tools/continuation/**'
+      - 'test_t095b159_round_evidence.mjs'
+      - 'test_t095b160_round_faults.mjs'
+      - 'test_t095b160c_evidence_honesty.mjs'
+      - 'test_t095b161b_round_recovery.mjs'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # existing repository pin
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # existing repository pin
+        with:
+          node-version: '24'
+      - name: Offline recovery and evidence regressions
+        run: >-
+          node --test --test-concurrency=1 --test-timeout=10000
+          test_t095b159_round_evidence.mjs
+          test_t095b160_round_faults.mjs
+          test_t095b160c_evidence_honesty.mjs
+          test_t095b161b_round_recovery.mjs
