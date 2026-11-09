@@ -106,6 +106,32 @@ test('T161-2: a ledger row that cannot name its revision blocks instead of passi
   assert.match(out.why, /row_revision_missing:r1/);
 });
 
+test('T301: Host exit with no round outcome stays open despite stale duplicate completion', () => {
+  // Synthetic ledger only: a transport failure is not proof the upstream rejected work.
+  // The older completion shares a task but does not settle this distinct open round.
+  const unfinished = row('new-round', 'R1', null, {
+    failure_code: 'desktop_host_exited', acceptance: 'unknown',
+  });
+  const stale = row('old-round', 'R1', 'done');
+  for (const activation of ['armed', 'disarmed']) {
+    for (const records of [
+      [unfinished, stale], [stale, unfinished],
+      [stale, unfinished, stale], [unfinished, stale, unfinished],
+    ]) {
+      const input = { goal: goal({ activation }), plan: PLAN, records };
+      const before = structuredClone(input);
+      const result = RC.assessRecovery(input);
+      assert.equal(result.code, RC.DECISION.FINISH_OPEN_FIRST);
+      assert.ok(result.open.includes('new-round(no_outcome)'));
+      assert.notEqual(result.code, RC.DECISION.RESUME_OK);
+      assert.deepEqual(input, before, 'assessment must not close/rewrite the ledger or rearm goal');
+    }
+  }
+  // A missing terminal callback must not be synthesized from the Host failure code.
+  const out = RC.assessRecovery({ goal: goal(), plan: PLAN, records: [unfinished] });
+  assert.deepEqual(out.open, ['new-round(no_outcome)']);
+});
+
 test('T161-2: no goal is its own answer', () => {
   for (const bad of [null, {}, { id: '' }]) {
     assert.equal(RC.assessRecovery({ goal: bad }).code, 'goal_missing');
