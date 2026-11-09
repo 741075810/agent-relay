@@ -749,6 +749,101 @@ test('T313: post-ACK crash window never replays a durably leased handoff', async
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
 
+test('T316: filesystem barrier plus bound receipts preserve uncertainty across fresh adapter restart', async () => {
+  const fs = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { createCoordinator, restore } = await import('./tools/continuation/coordinator.mjs');
+  const { createOfflineCheckpointStore } = await import('./tools/continuation/offline_checkpoint_store.mjs');
+  const { createOfflineBoundReceiptAdapter } = await import('./tools/continuation/offline_bound_receipt.mjs');
+  const root = await fs.mkdtemp(path.join(tmpdir(), 't316-'));
+  const now = 100000;
+  const identity = { sessionId: 'offline-t316', goalId: 'goal-x', goalRevision: 1 };
+  const deps = { sessionId: identity.sessionId, now: () => now,
+    tasks: [{ id: 'next', scope: 'fixture', title: 'synthetic handoff' }] };
+  try {
+    for (const mode of ['corrupt-ledger', 'storage-error', 'missing', 'mismatch', 'throw', 'unknown', 'lost-settlement', 'clean']) {
+      const directory = path.join(root, mode); await fs.mkdir(directory);
+      const store = createOfflineCheckpointStore({ directory, identity, enabled: true,
+        fault: stage => { if (mode === 'storage-error' && stage === 'after_write') throw new Error('fixture'); } });
+      let calls = 0, barrierChecks = 0, envelope, observedBinding;
+      const transport = { request: async request => {
+        calls += 1; // entry counter, even if an assertion/throw later becomes unknown
+        const disk = await store.read();
+        assert.equal(disk.code, null);
+        assert.deepEqual(disk.envelope, envelope);
+        const lease = JSON.parse(disk.envelope.checkpoint).store.jobs[request.key];
+        assert.equal(lease.state, 'leased');
+        assert.equal(lease.attempts, request.attempt);
+        assert.equal(lease.taskId, request.taskId);
+        assert.equal(disk.envelope.sessionId, request.sessionId);
+        barrierChecks += 1; // checked outside adapter too, so swallowed assertion is not a false PASS
+        observedBinding = { sessionId: request.sessionId, taskId: request.taskId,
+          key: request.key, epoch: request.epoch, attempt: request.attempt };
+        if (mode === 'throw') throw new Error('synthetic upstream uncertainty');
+        if (mode === 'missing') return { outcome: 'ack' };
+        if (mode === 'unknown') return { outcome: 'unknown' };
+        return { outcome: 'ack', receipt: { version: 1, receiptId: 'synthetic-receipt',
+          ...observedBinding, attempt: mode === 'mismatch' ? request.attempt + 1 : request.attempt } };
+      } };
+      const adapter = createOfflineBoundReceiptAdapter({ enabled: true, transport });
+      const co = createCoordinator({ ...deps, bridge: { request: async request => {
+        envelope.checkpoint = co.checkpoint();
+        if ((await store.write(envelope)).code !== null) throw new Error('storage barrier');
+        assert.deepEqual((await store.read()).envelope, envelope);
+        return adapter.request(request);
+      } } });
+      await co.enable({ kind: 'continuation', epoch: 't316', sessionId: identity.sessionId,
+        armedAt: 1000, expiresAt: 200000, maxTasks: 2, scopes: ['fixture'] });
+      co.poll({ ok: true, armEpoch: 't316', count: 1, truncated: false, candidates: [{
+        runId: 'aa11bb22-cc33-4d44-8e55-ff6677889905', status: 'completed', origin: 'bridge',
+        startedAt: 2, endedAtMs: 3000, postArm: true }] }, now);
+      const raw = JSON.stringify(row('settled', 'R1', 'done'));
+      const tailText = mode === 'corrupt-ledger' ? raw + '\n{bad\n' + raw : raw;
+      async function start(enabled = false) {
+        if (enabled !== true) return { code: 'disabled' };
+        const recovery = RC.assessRecovery({ goal: goal(), plan: PLAN, tailText });
+        if (recovery.code !== RC.DECISION.RESUME_OK) return { code: 'recovery_refused' };
+        envelope = { version: 1, ...identity, tailText, goal: goal(), plan: PLAN, recovery };
+        return co.step(now);
+      }
+      assert.equal((await start()).code, 'disabled'); assert.equal(calls, 0);
+      const before = co.checkpoint();
+      const out = await start(true);
+      const preError = ['corrupt-ledger', 'storage-error'].includes(mode);
+      assert.equal(calls, preError ? 0 : 1, mode);
+      assert.equal(barrierChecks, calls, 'every actual transport entry saw a verified persisted lease');
+      assert.equal(out.code, mode === 'corrupt-ledger' ? 'recovery_refused'
+        : ['clean', 'lost-settlement'].includes(mode) ? null : 'in_flight');
+      if (mode === 'corrupt-ledger') {
+        assert.equal(co.checkpoint(), before); assert.deepEqual(await fs.readdir(directory), []); continue;
+      }
+      if (mode === 'storage-error') {
+        assert.equal((await store.read()).code, 'unsettled_write'); continue;
+      }
+      assert.equal(co.state.tasksDone, ['clean', 'lost-settlement'].includes(mode) ? 1 : 0);
+      if (mode === 'clean') {
+        const acked = { ...envelope, checkpoint: co.checkpoint() };
+        assert.equal(JSON.parse(acked.checkpoint).store.jobs[observedBinding.key].state, 'acked');
+        assert.equal((await store.write(acked)).code, null);
+        assert.deepEqual((await store.read()).envelope, acked); // handoff bookkeeping, NOT task completion
+      }
+      const freshStore = createOfflineCheckpointStore({ directory, identity, enabled: true });
+      const durable = await freshStore.read(); assert.equal(durable.code, null);
+      assert.equal(durable.envelope.tailText, tailText);
+      let restartCalls = 0;
+      const freshAdapter = createOfflineBoundReceiptAdapter({ enabled: true,
+        transport: { request: async () => { restartCalls += 1; return { outcome: 'unknown' }; } } });
+      const restarted = restore(durable.envelope.checkpoint, { ...deps, bridge: freshAdapter });
+      assert.equal((await restarted.step(now)).code, mode === 'clean' ? 'no_events' : 'in_flight');
+      if (mode !== 'clean') {
+        await restarted.recover(now + 60001);
+        assert.equal((await restarted.step(now + 60001)).code, 'unknown_outcome');
+      }
+      assert.equal(restartCalls, 0, mode + ': persisted state blocks send with empty adapter latch');
+    }
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
 test('T161-2: no goal is its own answer', () => {
   for (const bad of [null, {}, { id: '' }]) {
     assert.equal(RC.assessRecovery({ goal: bad }).code, 'goal_missing');
