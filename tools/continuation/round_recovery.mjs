@@ -59,7 +59,8 @@ const STEPS = {
 
 /**
  * `tailText` is the raw ledger text, so a torn write is visible. `records` may be passed instead for
- * callers that already read the file.
+ * callers with a complete validated record set. Passing only recoverTail().records loses
+ * rejected-line evidence; use tailText when assessing raw ledger integrity.
  */
 export function assessRecovery({ goal, tailText, records, plan, planDigest, commits = [] }) {
   if (!goal || typeof goal !== 'object' || !goal.id) return { code: 'goal_missing', steps: [] };
@@ -69,8 +70,19 @@ export function assessRecovery({ goal, tailText, records, plan, planDigest, comm
     const tail = recoverTail(tailText);
     rows = tail.records;
     torn = tail.torn;
+    // Valid survivors are not a complete ledger when other lines were rejected.
+    // Block before completion/torn-tail advice; never suggest deleting evidence
+    // to turn an unknown interior round into permission to resume.
+    if (tail.invalid.length > 0 || tail.unparsable.length > 0) {
+      return { code: DECISION.BLOCKED, why: 'ledger_corrupt', goalId: goal.id,
+        steps: ['stop and preserve the entire ledger; do not drop or rewrite rejected lines',
+          'reconcile the missing round evidence before any resume or retry'],
+        invalidLineIndexes: tail.invalid.map((item) => item.lineIndex),
+        unparsableLineIndexes: tail.unparsable.map((item) => item.lineIndex),
+        tornLineIndex: torn ? torn.lineIndex : null, keptRounds: rows.length };
+    }
   }
-  // A torn tail is reported before anything else, including before "the goal is complete": completion
+  // Without interior corruption, a torn tail precedes even "the goal is complete": completion
   // may have been decided from a view that was missing its last round.
   if (torn) {
     return { code: DECISION.DISCARD_TAIL, steps: STEPS[DECISION.DISCARD_TAIL], goalId: goal.id,

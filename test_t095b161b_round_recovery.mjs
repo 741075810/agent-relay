@@ -1,6 +1,6 @@
 // T095B161 round 2: recovery decisions, from the states that actually appear after a restart.
 //
-// The order of these checks is the whole point: a torn tail outranks everything (you cannot judge rounds
+// Interior corruption blocks first; otherwise a torn tail outranks other decisions (you cannot judge rounds
 // you cannot read), revision drift outranks a plan mismatch (an edited goal invalidates the approval
 // itself), an open round outranks "the goal is armed" (otherwise the next round overlaps half-done work),
 // and a disarmed goal outranks "resume ok" (the driver will not run).
@@ -163,6 +163,56 @@ test('T302: terminal-only rounds remain settled; conflicting duplicate stays con
     assert.equal(RC.assessRecovery({ goal: goal(), plan: PLAN, records }).code,
       RC.DECISION.FINISH_OPEN_FIRST);
   }
+});
+
+test('T303: interior syntax errors block recovery instead of disappearing from valid rows', () => {
+  const tailText = [JSON.stringify(row('r1', 'R1', 'done')), '{broken-secret',
+    JSON.stringify(row('r2', 'R2', 'done'))].join('\n');
+  const parsed = RE.recoverTail(tailText);
+  assert.equal(parsed.records.length, 2);
+  assert.equal(parsed.unparsable[0].lineIndex, 1);
+  const input = { goal: goal(), plan: PLAN, tailText };
+  const before = structuredClone(input);
+  const result = RC.assessRecovery(input);
+  assert.equal(result.code, RC.DECISION.BLOCKED);
+  assert.equal(result.why, 'ledger_corrupt');
+  assert.deepEqual(result.unparsableLineIndexes, [1]);
+  assert.deepEqual(result.invalidLineIndexes, []);
+  assert.equal(result.keptRounds, 2);
+  assert.ok(!JSON.stringify(result).includes('broken-secret'));
+  assert.deepEqual(input, before);
+});
+
+test('T303: valid JSON non-round lines block active and complete goals', () => {
+  for (const invalid of ['null', '42', 'true', '"secret-value"', '[]']) {
+    for (const phase of ['active', 'complete']) {
+      const tailText = [JSON.stringify(row('r1', 'R1', 'done')), invalid,
+        JSON.stringify(row('r2', 'R2', 'done'))].join('\r\n');
+      const result = RC.assessRecovery({ goal: goal({ phase }), plan: PLAN, tailText });
+      assert.equal(result.code, RC.DECISION.BLOCKED);
+      assert.equal(result.why, 'ledger_corrupt');
+      assert.deepEqual(result.invalidLineIndexes, [1]);
+      assert.deepEqual(result.unparsableLineIndexes, []);
+    }
+  }
+});
+
+test('T303: corruption plus torn tail preserves evidence rather than suggesting a drop', () => {
+  const tailText = [JSON.stringify(row('r1', 'R1', 'done')), 'null', '{bad',
+    JSON.stringify(row('r2', 'R2', 'done')), '{torn'].join('\n');
+  const result = RC.assessRecovery({ goal: goal(), plan: PLAN, tailText });
+  assert.equal(result.code, RC.DECISION.BLOCKED);
+  assert.deepEqual(result.invalidLineIndexes, [1]);
+  assert.deepEqual(result.unparsableLineIndexes, [2]);
+  assert.equal(result.tornLineIndex, 4);
+  assert.match(result.steps.join(' '), /preserve/i);
+});
+
+test('T303: clean raw ledgers still resume with blank lines, BOM and CRLF', () => {
+  const tailText = '\uFEFF' + JSON.stringify(row('r1', 'R1', 'done')) + '\r\n\r\n';
+  const result = RC.assessRecovery({ goal: goal(), plan: PLAN, tailText });
+  assert.equal(result.code, RC.DECISION.RESUME_OK);
+  assert.equal(result.ledgerRounds, 1);
 });
 
 test('T161-2: no goal is its own answer', () => {
