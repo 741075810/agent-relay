@@ -646,6 +646,109 @@ test('T312: real filesystem barrier composes raw recovery with offline coordinat
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
 
+test('T313: post-ACK crash window never replays a durably leased handoff', async () => {
+  const fs = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { createCoordinator, restore } = await import('./tools/continuation/coordinator.mjs');
+  const { createOfflineCheckpointStore } = await import('./tools/continuation/offline_checkpoint_store.mjs');
+  const root = await fs.mkdtemp(path.join(tmpdir(), 't313-'));
+  const now = 100000;
+  const identity = { sessionId: 'offline-t313', goalId: 'goal-x', goalRevision: 1 };
+  const deps = { sessionId: identity.sessionId, now: () => now,
+    tasks: [{ id: 'next', scope: 'fixture', title: 'synthetic handoff' }] };
+  const tailText = JSON.stringify(row('settled', 'R1', 'done'));
+  const recovery = RC.assessRecovery({ goal: goal(), plan: PLAN, tailText });
+  assert.equal(recovery.code, RC.DECISION.RESUME_OK);
+  const at = (directory, fault) => createOfflineCheckpointStore({ directory, identity, enabled: true, fault });
+  const pack = checkpoint => ({ version: 1, ...identity, checkpoint, tailText, goal: goal(), plan: PLAN, recovery });
+  try {
+    for (const mode of ['lost-before-write', 'throw-terminal-write', 'corrupt-terminal', 'wrong-session', 'wrong-attempt', 'clean']) {
+      const directory = path.join(root, mode);
+      await fs.mkdir(directory);
+      let submits = 0;
+      let requestSeen;
+      let ack;
+      const co = createCoordinator({ ...deps, bridge: { request: async request => {
+        requestSeen = { ...request };
+        const prospective = pack(co.checkpoint());
+        assert.equal(JSON.parse(prospective.checkpoint).store.jobs[request.key].state, 'leased');
+        assert.equal((await at(directory).write(prospective)).code, null);
+        assert.deepEqual((await at(directory).read()).envelope, prospective);
+        submits += 1;
+        ack = { outcome: 'ack', sessionId: request.sessionId, key: request.key, attempt: request.attempt };
+        if (mode === 'wrong-session') ack.sessionId = 'other';
+        if (mode === 'wrong-attempt') ack.attempt += 1;
+        // Test-local identity check: coordinator itself does not authenticate reply fields.
+        if (ack.sessionId !== request.sessionId || ack.key !== request.key || ack.attempt !== request.attempt) {
+          return undefined;
+        }
+        return ack;
+      } } });
+      await co.enable({ kind: 'continuation', epoch: 't313', sessionId: identity.sessionId,
+        armedAt: 1000, expiresAt: 200000, maxTasks: 2, scopes: ['fixture'] });
+      co.poll({ ok: true, armEpoch: 't313', count: 1, truncated: false, candidates: [{
+        runId: 'aa11bb22-cc33-4d44-8e55-ff6677889904', status: 'completed', origin: 'bridge',
+        startedAt: 2, endedAtMs: 3000, postArm: true }] }, now);
+      async function guardedStart(enabled = false) {
+        if (enabled !== true) return { code: 'disabled' };
+        if (recovery.code !== RC.DECISION.RESUME_OK) return { code: 'recovery_refused' };
+        return co.step(now);
+      }
+      assert.equal((await guardedStart()).code, 'disabled');
+      assert.equal(submits, 0);
+      const out = await guardedStart(true);
+      assert.equal(submits, 1);
+      const mismatch = mode.startsWith('wrong-');
+      assert.equal(out.code, mismatch ? 'in_flight' : null);
+      const key = requestSeen.key;
+      if (!mismatch) assert.equal(co.state.store.jobs[key].state, 'acked');
+      let closed = false;
+      if (['throw-terminal-write', 'corrupt-terminal', 'clean'].includes(mode)) {
+        // Persist only the real coordinator's generated acked checkpoint; never invent done/history.
+        const terminal = pack(co.checkpoint());
+        const job = JSON.parse(terminal.checkpoint).store.jobs[key];
+        assert.equal(job.state, 'acked');
+        assert.equal(job.attempts, ack.attempt);
+        assert.equal(job.taskId, requestSeen.taskId);
+        assert.equal(co.state.tasksDone, 1); // handoffs, NOT authoritative upstream task completion
+        const storage = at(directory, async stage => {
+          if (mode === 'throw-terminal-write' && stage === 'after_write') throw new Error('terminal write failed');
+          if (mode === 'corrupt-terminal' && stage === 'after_rename') {
+            await fs.writeFile(path.join(directory, 'checkpoint.json'), '{corrupt');
+          }
+        });
+        const saved = await storage.write(terminal);
+        if (saved.code === null) {
+          const readback = await storage.read();
+          assert.deepEqual(readback.envelope, terminal);
+          closed = readback.code === null;
+        } else assert.equal(saved.code, mode === 'corrupt-terminal' ? 'readback_mismatch' : 'storage_error');
+      }
+      assert.equal(closed, mode === 'clean', 'closure only after verified ACK checkpoint readback');
+      const durable = await at(directory).read();
+      let restartSubmits = 0;
+      if (['throw-terminal-write', 'corrupt-terminal'].includes(mode)) {
+        assert.equal(durable.code, 'unsettled_write'); // refuse restore; no old fallback
+      } else {
+        assert.equal(durable.code, null);
+        const restored = restore(durable.envelope.checkpoint, { ...deps,
+          bridge: { request: async () => { restartSubmits += 1; return { outcome: 'ack' }; } } });
+        assert.equal((await restored.step(now)).code, closed ? 'no_events' : 'in_flight');
+        if (!closed) {
+          await restored.recover(now + 60001);
+          assert.equal((await restored.step(now + 60001)).code, 'unknown_outcome');
+        } else {
+          const before = restored.checkpoint();
+          assert.equal((await restored.step(now)).code, 'no_events'); // duplicate delivery opportunity
+          assert.equal(restored.checkpoint(), before);
+          assert.equal(restored.state.tasksDone, 1);
+        }
+      }
+      assert.equal(restartSubmits, 0, mode + ': never duplicate the accepted handoff');
+    }
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
 test('T161-2: no goal is its own answer', () => {
   for (const bad of [null, {}, { id: '' }]) {
     assert.equal(RC.assessRecovery({ goal: bad }).code, 'goal_missing');
