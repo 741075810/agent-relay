@@ -426,6 +426,71 @@ test('T314: legacy ACK settles captured request only and duplicate step does not
   assert.equal(bridge.calls.length, 1);
 });
 
+test('T315: opt-in bound receipt adapter rejects incomplete and conflicting evidence', async () => {
+  const { createOfflineBoundReceiptAdapter: adapter, assessBoundReceipt } =
+    await import('./tools/continuation/offline_bound_receipt.mjs');
+  const request = { sessionId: 'synthetic-session', taskId: 'synthetic-task', key: 'key-one',
+    epoch: 'synthetic-epoch', attempt: 1, title: 'synthetic request' };
+  // Caller-supplied synthetic receipt; equality here is NOT authentication.
+  const reply = { outcome: 'ack', receipt: { version: 1, receiptId: 'receipt-one',
+    sessionId: 'synthetic-session', taskId: 'synthetic-task', key: 'key-one',
+    epoch: 'synthetic-epoch', attempt: 1 } };
+  assert.deepEqual(assessBoundReceipt(request, reply), { outcome: 'ack' });
+  const negatives = [null, { outcome: 'ack' }, { outcome: 'failed' },
+    { ...reply, receipt: { ...reply.receipt, version: 2 } },
+    { ...reply, receipt: { ...reply.receipt, receiptId: '' } }];
+  for (const field of ['sessionId', 'taskId', 'key', 'epoch', 'attempt']) {
+    negatives.push({ ...reply, receipt: { ...reply.receipt, [field]: field === 'attempt' ? 2 : 'other' } });
+    const missing = structuredClone(reply); delete missing.receipt[field]; negatives.push(missing);
+  }
+  let disabledCalls = 0;
+  const off = adapter({ transport: { request: async () => { disabledCalls += 1; return reply; } } });
+  assert.equal((await off.request(request)).outcome, 'unknown'); assert.equal(disabledCalls, 0);
+  for (const response of negatives) {
+    let calls = 0;
+    const bound = adapter({ enabled: true, transport: { request: async sent => {
+      assert.equal(Object.isFrozen(sent), true); calls += 1; return response;
+    } } });
+    assert.equal((await bound.request(request)).outcome, 'unknown');
+    assert.equal((await bound.request({ ...request, attempt: 2 })).code, 'duplicate_or_conflicting_request');
+    assert.equal(calls, 1, 'unknown receipt never triggers a second submission');
+  }
+  let resolve;
+  let calls = 0;
+  const bound = adapter({ enabled: true, transport: { request: () => {
+    calls += 1; return new Promise(done => { resolve = done; });
+  } } });
+  const pending = bound.request(request);
+  assert.equal((await bound.request(request)).code, 'duplicate_or_conflicting_request');
+  resolve(reply); assert.equal((await pending).outcome, 'ack');
+  assert.equal((await bound.request({ ...request, taskId: 'other' })).outcome, 'unknown');
+  assert.equal(calls, 1);
+  const reused = adapter({ enabled: true, transport: { request: async sent => ({ outcome: 'ack',
+    receipt: { version: 1, receiptId: 'same-receipt', ...sent } }) } });
+  assert.equal((await reused.request(request)).outcome, 'ack');
+  assert.equal((await reused.request({ ...request, key: 'second-key' })).code, 'duplicate_receipt');
+  const thrown = adapter({ enabled: true, transport: { request: async () => { throw new Error('fixture'); } } });
+  assert.equal((await thrown.request(request)).outcome, 'unknown');
+  assert.equal((await thrown.request(request)).code, 'duplicate_or_conflicting_request');
+});
+
+test('T315: missing bound receipt leaves real coordinator leased, never done or retried', async () => {
+  const { createOfflineBoundReceiptAdapter } = await import('./tools/continuation/offline_bound_receipt.mjs');
+  const { co } = boot(); let calls = 0;
+  const bound = createOfflineBoundReceiptAdapter({ enabled: true, transport: { request: async () => {
+    calls += 1; return { outcome: 'ack' }; // legacy shape intentionally insufficient for opt-in contract
+  } } });
+  co.bridge.request = request => bound.request(request);
+  await co.enable(grant()); co.poll(listReply([completion(1)]), T0 + 1000);
+  assert.equal((await co.step(T0 + 2000)).code, 'in_flight');
+  assert.equal(co.status().tasksDone, 0); assert.deepEqual(co.state.used, []);
+  assert.equal(Object.values(co.status().jobs)[0].state, 'leased');
+  assert.equal((await co.step(T0 + 3000)).code, 'in_flight');
+  await co.recover(T0 + 3 * MIN);
+  assert.equal((await co.step(T0 + 3 * MIN)).code, 'unknown_outcome');
+  assert.equal(calls, 1);
+});
+
 test('T262 coordinator invalid clock retains source without any request', async () => {
   const { bridge, co } = boot(); await co.enable(grant()); co.poll(listReply([completion(1)]), T0);
   const before = co.checkpoint(); assert.equal((await co.step(NaN)).code, 'clock_unverified');
