@@ -908,6 +908,52 @@ test('T319: missing historical checkpoint never licenses replay of a stale pre-s
   } finally { await fs.rm(directory, { recursive: true, force: true }); }
 });
 
+test('T320: checksummed ACK under a contradictory job-map key cannot dispatch its event twice', async () => {
+  const fs = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { createCoordinator, restore } = await import('./tools/continuation/coordinator.mjs');
+  const { createOfflineCheckpointStore } = await import('./tools/continuation/offline_checkpoint_store.mjs');
+  const { createOfflineHandoff } = await import('./tools/continuation/offline_handoff.mjs');
+  const directory = await fs.mkdtemp(path.join(tmpdir(), 't320-'));
+  const identity = { sessionId: 'offline-t320', goalId: 'goal-x', goalRevision: 1 };
+  const deps = { sessionId: identity.sessionId, now: () => 100000, tasks: [
+    { id: 'first', scope: 'fixture', title: 'synthetic first' },
+    { id: 'second', scope: 'fixture', title: 'synthetic second' }] };
+  const store = createOfflineCheckpointStore({ directory, identity, enabled: true });
+  let calls = 0;
+  const transport = { request: async request => {
+    calls += 1; return { outcome: 'ack', receipt: { version: 1, receiptId: 'synthetic-' + calls, ...request } };
+  } };
+  try {
+    const seed = createCoordinator({ ...deps, bridge: { request: async () => ({ outcome: 'ack' }) } });
+    await seed.enable({ kind: 'continuation', epoch: 't320', sessionId: identity.sessionId,
+      armedAt: 1000, expiresAt: 200000, maxTasks: 3, scopes: ['fixture'] });
+    seed.poll({ ok: true, armEpoch: 't320', count: 1, truncated: false, candidates: [{
+      runId: 'aa11bb22-cc33-4d44-8e55-ff6677889907', status: 'completed', origin: 'bridge',
+      startedAt: 2, endedAtMs: 3000, postArm: true }] }, 100000);
+    assert.equal((await seed.step(100000)).code, null);
+    const raw = JSON.parse(seed.checkpoint());
+    const [originalKey, job] = Object.entries(raw.store.jobs)[0];
+    assert.equal(job.state, 'acked');
+    delete raw.store.jobs[originalKey];
+    raw.store.jobs['contradictory-index'] = job;
+    raw.state.store = structuredClone(raw.store); // duplicate stores agree, but index contradicts job identity
+    const boundary = createOfflineHandoff({ enabled: true, identity, planDigest: OWN, store, transport });
+    const restored = restore(raw, { ...deps, bridge: boundary.bridge });
+    const checkpoint = restored.checkpoint();
+    // Store computes its real checksum: structural readability is not authenticated provenance.
+    assert.equal((await store.write({ version: 1, ...identity, checkpoint })).code, null);
+    assert.equal((await store.read()).envelope.checkpoint, checkpoint);
+    const before = structuredClone(restored.state);
+    const out = await boundary.step(restored, { goal: goal(), plan: PLAN, tailText: '', at: 100000 });
+    assert.equal(out.code, 'checkpoint_job_identity_invalid');
+    assert.equal(calls, 0);
+    assert.deepEqual(restored.state, before);
+    assert.equal(restored.checkpoint(), checkpoint);
+    assert.equal((await store.read()).envelope.checkpoint, checkpoint);
+  } finally { await fs.rm(directory, { recursive: true, force: true }); }
+});
+
 test('T161-2: no goal is its own answer', () => {
   for (const bad of [null, {}, { id: '' }]) {
     assert.equal(RC.assessRecovery({ goal: bad }).code, 'goal_missing');

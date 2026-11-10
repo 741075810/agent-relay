@@ -1,6 +1,7 @@
 // Explicit offline import only. No runtime entrypoint, coordinator creation or grant changes.
 import { assessRecovery, DECISION } from './round_recovery.mjs';
 import { planDigestOf } from './round_evidence.mjs';
+import { key as eventKey } from './continuation_state.mjs';
 import { createOfflineBoundReceiptAdapter } from './offline_bound_receipt.mjs';
 
 export function createOfflineHandoff({ enabled = false, identity, planDigest, store, transport } = {}) {
@@ -63,6 +64,15 @@ export function createOfflineHandoff({ enabled = false, identity, planDigest, st
           || old.goalRevision !== expected.goalRevision || old.checkpoint !== before) {
           return { code: 'checkpoint_stale_or_mismatched' };
         }
+      }
+      // An acknowledged job under the wrong map key bypasses admit() deduplication.
+      // Check before step can re-admit its mirrored event or overwrite the checkpoint.
+      const jobs = JSON.parse(before).store?.jobs;
+      if (!jobs || typeof jobs !== 'object' || Array.isArray(jobs)
+        || Object.entries(jobs).some(([index, job]) => !job || typeof job !== 'object'
+          || job.key !== index || eventKey(job) !== index
+          || job.sessionId !== expected.sessionId)) {
+        return { code: 'checkpoint_job_identity_invalid' };
       }
       if (co.checkpoint() !== before) return { code: 'checkpoint_changed' };
       active = { co, evidence: { ...evidence, recovery } };
