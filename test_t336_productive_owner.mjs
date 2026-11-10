@@ -52,6 +52,21 @@ test('T336 real git diff and fixed named test establish artifact acceptance, not
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('T336 named-test launch fails closed before subprocesses when SystemRoot is unavailable', { skip: process.platform !== 'win32' }, () => {
+  const original = process.env.SystemRoot;
+  try {
+    for (const value of [undefined, '', ' ', '.', '/relative', '\\relative', 'X:relative', ' ' + original]) {
+      if (value === undefined) delete process.env.SystemRoot;
+      else process.env.SystemRoot = value;
+      // A null baseline would fail in verifyArtifact: this proves the environment guard runs first.
+      assert.throws(() => verifyWithNamedTest(null), { message: 'system_root_unavailable' });
+    }
+  } finally {
+    if (original === undefined) delete process.env.SystemRoot;
+    else process.env.SystemRoot = original;
+  }
+});
+
 test('T336 durable controls and evidence never overwrite an existing campaign', () => {
   const root = mkdtempSync(join(tmpdir(), 't336-state-')), directory = join(root, 'campaign');
   try {

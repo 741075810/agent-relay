@@ -53,10 +53,12 @@ export function verifyArtifact(baseline, { pristine = false } = {}) {
   return { path: MANIFEST.path, head: baseline.head, sha256: sha256(content), exactDiff: true };
 }
 export function verifyWithNamedTest(baseline, timeoutMs = 30000) {
-  const artifact = verifyArtifact(baseline);
   if (process.platform !== 'win32') throw Error('windows_test_required');
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30000) throw Error('test_budget_invalid');
-  const shell = join(process.env.SystemRoot || 'C:\\Windows', 'System32/WindowsPowerShell/v1.0/powershell.exe');
+  const systemRoot = process.env.SystemRoot;
+  if (!systemRoot || systemRoot.trim() !== systemRoot || !/^[a-z]:[\\/]/i.test(systemRoot)) throw Error('system_root_unavailable');
+  const artifact = verifyArtifact(baseline);
+  const shell = join(systemRoot, 'System32/WindowsPowerShell/v1.0/powershell.exe');
   if (!lstatSync(shell).isFile()) throw Error('test_shell_missing');
   const result = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-File', join(baseline.repoRoot, MANIFEST.test)],
     { ...commandOptions(baseline.repoRoot), timeout: timeoutMs, shell: false });
