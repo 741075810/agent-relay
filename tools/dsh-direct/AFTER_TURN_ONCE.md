@@ -80,6 +80,16 @@ Unregister-ScheduledTask -TaskName '<exact name from registration.json>' -Confir
 A timeout is not rejection/cancellation of a prompt already admitted. Preserve all bootstrap evidence;
 no automatic retry, credential change, session creation, consent rearm, extension reload or Host restart.
 
+## Scheduler executable validation
+
+The launcher resolves the shell from the running PowerShell edition: Desktop uses
+`powershell.exe`; Core uses `pwsh.exe`. It verifies the executable exists before creating
+any registration marker. Concatenating `pwsh.exe` to a Desktop `$PSHOME` produces a nonexistent
+action and scheduler error `0x80070002`, before the payload or its cleanup can run.
+Run `test_t331_scheduler_shell.ps1` for temporary-directory selection checks and a real
+default-off child invocation. Fixing source does not change an existing scheduled action;
+never rerun an old registration or erase its markers as an implicit retry.
+
 ## T328 measured limitation
 
 Scheduler service/cmdlets were available, but the existing Direct ledger contained a task still marked

@@ -43,13 +43,15 @@ $others = @(Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" | Where-Ob
 if ($others.Count) { throw 'Existing Direct process owner detected' }
 & $Node (Join-Path $PSScriptRoot 'after_turn_once.mjs') --enable --check-only --plan $Plan
 if ($LASTEXITCODE -ne 0) { throw 'Direct preflight refused; no registration created' }
+. (Join-Path $PSScriptRoot 'scheduler_shell.ps1')
+$shellExecutable = Resolve-SchedulerShell
 # Registration itself is one-shot per plan, even after success removes the scheduler entry.
 $claim = [IO.File]::Open($Plan + '.registered', 'CreateNew', 'Write', 'None'); $claim.Dispose()
 $TaskName = 'DSH-Canary-Once-' + [guid]::NewGuid().ToString('N')
 $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $triggerAt = (Get-Date).AddSeconds(20)
 $arguments = '-NoProfile -NonInteractive -File "' + $PSCommandPath + '" -Enable -Execute -Plan "' + $Plan + '" -TaskName "' + $TaskName + '" -Node "' + $Node + '"'
-$action = New-ScheduledTaskAction -Execute (Join-Path $PSHOME 'pwsh.exe') -Argument $arguments
+$action = New-ScheduledTaskAction -Execute $shellExecutable -Argument $arguments
 $trigger = New-ScheduledTaskTrigger -Once -At $triggerAt
 $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -MultipleInstances IgnoreNew -RestartCount 0
