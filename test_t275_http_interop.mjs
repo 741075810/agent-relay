@@ -214,13 +214,13 @@ test('T275: a 504 does not double-dispatch, does not release the lock, and the r
   assert.equal(slow.status, 504, 'the transport answers 504 instead of waiting forever');
 
   // The first turn is still inside the Host. A second submit with a *different* requestId must not reach it: the
-  // session is locked by a task whose outcome the client never saw.
+  // T337 holds the operation writer before session checks, even after HTTP timed out.
   const parallel = await call(sc.transport, sessionId, 'submit_task',
     { requestId: 't275.504.0002', sessionId: SESSION, prompt: 'second turn' });
   assert.equal(parallel.status, 200);
   const parallelPayload = payload(parallel);
   assert.equal(parallelPayload.ok, false);
-  assert.equal(parallelPayload.code, 'session_busy');
+  assert.equal(parallelPayload.code, 'direct_writer_held');
 
   await sleep(900);
   assert.equal(sc.controller.control.admissions().length, 1, 'exactly one prompt reached the Host');
@@ -288,7 +288,7 @@ test('T275: two concurrent submits with different requestIds admit exactly one p
   assert.equal(results.filter((item) => item.ok === true && item.duplicate !== true).length, 1,
     'one of the two wins the session');
   const lost = results.find((item) => item.ok === false);
-  assert.equal(lost.code, 'session_busy');
+  assert.equal(lost.code, 'direct_writer_held');
   await sleep(400);
   assert.equal(sc.controller.control.admissions().length, 1);
   sc.controller.prompt = realPrompt;
