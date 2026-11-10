@@ -35,6 +35,11 @@ cooperating CLI owners; old DirectServer instances use independent in-memory Tas
 write the entire ledger. `session/writer-held` protects the native storage writer, not exclusive
 ownership among prompt callers. Idle checks are observations, not an atomic admission lease.
 
+T337 adds mandatory operation-scoped `.direct-writer.lock` coordination and snapshot validation to
+updated TaskStore/DirectServer entry points; [DIRECT_WRITER_BOUNDARY.md](DIRECT_WRITER_BOUNDARY.md)
+defines that limited guarantee. It is not a campaign lease, does not upgrade installed/old binaries,
+and does not fence raw Host/Bridge/native callers. The productive CLI remains blocked.
+
 `runPreparedOwner` is an integration library, not a claimed installed lease API. Its trusted embedding
 requires a real `lease.assertHeld({sessionId,stateDir})`, acquired **before constructing** the original
 DirectServer/TaskStore, with enforcement at every ledger write and Host prompt admission. Supplying

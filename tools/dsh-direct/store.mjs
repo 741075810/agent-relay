@@ -10,8 +10,10 @@
 //      `unknown`, not `succeeded`.
 
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { readFileSync, renameSync, openSync, writeFileSync, fsyncSync, closeSync } from 'node:fs';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import path from 'node:path';
+import { acquireWriter } from './writer_lock.mjs';
 
 import { ACTIVE_STATES, CODES, DirectError, TASK_STATES, fail } from './protocol.mjs';
 
@@ -37,6 +39,49 @@ function holdsSession(task) {
 }
 
 export class TaskStore {
+  #writer = new AsyncLocalStorage();
+  #snapshot;
+
+  /** Hold ownership across asynchronous Host admission/collection; never queue or steal. */
+  async withWriter(work) {
+    if (this.#writer.getStore()) fail('direct_writer_reentrant', 'nested Direct writer operation');
+    const lease = acquireWriter(this.stateDir);
+    try {
+      return await this.#writer.run(lease, async () => {
+        this.#assertSnapshot(lease); // stale long-lived instances fail, rather than clobber a newer ledger
+        return await work();
+      });
+    } finally { lease.release(); }
+  }
+
+  assertWriterHeld() {
+    const lease = this.#writer.getStore();
+    if (!lease) fail('direct_writer_required', 'Host admission requires the active Direct writer');
+    this.#assertSnapshot(lease);
+  }
+
+  #diskBytes() {
+    try { return readFileSync(this.path); }
+    catch (e) { if (e.code === 'ENOENT') return null; throw e; }
+  }
+
+  #assertSnapshot(lease) {
+    lease.assertHeld();
+    const current = this.#diskBytes();
+    if (!(current === null && this.#snapshot === null) && !(current && this.#snapshot && current.equals(this.#snapshot))) {
+      lease.preserve();
+      fail('direct_writer_stale', 'ledger changed outside this snapshot; reservation preserved');
+    }
+  }
+
+  #mutate(work) {
+    const inherited = this.#writer.getStore(), lease = inherited || acquireWriter(this.stateDir);
+    const before = structuredClone(this.doc);
+    try { this.#assertSnapshot(lease); return work(lease); }
+    catch (e) { this.doc = before; throw e; }
+    finally { if (!inherited) lease.release(); }
+  }
+
   constructor(stateDir, now = () => Date.now()) {
     this.stateDir = stateDir;
     this.path = path.join(stateDir, STATE_FILE);
@@ -47,9 +92,11 @@ export class TaskStore {
   #load() {
     let raw = null;
     try {
-      raw = readFileSync(this.path, 'utf8');
+      const bytes = readFileSync(this.path);
+      this.#snapshot = bytes;
+      raw = bytes.toString('utf8');
     } catch (err) {
-      if (err && err.code === 'ENOENT') return { version: STATE_VERSION, tasks: [], requestIds: {} };
+      if (err && err.code === 'ENOENT') { this.#snapshot = null; return { version: STATE_VERSION, tasks: [], requestIds: {} }; }
       fail(CODES.state_unreadable, 'the task ledger exists but cannot be read', { path: this.path, reason: String(err && err.code) });
     }
     let parsed = null;
@@ -86,11 +133,20 @@ export class TaskStore {
     return parsed;
   }
 
-  #save() {
-    mkdirSync(this.stateDir, { recursive: true });
-    const tmp = this.path + '.tmp-' + process.pid;
-    writeFileSync(tmp, JSON.stringify(this.doc, null, 2) + '\n', 'utf8');
-    renameSync(tmp, this.path);
+  #save(lease) {
+    const tmp = this.path + '.tmp-' + process.pid + '-' + randomBytes(8).toString('hex');
+    const bytes = Buffer.from(JSON.stringify(this.doc, null, 2) + '\n', 'utf8');
+    try {
+      this.#assertSnapshot(lease);
+      const fd = openSync(tmp, 'wx', 0o600);
+      try { writeFileSync(fd, bytes); fsyncSync(fd); } finally { closeSync(fd); }
+      this.#assertSnapshot(lease);
+      renameSync(tmp, this.path);
+      this.#snapshot = bytes;
+    } catch (e) {
+      lease.preserve(); // leave temp/lock evidence; no automatic rollback over newer/uncertain disk state
+      throw e;
+    }
   }
 
   get tasks() {
@@ -115,7 +171,9 @@ export class TaskStore {
    * `requestId` reuse with a different (sessionId, prompt) is a refusal: it is a different intent wearing the same
    * key, and answering with the old task would lose it.
    */
-  accept({ requestId, sessionId, projectId, prompt }) {
+  accept(input) { return this.#mutate(lease => this.#accept(input, lease)); }
+
+  #accept({ requestId, sessionId, projectId, prompt }, lease) {
     const sha = promptSha(prompt);
     const known = this.byRequestId(requestId);
     if (known) {
@@ -148,21 +206,25 @@ export class TaskStore {
     };
     this.doc.tasks.push(task);
     this.doc.requestIds[requestId] = task.taskId;
-    this.#save();
+    this.#save(lease);
     return { task, duplicate: false };
   }
 
-  stage(taskId, stage, detail) {
+  stage(taskId, stage, detail) { return this.#mutate(lease => this.#stage(taskId, stage, detail, lease)); }
+
+  #stage(taskId, stage, detail, lease) {
     const task = this.find(taskId);
     if (!task) fail(CODES.task_not_found, 'no such task', { taskId });
     const at = this.now();
     task.stages.push({ at, stage, detail: detail === undefined ? null : detail });
     task.updatedAt = at;
-    this.#save();
+    this.#save(lease);
     return task;
   }
 
-  transition(taskId, state, patch = {}) {
+  transition(taskId, state, patch = {}) { return this.#mutate(lease => this.#transition(taskId, state, patch, lease)); }
+
+  #transition(taskId, state, patch, lease) {
     if (!TASK_STATES.includes(state)) fail(CODES.internal, 'unknown task state', { state });
     const task = this.find(taskId);
     if (!task) fail(CODES.task_not_found, 'no such task', { taskId });
@@ -170,7 +232,7 @@ export class TaskStore {
     Object.assign(task, patch);
     task.updatedAt = this.now();
     task.stages.push({ at: task.updatedAt, stage: 'state_' + state, detail: null });
-    this.#save();
+    this.#save(lease);
     return task;
   }
 

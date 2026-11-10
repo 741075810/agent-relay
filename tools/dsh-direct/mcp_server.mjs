@@ -115,6 +115,9 @@ export class DirectServer {
       endpointFile: config.endpointFile || null, tokenFile: config.tokenFile,
       expectKind: config.expectKind, expectProtocol: config.expectProtocol });
     this.store = store || new TaskStore(config.stateDir);
+    if (!(this.store instanceof TaskStore) || path.resolve(this.store.stateDir) !== path.resolve(config.stateDir)) {
+      fail('direct_writer_required', 'DirectServer requires the coordinated TaskStore for its configured state directory');
+    }
     this.worktree = worktree;
   }
 
@@ -131,7 +134,9 @@ export class DirectServer {
       sessions: filtered, counts: { listed: listed.length, bound: allowed.length, returned: filtered.length } };
   }
 
-  async submitTask(args) {
+  async submitTask(args) { return this.store.withWriter(() => this.#submitTask(args)); }
+
+  async #submitTask(args) {
     const input = validateSubmitTask(args);
     // Fail closed on the worktree *before* any Host call: never write over work in progress, and say why.
     let worktree = null;
@@ -171,7 +176,9 @@ export class DirectServer {
    *   2. otherwise re-submit the *same* requestId with the same text (the caller supplies it; this server keeps only
    *      the digest, and the digest must match), which rc.2 acknowledges without inserting a second message.
    */
-  async reconcileTask(args) {
+  async reconcileTask(args) { return this.store.withWriter(() => this.#reconcileTask(args)); }
+
+  async #reconcileTask(args) {
     const taskId = validateTaskId(args);
     const task = this.store.find(taskId);
     if (!task) fail(CODES.task_not_found, 'no such task', { taskId });
@@ -227,6 +234,7 @@ export class DirectServer {
     this.store.stage(task.taskId, reconciling ? 'host_reprompt_sent' : 'host_prompt_sent',
       { sessionId: task.sessionId, requestId: task.requestId });
     let receipt = null;
+    this.store.assertWriterHeld(); // a local fencing failure is not a Host submission error
     try {
       receipt = await this.client.prompt({ sessionId: task.sessionId, text: input.prompt,
         requestId: task.requestId });
@@ -299,7 +307,9 @@ export class DirectServer {
     if (!task) fail(CODES.task_not_found, 'no such task', { taskId });
     // A normal model answer outlives the three immediate polls in submit_task. Subsequent reads must refresh
     // history rather than consulting a permanently running ledger. This path never calls prompt/reconcile.
-    if (task.state === 'running' || isRecoverableUnknown(task)) await this.#collect(taskId);
+    if (task.state === 'running' || isRecoverableUnknown(task)) {
+      await this.store.withWriter(() => this.#collect(taskId));
+    }
     return { ok: true, task: this.#view(this.store.finished(taskId)) };
   }
 
