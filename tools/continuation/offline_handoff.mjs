@@ -53,7 +53,10 @@ export function createOfflineHandoff({ enabled = false, identity, planDigest, st
       if (recovery.code !== DECISION.RESUME_OK) return { code: 'recovery_refused', recovery };
       const before = co.checkpoint();
       const prior = await store.read();
-      if (prior?.code !== 'missing') {
+      // Absence cannot distinguish a new fixture from lost accepted-work history.
+      // Caller must explicitly initialize and verify a known-new offline snapshot first.
+      if (prior?.code === 'missing') return { code: 'checkpoint_missing' };
+      {
         if (prior?.code !== null) return { code: 'checkpoint_unreadable' };
         const old = prior.envelope;
         if (old?.sessionId !== expected.sessionId || old.goalId !== expected.goalId

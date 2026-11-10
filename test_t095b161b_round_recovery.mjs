@@ -804,6 +804,12 @@ test('T316/T317: reusable offline boundary preserves uncertainty across fresh ad
       const disabled = createOfflineHandoff(config);
       assert.equal((await disabled.step(co, input)).code, 'disabled'); assert.equal(calls, 0);
       const before = co.checkpoint();
+      if (!['malformed', 'corrupt-ledger'].includes(mode)) {
+        const initializer = createOfflineCheckpointStore({ directory, identity, enabled: true });
+        const initialEnvelope = { version: 1, ...identity, checkpoint: before };
+        assert.equal((await initializer.write(initialEnvelope)).code, null);
+        assert.deepEqual((await initializer.read()).envelope, initialEnvelope);
+      }
       const out = await boundary.step(co, input);
       assert.equal((await boundary.step(co, input)).code, 'offline_boundary_used');
       const preError = ['malformed', 'corrupt-ledger', 'storage-error', 'write-loss'].includes(mode);
@@ -818,7 +824,7 @@ test('T316/T317: reusable offline boundary preserves uncertainty across fresh ad
         assert.equal((await store.read()).code, 'unsettled_write'); continue;
       }
       if (mode === 'write-loss') {
-        assert.equal((await store.read()).code, 'missing');
+        assert.equal((await store.read()).envelope.checkpoint, before);
         assert.equal((await co.step(now)).code, 'in_flight'); continue;
       }
       assert.equal(co.state.tasksDone, ['clean', 'lost-settlement'].includes(mode) ? 1 : 0);
@@ -843,6 +849,63 @@ test('T316/T317: reusable offline boundary preserves uncertainty across fresh ad
       assert.equal(restartCalls, 0, mode + ': persisted state blocks send with empty adapter latch');
     }
   } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+test('T319: missing historical checkpoint never licenses replay of a stale pre-send snapshot', async () => {
+  const fs = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { createCoordinator, restore } = await import('./tools/continuation/coordinator.mjs');
+  const { createOfflineCheckpointStore } = await import('./tools/continuation/offline_checkpoint_store.mjs');
+  const { createOfflineHandoff } = await import('./tools/continuation/offline_handoff.mjs');
+  const directory = await fs.mkdtemp(path.join(tmpdir(), 't319-'));
+  const identity = { sessionId: 'offline-t319', goalId: 'goal-x', goalRevision: 1 };
+  const deps = { sessionId: identity.sessionId, now: () => 100000,
+    tasks: [{ id: 'next', scope: 'fixture', title: 'synthetic task' }] };
+  const input = { goal: goal(), plan: PLAN, tailText: '', at: 100000 };
+  let calls = 0;
+  const transport = { request: async request => {
+    calls += 1; return { outcome: 'ack', receipt: { version: 1, receiptId: 'synthetic-' + calls, ...request } };
+  } };
+  const store = () => createOfflineCheckpointStore({ directory, identity, enabled: true });
+  const boundary = () => createOfflineHandoff({ enabled: true, identity, planDigest: OWN, store: store(), transport });
+  try {
+    const first = boundary();
+    const co = createCoordinator({ ...deps, bridge: first.bridge });
+    await co.enable({ kind: 'continuation', epoch: 't319', sessionId: identity.sessionId,
+      armedAt: 1000, expiresAt: 200000, maxTasks: 2, scopes: ['fixture'] });
+    co.poll({ ok: true, armEpoch: 't319', count: 1, truncated: false, candidates: [{
+      runId: 'aa11bb22-cc33-4d44-8e55-ff6677889906', status: 'completed', origin: 'bridge',
+      startedAt: 2, endedAtMs: 3000, postArm: true }] }, 100000);
+    const initial = co.checkpoint();
+    // Explicit fixture initialization: known-new directory, exact pre-handoff snapshot.
+    const initialized = { version: 1, ...identity, checkpoint: initial };
+    assert.equal((await store().write(initialized)).code, null);
+    assert.deepEqual((await store().read()).envelope, initialized);
+    const mismatched = boundary();
+    const mismatchedCo = restore(initial, { ...deps, bridge: mismatched.bridge });
+    assert.equal((await mismatched.step(mismatchedCo, { ...input, goal: goal({ id: 'other-goal' }) })).code,
+      'offline_binding_mismatch');
+    const staleBoundary = boundary();
+    const altered = JSON.parse(initial); altered.state.tasksDone = 1;
+    const alteredCo = restore(altered, { ...deps, bridge: staleBoundary.bridge });
+    assert.equal((await staleBoundary.step(alteredCo, input)).code, 'checkpoint_stale_or_mismatched');
+    assert.equal(calls, 0);
+    assert.equal((await first.step(co, input)).code, null);
+    assert.equal(calls, 1);
+    await fs.unlink(path.join(directory, 'checkpoint.json')); // simulate history loss ONLY in fixture
+    const retry = boundary();
+    const stale = restore(initial, { ...deps, bridge: retry.bridge });
+    const before = stale.checkpoint();
+    assert.equal((await retry.step(stale, input)).code, 'checkpoint_missing');
+    assert.equal(calls, 1, 'missing history must not duplicate the accepted handoff');
+    assert.equal(stale.checkpoint(), before);
+    assert.deepEqual(await fs.readdir(directory), []);
+    // An unresolved intent is not fresh initialization either.
+    await fs.writeFile(path.join(directory, 'checkpoint.intent'), 'uncertain');
+    const held = boundary(); const heldCo = restore(initial, { ...deps, bridge: held.bridge });
+    assert.equal((await held.step(heldCo, input)).code, 'checkpoint_unreadable');
+    assert.equal(calls, 1);
+  } finally { await fs.rm(directory, { recursive: true, force: true }); }
 });
 
 test('T161-2: no goal is its own answer', () => {

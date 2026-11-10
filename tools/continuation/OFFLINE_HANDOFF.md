@@ -21,8 +21,17 @@ const result = await boundary.step(existingOfflineCoordinator, { tailText, goal,
 `step` requires the coordinator to already reference this exact bridge. It rejects absent inputs,
 identity/plan mismatch and any non-resume_ok raw-ledger assessment before invoking coordinator.step.
 Filtered records are not an input. Existing store errors block; a stored envelope must match expected
-identity and the coordinator's current checkpoint exactly. Missing store is allowed ONLY for a caller's
-known fresh fixture: this is not authority to reconstruct lost history after an unexplained restart.
+identity and the coordinator's current checkpoint exactly. Missing store ALWAYS returns
+`checkpoint_missing`, before step and before writes. There is no `allowMissing`/freshness boolean.
+
+For an explicitly known-new OFFLINE fixture only, caller creates an isolated directory and its initial
+coordinator, then writes `{version:1, sessionId, goalId, goalRevision, checkpoint:co.checkpoint()}` via
+the enabled isolated store and verifies exact readback BEFORE calling boundary.step. This deliberate
+initialization is the opt-in first-start contract, not inferred freshness. The tests own the synthetic
+session from creation and have no earlier accepted work. After an unexplained restart or lost file,
+do not reinitialize from an old clean snapshot: retain `checkpoint_missing` until authoritative history
+is reconciled. This utility cannot prove remote freshness or prevent a dishonest caller from supplying
+fabricated history. It supplies no generation oracle, auto-bootstrap or production recovery path.
 
 At the transport seam, the boundary verifies the actual checkpoint version/session and leased
 job session/task/epoch/attempt against the captured request. It writes the original assessment inputs,
