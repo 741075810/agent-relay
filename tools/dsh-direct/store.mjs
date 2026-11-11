@@ -172,6 +172,11 @@ export class TaskStore {
 
   #save(lease) {
     const tmp = this.path + '.tmp-' + process.pid + '-' + randomBytes(8).toString('hex');
+    // Name the writer that produced these bytes. Additive and auditable; not a fence, because
+    // a takeover legitimately inherits a document that names its predecessor. Ownership stays
+    // the lock body plus the snapshot comparison below.
+    this.doc.writer = { generation: lease.generation === undefined ? null : lease.generation,
+      pid: process.pid, at: this.now() };
     const bytes = Buffer.from(JSON.stringify(this.doc, null, 2) + '\n', 'utf8');
     try {
       this.#assertSnapshot(lease);

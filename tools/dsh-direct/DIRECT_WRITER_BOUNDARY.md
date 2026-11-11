@@ -15,6 +15,22 @@ automatic crash cleanup**; thus a paused/dead owner never loses its reservation 
 this implementation. Same-process async contexts retain that token; a late callback after release is
 rejected rather than silently reacquiring. A returned promise must cover the entire operation.
 
+T352 adds a per-lease `generation` to the lock record (`version: 2`) and to the ledger it writes
+(`doc.writer = { generation, pid, at }`). The generation names the writer that produced the current
+bytes; it is **evidence, not a fence**, because a legitimate takeover inherits a document that names
+its predecessor. Ownership is still decided by exact lock-body equality. The `writer` record is
+additive: the ledger stays a version 1 document and older readers ignore it.
+
+T352 also changed release. It used to check the body and then unlink by name; between those two
+statements the file could be replaced by an external delete plus another writer's acquire, and the
+unlink would then delete that newer owner's record. Release now renames the file aside atomically,
+compares what it actually took, and when the record is not ours it restores those bytes under the
+lock name (`flag: 'wx'`, so it never clobbers a third record) and refuses with `direct_writer_lost`
+plus `restored`. Residual window, stated exactly: if another writer creates the lock between our
+park and our restore, the restore is skipped and the parked copy is left as `<lock>.release-<owner>`
+evidence. No portable compare-and-delete exists, so this narrows and repairs the damage instead of
+eliminating the race.
+
 A loaded ledger's original bytes must still match before each write. A stale instance returns
 `direct_writer_stale`, preserves the reservation and does not merge or overwrite another snapshot.
 The writer creates an exclusive random temporary file, writes all bytes, fsyncs, rechecks ownership
@@ -53,6 +69,7 @@ coordinated deployment, not a source-only assumption. Do not use the live ledger
 
 ```powershell
 node --test --test-isolation=none --test-concurrency=1 --test-timeout=15000 test_t337_writer_boundary.mjs test_t336_productive_owner.mjs test_t276_task_lifecycle.mjs test_t285_restart_recovery.mjs
+node test_t352_writer_generation.mjs
 ```
 
 The six T337 cases use temporary state, real Node processes and one known task:
@@ -66,6 +83,13 @@ The six T337 cases use temporary state, real Node processes and one known task:
   temp/lock remain, and the next writer is rejected after that handle closes;
 - stale snapshots and replaced lock tokens never overwrite/unlink the newer evidence;
 - an unfenced injected store and a late async writer are rejected.
+
+The eight T352 cases add the replaced-owner path in detail: a lock swapped under a live lease is
+restored byte for byte instead of deleted; legacy (`version: 1`) and malformed bodies are preserved
+verbatim; a stale owner's `stage` is refused with the ledger unchanged and the newer record intact; the
+generation in `doc.writer` changes per lease while the document still validates as version 1; a
+preserved lease neither writes nor releases; and the reservation is present inside the rename and gone
+afterwards.
 
 Host behavior in contention tests is a counting fixture, not a real model request. No canary/productive
 prompt is issued. Existing T336 tests use real temp Git/PowerShell artifact checks, not live acceptance.
