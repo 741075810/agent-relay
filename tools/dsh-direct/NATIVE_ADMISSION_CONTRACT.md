@@ -1,0 +1,112 @@
+# Native admission contract
+
+What a runtime build must implement before `admissionGate()` may report
+`atomic-session-admission-lease` as satisfied, and why prose alone cannot satisfy it.
+
+This document is a contract, not a claim. Nothing here is enabled: `admissionGate()` still
+returns `writer_fencing_unavailable` and `DISPATCH_GATE` still blocks every dispatch. The
+facts below were established against a staged copy of the shipped runtime at compatibility
+baseline `0.2.0-rc.2`; the copies are not committed to this repository (see Publishing in
+`AGENTS.md`), so each fact is stated with the operation that produced it rather than shipped
+as code.
+
+## 1. The decision belongs at the durable inbox commit
+
+A local writer fence is not enough, and neither is a wrapper. The authoritative moment is the
+session's own durable commit of pending input:
+
+```
+ReactLoopInbox.mutate(target, start, deleteCount, inserted, discardRemoved)
+    -> session.append("agent/inbox/spliced", splice)
+```
+
+Every route converges there or bypasses wrappers entirely:
+
+| route | reaches the commit as |
+|---|---|
+| `ReactLoopAgent.followup` (native prompt, Bridge queue) | `inbox.splice(target, Infinity, 0, [message])` |
+| `ReactLoopAgent.steer` / `inject` | the same `send()` call with another target |
+| public `Inbox.append` / `prepend` / `replace` / `splice` | `mutate` directly |
+| the driver's own step drain (`claim`) | `mutate` with `inserted.length === 0` |
+| the loop's tool-context insert | `mutate` from `executeToolCalls` |
+
+Therefore the admission check must run **inside** `mutate`, after the splice is normalised and
+**immediately before** `session.append`, with no `await` in between. A check placed before an
+`await` is a different, weaker decision: content preparation (model capability lookup,
+attachment admission, file-receipt binding) happens asynchronously in the controller, and a
+generation handover can land inside that window.
+
+Refusals are synchronous and typed. The message that fails admission must never reach
+`session.append`, so the event log itself is the evidence that nothing was admitted.
+
+## 2. What a request must carry
+
+An owner generation envelope, immutable per delivery:
+
+| field | meaning |
+|---|---|
+| `requestId` | immutable request identity; a repeat with a different payload is a conflict, not a duplicate |
+| `sessionId` | the session the envelope was issued for |
+| `owner` | the campaign/owner identity holding the generation |
+| `generation` | the owner's generation counter |
+| `epoch` | monotonic admission epoch for this session; the only value the fence compares |
+
+Two rules that are easy to get wrong:
+
+* **An undeclared field does not survive validation.** The generated request codec is a zod
+  object and strips unknown keys even in its strict codec mode, so an envelope that is not
+  declared in the codec is silently dropped before the controller ever sees it. Declaring the
+  field is part of the contract, not a detail.
+* **The route is not the authority.** A native prompt reaches the commit as `followup`, a
+  Bridge delivery as `inject`, and a request envelope is issued for the owner generation, not
+  for a route. Comparing the envelope's provenance against the committing route refuses every
+  genuine native prompt.
+
+## 3. Refusal codes
+
+| code | raised when |
+|---|---|
+| `admission_required` | an inserted message carries no envelope |
+| `admission_unknown_session` | the fence has no generation for this session |
+| `admission_session_mismatch` | the envelope belongs to another session |
+| `admission_owner_mismatch` | the envelope names an owner that does not hold the live generation |
+| `admission_generation_stale` | the envelope's epoch is behind the session's live epoch |
+| `admission_released` | the generation was released without a successor |
+| `admission_epoch_unknown` | the envelope's epoch was never issued |
+
+At the controller boundary the same refusal must stay distinguishable from a busy agent:
+a delivery refused at the commit surfaces as `session/admission-refused` carrying the
+boundary's own code, never as `session/agent-busy`. A legacy request that carries no envelope
+is refused as `session/admission-required`, an envelope issued for another session as
+`session/admission-mismatch`, and a repeated `requestId` bound to a different payload as
+`session/request-id-conflict`.
+
+## 4. Exemptions, by name and reason
+
+* `claim` — the driver draining its own queue removes messages; requiring a lease there would
+  make a session whose campaign ended unreadable.
+* the loop's tool-context insert — formed by the loop mid-step, not delivered by a producer.
+
+Everything else fails closed. An exemption added without a reason in this list is a hole.
+
+## 5. Acceptance observations
+
+A build that claims this contract is accepted only after all four are observed in a new
+process generation:
+
+1. a delivery whose envelope predates a handover is refused with `admission_generation_stale`
+   and produces no `agent/inbox/spliced` event;
+2. a native prompt and a Bridge `followup` under one generation both commit, once each;
+3. a handover during content preparation leaves exactly one event, from the newer generation;
+4. the step drain still drains a session with no live generation.
+
+## 6. Still uncovered after the inbox commit is fenced
+
+* raw `Session.append("agent/inbox/spliced", ...)` issued below the driver — either it
+  participates in the same authority or it is excluded from the admitted producer set;
+* durable replay: if an admitted generation must survive restart as evidence rather than be
+  re-derived, the projection schema needs a version bump;
+* cancellation (`remove`, `clear`, direct removal) — must be classified deliberately instead
+  of inheriting the exemption above;
+* every ledger writer (this engine, the Direct server, the Host bridge) must share one
+  authority before `all-ledger-writers-coordinated` can be reported as satisfied.
