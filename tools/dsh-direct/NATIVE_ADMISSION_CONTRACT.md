@@ -131,6 +131,27 @@ at the journal the message is content without an envelope and is refused. An unm
 lose those inserts. The fix is an identity the authority can verify for internal producers (or a
 separate event type for loop-formed context), which is a contract change.
 
+**Internal producers present a capability, never a flag.** The session module mints an opaque,
+frozen capability through `grantInternalProducer(session, label, generation)`; the registry is
+module-private and keyed by the object itself, so the capability *is* its identity. Four rules make
+the grant unforgeable from the wire rather than merely discouraged:
+
+* it travels **out of band**, as `append(type, data, { internal })`; the options object is never
+  snapshotted into the event, so a writer that only controls `data` — a controller, a Bridge, a
+  plugin replaying JSON — cannot present one;
+* it is bound to **one session**: a capability minted for another journal reads as absent and the
+  ordinary `admission_required` refusal follows, which leaks nothing about the other session;
+* it is bound to **one generation**: after a handover the old capability is refused with
+  `admission_generation_stale`, so a loop abandoned by the previous owner cannot keep writing;
+* a spread, a `structuredClone` or a JSON round-trip of a valid capability is a value the registry
+  has never seen and is refused.
+
+An admitted internal insert records `{owner, generation, epoch, internal: <label>}` in the event, so
+a replay reads which internal producer wrote it and under which generation. The boundary defends
+against an unprivileged *writer*: code that already runs in the same process and can call
+`grantInternalProducer` with the session object is outside it — that is a module-trust question, not
+a wire question, and a build should keep the grant in the session package for exactly that reason.
+
 ## 7. Still uncovered after the inbox commit is fenced
 
 * raw `Session.append("agent/inbox/spliced", ...)` issued below the driver — either it
