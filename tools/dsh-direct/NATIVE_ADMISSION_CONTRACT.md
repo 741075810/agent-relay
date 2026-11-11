@@ -100,7 +100,38 @@ process generation:
 3. a handover during content preparation leaves exactly one event, from the newer generation;
 4. the step drain still drains a session with no live generation.
 
-## 6. Still uncovered after the inbox commit is fenced
+## 6. The journal is the commit every producer shares
+
+A fence in the driver's inbox governs the driver. `Session.append()` governs **every** writer, because
+it is the single durable commit for pending input: the inbox, a plugin, and a direct
+`session.append("agent/inbox/spliced", ...)` all end there, and none of the latter two pass through
+`ReactLoopInbox` at all. A decision taken only in the inbox is a decision any other writer can skip.
+
+Three properties of the journal make it the right place, and all three are observable rather than
+assumed:
+
+* the payload is snapshotted before the event is built, so a policy sees exactly what would be
+  stored, and a refusal throws before the log changes — "nothing committed" is provable from the log
+  alone;
+* the event is deep-frozen, so an admitted `{owner, generation, epoch}` must be recorded *in* the
+  event at append time, not attached afterwards;
+* a field the event schema does not know still survives into the log, so the recorded generation is
+  readable back on replay without a schema change. (Persisting it as *evidence* across a restart is
+  still the replay item in §7.)
+
+The policy must be explicit about what it does not police. Two things are permitted without a lease:
+any event type other than `agent/inbox/spliced` (it has its own contract), and a splice whose
+`inserted` list is empty (a removal cannot introduce content, and blocking it would make a finished
+campaign unreadable). Content insertion is decided by the same authority the inbox consults, over the
+same envelopes, so the two gates cannot disagree — the inbox is only the earlier, cheaper refusal.
+
+**Known conflict to resolve in a build, not by loosening the policy.** The loop inserts tool context
+into its own inbox under a local `driver-context` exemption. That exemption lives only in the inbox;
+at the journal the message is content without an envelope and is refused. An unmodified loop would
+lose those inserts. The fix is an identity the authority can verify for internal producers (or a
+separate event type for loop-formed context), which is a contract change.
+
+## 7. Still uncovered after the inbox commit is fenced
 
 * raw `Session.append("agent/inbox/spliced", ...)` issued below the driver — either it
   participates in the same authority or it is excluded from the admitted producer set;
