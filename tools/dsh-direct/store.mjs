@@ -34,6 +34,29 @@ export function isRecoverableUnknown(task) {
   return task?.state === 'unknown' && task.unknownReason === 'process_restart';
 }
 
+// Version of the durable pre-admission reservation. A row carrying it was written by
+// `accept()` with fsync+rename *before* the first Host prompt, which is what makes the
+// absence of a prompt stage evidence rather than a guess. Rows written before this marker
+// existed can look identical and must stay conservative: for them, silence proves nothing.
+export const RESERVATION_PROTOCOL = 1;
+
+/**
+ * True only when the ledger can prove this request never reached the Host.
+ *
+ * Three facts together, and none of them alone: the row is still `accepted` (no receipt was
+ * recorded), it carries the reservation marker for exactly this prompt digest, and no
+ * `host_prompt_sent`/`host_reprompt_sent` stage exists. The last one is the proof: that
+ * stage is written durably immediately before the only call that can submit a prompt.
+ */
+export function isProvablyUnsent(task) {
+  if (task?.state !== 'accepted' && task?.state !== 'reserved') return false;
+  const reservation = task.reservation;
+  if (!reservation || reservation.protocol !== RESERVATION_PROTOCOL
+    || reservation.promptSha256 !== task.promptSha256) return false;
+  if (!Array.isArray(task.stages)) return false;
+  return !task.stages.some((row) => row?.stage === 'host_prompt_sent' || row?.stage === 'host_reprompt_sent');
+}
+
 function holdsSession(task) {
   return ACTIVE_STATES.includes(task.state) || isRecoverableUnknown(task);
 }
@@ -120,6 +143,20 @@ export class TaskStore {
         recovered += 1;
         continue;
       }
+      // A reservation that provably never reached the Host is not an unknown outcome, and
+      // treating it as one locked the session forever: `unknown` holds the lock and only an
+      // `unsettled` task is reconcilable. `reserved` releases the lock without claiming any
+      // result and without a Host call. It is deliberately not a `TASK_STATES` entry, so no
+      // public transition can manufacture the "provably unsent" state.
+      if (task.state === 'accepted' && isProvablyUnsent(task)) {
+        task.state = 'reserved';
+        task.requiresReconcile = false;
+        task.updatedAt = this.now();
+        task.stages = (task.stages || []).concat([{ at: this.now(), stage: 'recovered_as_reserved',
+          detail: 'durable reservation predates the first prompt; nothing was sent' }]);
+        recovered += 1;
+        continue;
+      }
       if (ACTIVE_STATES.includes(task.state)) {
         task.state = 'unknown';
         task.unknownReason = 'process_restart';
@@ -197,6 +234,8 @@ export class TaskStore {
       promptSha256: sha,
       promptChars: prompt.length,
       state: 'accepted',
+      // Written into the same fsync+rename as the row itself, before any Host call.
+      reservation: { protocol: RESERVATION_PROTOCOL, at, promptSha256: sha },
       stages: [{ at, stage: 'accepted', detail: 'validated against the binding and the Host session list' }],
       createdAt: at,
       updatedAt: at,
@@ -243,6 +282,11 @@ export class TaskStore {
     if (task.state === 'unsettled') {
       fail(CODES.task_unsettled, 'the submission never got an answer; reconcile it with its requestId first', {
         taskId, requestId: task.requestId, stages: task.stages.length });
+    }
+    if (task.state === 'reserved') {
+      // Not a result, and not a duplicate: the prompt was never sent, so nothing exists to collect.
+      fail(CODES.task_not_finished, 'this task is a durable reservation that never reached the Host', {
+        taskId, requestId: task.requestId, state: task.state, stages: task.stages.length });
     }
     if (holdsSession(task)) {
       fail(CODES.task_not_finished, 'the task has not finished', { taskId, state: task.state,

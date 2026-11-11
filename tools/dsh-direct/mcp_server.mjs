@@ -23,7 +23,7 @@ import {
   validateListSessions, validateSubmitTask, validateTaskId,
 } from './protocol.mjs';
 import { HostClient } from './host_client.mjs';
-import { TaskStore, isRecoverableUnknown, promptSha } from './store.mjs';
+import { TaskStore, isProvablyUnsent, isRecoverableUnknown, promptSha } from './store.mjs';
 import { precheckWorktree } from './worktree.mjs';
 
 /** Codes that mean "the Host answered, and the answer was no". Everything else is an unanswered call. */
@@ -165,7 +165,15 @@ export class DirectServer {
     }
     const accepted = this.store.accept({ ...input, projectId: session.cwd });
     if (accepted.duplicate) {
-      return { ok: true, host: this.client.kind, duplicate: true, worktree, task: this.#view(accepted.task) };
+      // A duplicate of a request that provably never reached the Host is not an admission:
+      // nothing was sent, so admitting it now cannot produce a second prompt. Every other
+      // duplicate -- running, succeeded, unsettled, or a row from before the reservation
+      // marker existed -- stays a no-op, because for those a second prompt would be real.
+      if (!isProvablyUnsent(accepted.task)) {
+        return { ok: true, host: this.client.kind, duplicate: true, worktree, task: this.#view(accepted.task) };
+      }
+      this.store.stage(accepted.task.taskId, 'reservation_reused', { requestId: input.requestId });
+      return this.#admit(accepted.task, input, worktree);
     }
     return this.#admit(accepted.task, input, worktree);
   }
