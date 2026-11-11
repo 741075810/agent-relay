@@ -1,6 +1,6 @@
 // One fixed docs-maintenance campaign. No caller-supplied prompts, commands or write paths.
-import { readFileSync, lstatSync, realpathSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { readFileSync, lstatSync, fstatSync, openSync, closeSync, realpathSync } from 'node:fs';
+import { join, resolve, sep, isAbsolute } from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 
@@ -36,17 +36,36 @@ function canonicalPath(value) {
     return null;
   }
 }
-function nominalPath(value) {
-  return fold(resolve(value));
-}
-function regular(root, relative) {
+// A campaign file must be a plain file whose *physical* home is exactly
+// `<physical repository root>/<manifest-relative path>`.
+//
+// Comparing a physical path against a lexical one is what broke run 42995856154: the Windows
+// runner hands its fixture root out in 8.3 form, `realpathSync.native` expanded that component,
+// `resolve()` did not, and one ordinary file inside one clean fixture repository was refused as
+// `non_regular_campaign_file` -- the same message as a symlinked or missing file, for a file that
+// was neither. Both sides are physical here, so every honest spelling of the root (case, 8.3 short
+// name, junction) is accepted, while the leaf keeps its strictness: `lstat` rejects a symlink or a
+// special file, `fstat` re-checks the object that is actually read, and a physical path that is not
+// the root plus the same relative path is a detour or an escape rather than a spelling.
+export function campaignFile(root, relative) {
+  if (typeof relative !== 'string' || relative === '' || isAbsolute(relative)
+    || relative.split(/[\\/]/).includes('..')) throw Error('campaign_path_invalid');
   const file = join(root, relative);
-  // Still "a regular file reached without a detour": a symlink canonicalises to its target,
-  // which is a different path from the one asked for. Only letter case is forgiven.
-  if (!lstatSync(file).isFile() || canonicalPath(file) !== nominalPath(file)) {
-    throw Error('non_regular_campaign_file');
-  }
-  return readFileSync(file, 'utf8');
+  let leaf;
+  try { leaf = lstatSync(file); } catch { throw Error('non_regular_campaign_file'); }
+  if (!leaf.isFile()) throw Error('non_regular_campaign_file');
+  const handle = openSync(file, 'r');
+  try {
+    if (!fstatSync(handle).isFile()) throw Error('non_regular_campaign_file');
+    const physicalRoot = canonicalPath(root);
+    const physicalFile = canonicalPath(file);
+    if (physicalRoot === null || physicalFile === null) throw Error('non_regular_campaign_file');
+    if (physicalFile !== fold(join(physicalRoot, relative))) {
+      throw Error(physicalFile.startsWith(physicalRoot + sep) ? 'campaign_file_detour'
+        : 'outside_repository_root');
+    }
+    return readFileSync(handle, 'utf8');
+  } finally { closeSync(handle); }
 }
 export function expectedDocument(source) {
   if (source.split(MANIFEST.before).length !== 2 || source.includes(MANIFEST.after)) throw Error('baseline_anchor_mismatch');
@@ -62,8 +81,8 @@ export function repositoryBaseline(repoRoot) {
   if (git(root, ['status', '--porcelain=v1', '-z', '--untracked-files=all']) !== '') throw Error('worktree_not_clean');
   const head = git(root, ['rev-parse', 'HEAD']).trim();
   const source = git(root, ['show', head + ':' + MANIFEST.path]);
-  if (regular(root, MANIFEST.path) !== source) throw Error('baseline_worktree_mismatch');
-  const test = regular(root, MANIFEST.test);
+  if (campaignFile(root, MANIFEST.path) !== source) throw Error('baseline_worktree_mismatch');
+  const test = campaignFile(root, MANIFEST.test);
   if (test !== git(root, ['show', head + ':' + MANIFEST.test])) throw Error('test_not_pinned');
   return { repoRoot: root, head, originalSha256: sha256(source), expectedSha256: sha256(expectedDocument(source)),
     testSha256: sha256(test), manifestSha256 };
@@ -75,9 +94,9 @@ export function verifyArtifact(baseline, { pristine = false } = {}) {
   if (sha256(source) !== baseline.originalSha256 || sha256(expectedDocument(source)) !== baseline.expectedSha256) throw Error('baseline_hash_mismatch');
   const status = git(root, ['status', '--porcelain=v1', '-z', '--untracked-files=all']);
   if (status !== (pristine ? '' : ' M ' + MANIFEST.path + '\0')) throw Error('diff_outside_manifest');
-  const content = regular(root, MANIFEST.path);
+  const content = campaignFile(root, MANIFEST.path);
   if (content !== (pristine ? source : expectedDocument(source))) throw Error('artifact_content_mismatch');
-  if (sha256(regular(root, MANIFEST.test)) !== baseline.testSha256) throw Error('named_test_changed');
+  if (sha256(campaignFile(root, MANIFEST.test)) !== baseline.testSha256) throw Error('named_test_changed');
   return { path: MANIFEST.path, head: baseline.head, sha256: sha256(content), exactDiff: true };
 }
 export function verifyWithNamedTest(baseline, timeoutMs = 30000) {
