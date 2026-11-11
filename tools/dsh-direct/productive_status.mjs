@@ -12,6 +12,7 @@
 import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { resumeCampaign } from './productive_resume.mjs';
+import { classifyAdmission } from './admission_view.mjs';
 
 const STATE_VERSION = 1;
 
@@ -41,6 +42,12 @@ function observe(stateDir, requestId) {
   view.observed = { requestId, taskId, state: task.state ?? null,
     requiresReconcile: task.requiresReconcile ?? null, turnId: task.turnId ?? null,
     unknownReason: task.unknownReason ?? null };
+  // The same read-only classification the Direct ledger offers, so the operator sees
+  // "provably never sent" as a distinct fact instead of guessing from `state`.
+  const admission = classifyAdmission(task, { requestId }, 'read');
+  view.admission = { classification: admission.classification, reason: admission.reason,
+    taskId: admission.taskId, state: admission.state, promptAttempted: admission.promptAttempted,
+    terminalEvidence: admission.terminalEvidence };
   return view;
 }
 
@@ -61,5 +68,8 @@ export function campaignStatus({ campaignDir, stateDir = null } = {}) {
   if (!stateDir) return out;
   out.ledger = observe(stateDir, out.blocked?.requestId ?? null);
   if (out.blocked && out.ledger.observed) out.blocked.ledgerState = out.ledger.observed.state;
+  // Reported, never acted on: only PROVEN_UNSENT could ever justify a retry, and even then
+  // this module does not dispatch -- the authority gate is unchanged.
+  if (out.blocked && out.ledger.admission) out.blocked.admission = out.ledger.admission;
   return out;
 }
