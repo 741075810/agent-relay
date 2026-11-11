@@ -88,6 +88,40 @@ jobs:
             exit $code
           }
 
+      # T354: isolate one suite before the aggregate gate runs.
+      #
+      # `gate js suites` is a single step over every `test_*.mjs`, so when one of them fails
+      # the check-run can only say what the gate's own picker extracts -- and run 42982214704
+      # spent a red Windows run publishing four `at node:internal/...` frames. Here the suite
+      # runs alone, with node's raw TAP in the job log: the named subtest, `error:`,
+      # `expected:`/`actual:`, the stack, and the exit code. That answers the one question the
+      # aggregate cannot: does T336 fail by itself on a Windows runner (environment) or only
+      # while the other 141 suites are running (interference)?
+      #
+      # `--test-reporter=tap` is not decoration: Node 24's default reporter is `spec`, which
+      # prints `x name` and indented blocks, and its glyphs are not ASCII -- redirected into a
+      # console with another code page they arrive as mojibake. TAP is the machine-readable
+      # form with `not ok N - <subtest>` and the `error:`/`expected:`/`actual:`/`stack:` block.
+      #
+      # This step decides nothing. It exits 0 whatever the suite does, so the release gate
+      # below remains the only verdict and no check can be skipped because of a diagnostic.
+      - name: T336 isolated, raw TAP
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $lines = @(& node --test --test-reporter=tap --test-timeout=120000 test_t336_productive_owner.mjs 2>&1)
+          $code = $LASTEXITCODE
+          $lines | ForEach-Object { [string]$_ }
+          $failed = @($lines | Where-Object { [string]$_ -match '^\s*not ok \d+' })
+          "T336_ISOLATED_EXIT=$code"
+          "T336_ISOLATED_FAILED_SUBTESTS=$($failed.Count)"
+          if ($code -ne 0) {
+            $named = ($failed | ForEach-Object { ([string]$_).Trim() }) -join '; '
+            if (-not $named) { $named = 'no TAP failure line; see the suite output above' }
+            Write-Output "::warning title=T336 isolated::suite returned $code; $named"
+          }
+          exit 0
+
       # One step, because the point of the gate is that nobody assembles the checks by
       # hand and nobody reads a number out of a log and retypes it.
       #
@@ -156,6 +190,7 @@ jobs:
           test_t095b93_preflight_verdict
           test_release_gate
           test_release_gate_timeout
+          test_t354_workflow_t336_probe
           test_t095b94_tree_kill
           test_t095b95_tree_kill_edges
           test_t095b96_upgrade_drill
