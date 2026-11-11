@@ -643,6 +643,21 @@ HIGH_LINE = re.compile(
     r'^\s*(LEAK|REVIEW|STALE|excused)\s)')
 LOW_LINE = re.compile(r'(Traceback|^\s+File "|^\s+\w+Error|\^)')
 
+# What a node:test failure block says about the mismatch, which neither pattern above
+# matches: the reporter indents `error:`, `expected:`, `actual:` and `code:` under its
+# `not ok` line, and those four lines are the whole diagnosis. Run 42846011947 named
+# `test_t336_productive_owner.mjs` and stopped there, so this pattern is the difference
+# between "a suite failed" and "expected X, got Y".
+SUITE_DETAIL = re.compile(r'^\s*(error|expected|actual|code|failureType|operator):'
+                          r'|^\s*(Expected|Received)\b')
+
+# One failing suite's report: a verdict line, then this many lines of its own output.
+# Bounded because a check run holds eight annotations in total and a suite can print
+# thousands of lines; the point is the diagnosis, not the transcript.
+SUITE_SNIPPET_LINES = 4
+SUITE_REPORT_SUITES = 3
+SUITE_LINE_CHARS = 300
+
 # Annotations are part of the public check-run record, so a machine path must not ride
 # out on one. The negative test that proved this module works printed the operator's
 # own temp directory into an annotation.
@@ -683,16 +698,107 @@ def scrub(text):
     return POSIX_PATH.sub('<path>', text)
 
 
+def explaining_lines(text):
+    """(most telling, supporting) lines of a step's output, in the order printed."""
+    high, low = [], []
+    for line in (text or '').splitlines():
+        stripped = line.rstrip()
+        if not stripped:
+            continue
+        if HIGH_LINE.search(stripped):
+            high.append(stripped)
+        elif LOW_LINE.search(stripped):
+            low.append(stripped)
+    return high, low
+
+
+def suite_lines(part, limit=SUITE_REPORT_SUITES):
+    """What a failing `js suites` part has to say, from the output it already retains.
+
+    `js_suites()` keeps each child's whole output under `suites[]`, but a part's own
+    `output` is only set for single-step parts, so before this every JS failure reached
+    the check-run annotations as a bare suite name -- and job logs, the only other copy,
+    need `actions: read`. Run 42846011947 is exactly that: `gate js suites:
+    test_t336_productive_owner.mjs`, no assertion, no exit code, nothing to act on.
+
+    The verdict line comes from the retained return code rather than from the text,
+    because a suite can fail without printing a summary at all. A suite whose output was
+    lost says so instead of rendering as "nothing failed".
+    """
+    failing = [suite for suite in (part.get('suites') or []) if not suite.get('ok')]
+    if not failing:
+        return []
+    lines = []
+    for suite in failing[:limit]:
+        code = suite.get('returncode')
+        header = '%s: %s, %s' % (
+            suite.get('name'),
+            'exit code %s' % (code if code is not None else 'none'),
+            'timed out after %ss' % suite.get('timeout_seconds') if suite.get('timeout')
+            else 'no timeout')
+        if suite.get('cleanup_note'):
+            header += ', cleanup not guaranteed'
+        lines.append(scrub(header[:SUITE_LINE_CHARS]))
+        text = suite.get('output') or ''
+        high, low = explaining_lines(text)
+        picked = ([str(suite['problem'])] if suite.get('problem') else []) + high
+        carried = high + low
+        for line in text.splitlines():
+            if SUITE_DETAIL.search(line.rstrip()) and line.rstrip() not in carried:
+                picked.append(line.rstrip())
+        if not picked:
+            picked = [line.strip() for line in text.splitlines() if line.strip()]
+            picked = picked[-SUITE_SNIPPET_LINES:]
+        if not picked:
+            picked = ['no output retained for this suite']
+        lines.extend(scrub(line[:SUITE_LINE_CHARS]) for line in picked[:SUITE_SNIPPET_LINES])
+    hidden = len(failing) - len(failing[:limit])
+    if hidden > 0:
+        lines.append('(+%d more failing suite(s), each with its own annotation)'
+                     % hidden)
+    return lines
+
+
 def text_of(part):
     """The output that explains a part.
 
     `hygiene` is itself two steps, and its scan output -- the one that names the rule that
     fired -- lives under `detail`, not `output`. Reading only `output` made the hygiene
     annotation say the word "hygiene" and nothing else.
+
+    `js suites` is an aggregate of one step per file, so it has neither: its explanation
+    is the retained output of the suites that actually failed.
     """
     if part.get('output'):
         return part['output']
+    if part.get('name') == 'js suites':
+        lines = suite_lines(part)
+        if lines:
+            return '\n'.join(lines)
     return (part.get('detail') or {}).get('output') or ''
+
+
+def detail_lines(part, limit=8):
+    """The few lines of a part's output that explain the failure, most telling first."""
+    if part.get('name') == 'install':
+        detail = part.get('detail') or {}
+        return ['installed files: %s; Chrome loaded runtime UNKNOWN'
+                % detail.get('code', 'unchecked')][:limit]
+    if part.get('problem'):
+        return [scrub(str(part['problem']))][:limit]
+    if part.get('name') == 'js suites':
+        # Already ordered by `suite_lines()`: verdict first, then what the suite said.
+        # Re-running the HIGH/LOW picker here would drop `code:`/`error:` and the
+        # "no output retained" line, which are the only things this part has.
+        chosen = suite_lines(part)
+        if chosen:
+            return chosen[:limit]
+    text = text_of(part)
+    high, low = explaining_lines(text)
+    picked = [scrub(line[:300]) for line in (high + low)[:limit]]
+    if picked:
+        return picked
+    return [scrub(line) for line in text.strip().splitlines()[-limit:]]
 
 
 def headline(part):
@@ -711,30 +817,6 @@ def headline(part):
     if name == 'dependencies':
         return name + ': ' + ', '.join(part.get('problems') or ['ok'])
     return name
-
-
-def detail_lines(part, limit=8):
-    """The few lines of a part's output that explain the failure, most telling first."""
-    if part.get('name') == 'install':
-        detail = part.get('detail') or {}
-        return ['installed files: %s; Chrome loaded runtime UNKNOWN'
-                % detail.get('code', 'unchecked')][:limit]
-    if part.get('problem'):
-        return [scrub(str(part['problem']))][:limit]
-    text = text_of(part)
-    high, low = [], []
-    for line in text.splitlines():
-        stripped = line.rstrip()
-        if not stripped:
-            continue
-        if HIGH_LINE.search(stripped):
-            high.append(scrub(stripped[:300]))
-        elif LOW_LINE.search(stripped):
-            low.append(scrub(stripped[:300]))
-    picked = (high + low)[:limit]
-    if picked:
-        return picked
-    return [scrub(line) for line in text.strip().splitlines()[-limit:]]
 
 
 def github_escape(text):

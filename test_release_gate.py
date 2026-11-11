@@ -9,6 +9,7 @@ pushes while reporting, in prose, that it should have been green.
 Each case below builds a small throwaway repository and runs the real gate against it. No
 case touches this repository, the live extension state, or the network.
 """
+import contextlib
 import io
 import json
 import os
@@ -333,6 +334,108 @@ class MissingCompressorTest(unittest.TestCase):
             subprocess.run = original_run
         self.assertIn('22.15', str(caught.exception))
         self.assertIn('zstdCompressSync', str(caught.exception))
+
+
+class FailedSuiteDiagnostics(unittest.TestCase):
+    """A failing JS suite must reach the annotation carrying its own diagnosis.
+
+    Run 42846011947 published exactly `gate js suites: test_t336_productive_owner.mjs` and
+    stopped: `js_suites()` retains every child's output under `suites[]`, but `text_of()`
+    only knew a part's own `output`, so `detail_lines()` returned nothing for the aggregate
+    and the only other copy is a job log that needs `actions: read`. These cases pin the
+    retention, the redaction, and that pass/fail meaning did not move.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.gate = load_gate()
+
+    @staticmethod
+    def part(output='', **overrides):
+        suite = {'name': 'test_zz_simulated_failure.mjs', 'ok': False, 'returncode': 1,
+                 'timeout': False, 'timeout_seconds': 1800, 'output': output}
+        suite.update(overrides)
+        return {'name': 'js suites', 'ok': False, 'failed': [suite['name']],
+                'suites': [suite], 'count': 1, 'assertions': 0, 'timed_out': []}
+
+    def test_the_retained_suite_output_becomes_the_annotation(self):
+        text = ("not ok 2 - simulated failure\n"
+                '  error: |-\n'
+                '    AssertionError: simulated T347 failure\n'
+                "  code: 'ERR_ASSERTION'\n")
+        joined = '\n'.join(self.gate.detail_lines(self.part(text)))
+        self.assertIn('exit code 1', joined)
+        self.assertIn('simulated T347 failure', joined)
+        self.assertIn('ERR_ASSERTION', joined)
+
+    def test_the_verdict_line_is_reported_even_with_no_output(self):
+        joined = '\n'.join(self.gate.detail_lines(self.part()))
+        self.assertIn('test_zz_simulated_failure.mjs: exit code 1, no timeout', joined)
+        # "no output retained" is a different fact from "the suite said nothing".
+        self.assertIn('no output retained', joined)
+
+    def test_a_timed_out_suite_says_so(self):
+        joined = '\n'.join(self.gate.detail_lines(
+            self.part(returncode=None, timeout=True)))
+        self.assertIn('timed out after 1800s', joined)
+
+    def test_a_machine_path_in_the_failure_is_scrubbed(self):
+        two = chr(92)
+        text = 'AssertionError: failed at C:' + two + 'Users' + two + 'operator' + two + 'x.mjs:3\n'
+        joined = '\n'.join(self.gate.detail_lines(self.part(text)))
+        self.assertNotIn('operator', joined)
+        self.assertIn('<path>', joined)
+
+    def test_the_annotation_budget_is_unchanged(self):
+        result = {'ok': False, 'parts': [self.part('not ok 1 - x\n  error: refuse\n')]}
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = self.gate.github_report(result)
+        emitted = [line for line in buffer.getvalue().splitlines()
+                   if line.startswith('::error')]
+        self.assertEqual(code, 1)
+        self.assertLessEqual(len(emitted), 8)
+        self.assertTrue(any('exit code 1' in line for line in emitted), emitted)
+
+    def test_a_passing_aggregate_gains_no_detail(self):
+        part = {'name': 'js suites', 'ok': True, 'failed': [], 'suites': [],
+                'count': 3, 'assertions': 9}
+        self.assertEqual(self.gate.detail_lines(part), [])
+
+
+@unittest.skipUnless(shutil.which('node'), 'node is not installed')
+class FailedSuiteInAFixture(unittest.TestCase):
+    """One real failing suite, in a throwaway directory, through the real gate step."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.gate = load_gate()
+
+    def test_a_real_failing_suite_is_named_with_its_assertion(self):
+        root = tempfile.mkdtemp(prefix='gate-js-')
+        self.addCleanup(shutil.rmtree, root, True)
+        passing = ('import test from "node:test";\n'
+                   'import assert from "node:assert";\n'
+                   'test("ok", () => { assert.equal(1, 1); });\n'
+                   'console.log("RESULT: 1 passed, 0 failed");\n')
+        failing = ('import test from "node:test";\n'
+                   'import assert from "node:assert";\n'
+                   'test("simulated", () =>\n'
+                   '  assert.fail("simulated T347 failure at " + process.cwd()));\n')
+        for name, body in (('test_aa_ok.mjs', passing),
+                           ('test_zz_simulated_failure.mjs', failing)):
+            with open(os.path.join(root, name), 'w', encoding='utf-8') as handle:
+                handle.write(body)
+        part = self.gate.js_suites(root)
+        self.assertFalse(part['ok'])
+        self.assertEqual(part['failed'], ['test_zz_simulated_failure.mjs'])
+        self.assertEqual(part['count'], 2)
+        joined = '\n'.join(self.gate.detail_lines(part))
+        self.assertIn('test_zz_simulated_failure.mjs: exit code 1', joined)
+        self.assertIn('simulated T347 failure', joined)
+        # The fixture's own directory must not ride out on a public annotation.
+        self.assertNotIn(os.path.basename(root), joined)
+        self.assertIn('<path>', joined)
 
 
 if __name__ == '__main__':
