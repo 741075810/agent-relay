@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { MANIFEST, manifestSha256, sha256, repositoryBaseline, verifyArtifact, verifyWithNamedTest, jobPrompt } from './productive_manifest.mjs';
 import { openCampaign } from './productive_state.mjs';
+import { campaignStatus } from './productive_status.mjs';
 import { exactFinished } from './after_turn_once.mjs';
 
 export function admissionGate() {
@@ -159,7 +160,31 @@ export async function runPreparedOwner({ enabled = false, plan, lease, host, cli
   } finally { journal?.close(); }
 }
 
+// `--status` is admissible while the gate is shut; it is what an unattended owner would
+// consult first. Exit 0 means "the journal is coherent and this is where work would
+// resume", never "dispatch is allowed": `dispatchAllowed` is false in every view.
+const READY_CODES = new Set(['ready', 'paused', 'campaign_complete']);
+
+function argument(args, flag) {
+  const index = args.indexOf(flag);
+  return index === -1 ? null : (args[index + 1] ?? null);
+}
+
 export async function main(args = process.argv.slice(2)) {
+  if (args.includes('--status')) {
+    const campaignDir = argument(args, '--status');
+    if (!campaignDir) {
+      console.log(JSON.stringify({ code: 'status_usage', submitted: false, dispatchAllowed: false,
+        usage: '--status <campaignDir> [--state-dir <dir>]' }));
+      process.exitCode = 2; return;
+    }
+    // Read-only: no plan construction, no lease, no client, no campaign creation.
+    const view = campaignStatus({ campaignDir, stateDir: argument(args, '--state-dir') });
+    console.log(JSON.stringify(view));
+    // A blocked or unreadable campaign must not exit like a healthy one.
+    process.exitCode = READY_CODES.has(view.code) ? 0 : 2;
+    return;
+  }
   if (!args.includes('--enable')) { console.log(JSON.stringify({ code: 'disabled', submitted: false })); return; }
   // Safe preflight only: installed components do not provide the required coordination.
   // No credentials/config/plan read, campaign creation, timer, scheduler or DirectServer construction.
