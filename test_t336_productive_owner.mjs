@@ -67,6 +67,27 @@ test('T336 named-test launch fails closed before subprocesses when SystemRoot is
   }
 });
 
+// Run 42992116493 published `Error: repository_root_mismatch` from
+// `productive_manifest.mjs:33` on the Windows runner while the same fixture was green here.
+// The cause was spelling, not location: `realpathSync()` returns the case it was handed and
+// `git rev-parse --show-toplevel` returns the volume's, so one directory was two strings.
+// The strict half of this case matters as much as the forgiving half: a subdirectory is still
+// not the repository root.
+test('T336 a root spelled with another case is the same repository, a subdirectory is not', { skip: process.platform !== 'win32' }, () => {
+  const root = fixture();
+  try {
+    const baseline = repositoryBaseline(root);
+    const recased = root.toUpperCase();
+    assert.notEqual(recased, root, 'the fixture path must contain a letter to recase');
+    const again = repositoryBaseline(recased);
+    assert.equal(again.head, baseline.head);
+    // `repoRoot` is reported as the caller spelled it -- `realpathSync()` does not recase a
+    // path it is handed -- so the same directory is asserted here, not the same string.
+    assert.equal(again.repoRoot.toLowerCase(), baseline.repoRoot.toLowerCase());
+    assert.throws(() => repositoryBaseline(join(root, 'tools')), /repository_root_mismatch/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('T336 durable controls and evidence never overwrite an existing campaign', () => {
   const root = mkdtempSync(join(tmpdir(), 't336-state-')), directory = join(root, 'campaign');
   try {

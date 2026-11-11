@@ -19,9 +19,33 @@ const commandOptions = root => ({ cwd: root, encoding: 'utf8', timeout: 10000, m
 function git(root, args) {
   return execFileSync('git', ['--no-optional-locks', '-c', 'core.fsmonitor=false', ...args], commandOptions(root));
 }
+// Two spellings of one directory must compare equal, and nothing else may.
+//
+// `realpathSync()` keeps the case it was handed, while `git rev-parse --show-toplevel` answers
+// with the volume's own spelling, so `C:` + `USERS` + `TEMP` and `C:` + `Users` + `Temp` were
+// two different strings for one repository: `repository_root_mismatch` from a root that was
+// exactly right. That is what run 42992116493 published from the Windows runner, whose temp
+// path is not spelled the way the disk stores it. `realpathSync.native` is used when present
+// because it also expands an 8.3 short name to the long one, which the same comparison used to
+// reject; folding case is Windows-only, because on POSIX two spellings are two directories.
+const fold = value => (process.platform === 'win32' ? value.toLowerCase() : value);
+function canonicalPath(value) {
+  try {
+    return fold((realpathSync.native ?? realpathSync)(resolve(value)));
+  } catch {
+    return null;
+  }
+}
+function nominalPath(value) {
+  return fold(resolve(value));
+}
 function regular(root, relative) {
   const file = join(root, relative);
-  if (!lstatSync(file).isFile() || realpathSync(file) !== resolve(file)) throw Error('non_regular_campaign_file');
+  // Still "a regular file reached without a detour": a symlink canonicalises to its target,
+  // which is a different path from the one asked for. Only letter case is forgiven.
+  if (!lstatSync(file).isFile() || canonicalPath(file) !== nominalPath(file)) {
+    throw Error('non_regular_campaign_file');
+  }
   return readFileSync(file, 'utf8');
 }
 export function expectedDocument(source) {
@@ -30,7 +54,11 @@ export function expectedDocument(source) {
 }
 export function repositoryBaseline(repoRoot) {
   const root = realpathSync(repoRoot);
-  if (resolve(git(root, ['rev-parse', '--show-toplevel']).trim()) !== root) throw Error('repository_root_mismatch');
+  // Same directory, whichever way it is spelled; a subdirectory or another repository still
+  // canonicalises to something else, which is what this line is for.
+  if (canonicalPath(git(root, ['rev-parse', '--show-toplevel']).trim()) !== canonicalPath(root)) {
+    throw Error('repository_root_mismatch');
+  }
   if (git(root, ['status', '--porcelain=v1', '-z', '--untracked-files=all']) !== '') throw Error('worktree_not_clean');
   const head = git(root, ['rev-parse', 'HEAD']).trim();
   const source = git(root, ['show', head + ':' + MANIFEST.path]);
