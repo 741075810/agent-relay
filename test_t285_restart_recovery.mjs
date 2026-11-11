@@ -59,7 +59,10 @@ test('T285: restarted admitted task reads durable terminal without resending', a
 });
 
 test('T285: unknown retains its session lock and needs exact admission plus terminal', async (t) => {
-  const f = recovery(t, 'accepted');
+  // T350 changed what a pre-prompt row recovers to, so this case must start from a state
+  // where a prompt call really was attempted: `running` in the ledger, which a restart
+  // turns into `unknown`/`process_restart`. The rejected-prompt variant is covered below.
+  const f = recovery(t, 'running');
   assert.equal(f.server.store.activeFor(SID)?.taskId, f.taskId);
   await assert.rejects(f.server.submitTask({ requestId: 't285-other-offline', sessionId: SID, prompt: 'other' }),
     { code: 'session_busy' });
@@ -75,6 +78,19 @@ test('T285: unknown retains its session lock and needs exact admission plus term
   assert.equal((await f.server.getResult({ taskId: f.taskId })).task.state, 'succeeded');
   assert.equal(f.server.store.activeFor(SID), null);
   assert.equal(f.seen.prompts, 0);
+});
+
+test('T285: a reservation that never reached the Host recovers as reserved, not unknown', async (t) => {
+  // T350 made the pre-prompt window provable: `accept()` writes its reservation durably
+  // before `#admit` can call the Host, and `#admit` stages `host_prompt_sent` durably before
+  // that call. A marker without a prompt stage means nothing was submitted, so the session
+  // must be released rather than locked forever behind an unreconcilable `unknown`.
+  const f = recovery(t, 'accepted');
+  assert.equal(f.server.store.find(f.taskId).state, 'reserved');
+  assert.equal(f.server.store.activeFor(SID), null);
+  assert.equal(f.server.getTask({ taskId: f.taskId }).task.state, 'reserved');
+  assert.equal(f.seen.prompts, 0);
+  assert.equal(f.seen.reads, 0);
 });
 
 test('T285: failed read preserves unknown and the next exact aborted terminal settles failure', async (t) => {
