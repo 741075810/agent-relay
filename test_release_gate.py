@@ -402,6 +402,64 @@ class FailedSuiteDiagnostics(unittest.TestCase):
                 'count': 3, 'assertions': 9}
         self.assertEqual(self.gate.detail_lines(part), [])
 
+    def test_an_indented_node_error_beats_the_internal_stack_tail(self):
+        # Exactly the shape run 42982214704 published: a failure thrown from a hook, whose
+        # reporter block is indented, so the column-0 patterns matched nothing and the
+        # annotation became four `at node:internal/...` frames. Paths are assembled from
+        # pieces so this file itself carries no literal drive-letter path.
+        drive, sep = 'C:', chr(92)
+        text = ('x T353 hook throw (0.9781ms)\n'
+                'i tests 1\n'
+                'i fail 1\n'
+                '\n'
+                'x failing tests:\n'
+                '\n'
+                'test at ' + drive + sep + 'work' + sep + 'test_t353_hook.mjs:2:1\n'
+                'x T353 hook throw (0.9781ms)\n'
+                '  Error: hook exploded\n'
+                '      at TestContext.<anonymous> (file:///' + drive + '/work/test_t353_hook.mjs:3:25)\n'
+                '      at TestHook.runInAsyncScope (node:async_hooks:227:14)\n'
+                '      at Test.run (node:internal/test_runner/test:1332:13)\n'
+                '      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3)\n')
+        lines = self.gate.detail_lines(self.part(text))
+        joined = '\n'.join(lines)
+        self.assertIn('hook exploded', joined)
+        self.assertIn('test_t353_hook.mjs:3:25', joined)
+        for line in lines:
+            self.assertNotRegex(line, r'node:(internal|async_hooks)')
+        # The reporter's own bookkeeping must not spend the budget.
+        self.assertNotIn('failing tests:', joined)
+        self.assertNotIn('tests 1', joined)
+
+    def test_the_mismatch_survives_the_annotation_budget(self):
+        drive = 'C:'
+        text = ('x T353 body assertion (1.1ms)\n'
+                'x failing tests:\n'
+                'x T353 body assertion (1.1ms)\n'
+                '  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:\n'
+                '    code: \'ERR_ASSERTION\',\n'
+                '    actual: 1,\n'
+                '    expected: 2,\n'
+                '    operator: \'strictEqual\',\n'
+                '      at TestContext.<anonymous> (file:///' + drive + '/work/test_t353_body.mjs:3:40)\n'
+                '      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3)\n')
+        joined = '\n'.join(self.gate.detail_lines(self.part(text)))
+        self.assertIn('AssertionError', joined)
+        self.assertIn('actual: 1', joined)
+        self.assertIn('expected: 2', joined)
+
+    def test_output_that_is_only_internal_frames_admits_it(self):
+        text = ('    at Test.runHook (node:internal/test_runner/test:1198:20)\n'
+                '    at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3)\n')
+        joined = '\n'.join(self.gate.detail_lines(self.part(text)))
+        self.assertIn('stack frames inside Node only', joined)
+        self.assertNotRegex(joined, r'node:internal')
+
+    def test_reporter_glyphs_do_not_reach_a_public_annotation(self):
+        joined = '\n'.join(self.gate.detail_lines(self.part('x ok line\nError: boom\n')))
+        for glyph in ('\u2716', '\u2139', '\u26a0'):
+            self.assertNotIn(glyph, joined)
+
 
 @unittest.skipUnless(shutil.which('node'), 'node is not installed')
 class FailedSuiteInAFixture(unittest.TestCase):
@@ -436,6 +494,26 @@ class FailedSuiteInAFixture(unittest.TestCase):
         # The fixture's own directory must not ride out on a public annotation.
         self.assertNotIn(os.path.basename(root), joined)
         self.assertIn('<path>', joined)
+
+    def test_a_failure_thrown_from_a_hook_names_the_fixture_line(self):
+        # The run-42982214704 shape, end to end: node prints no `not ok` and indents its
+        # error block, so only a fixture that really fails this way proves the fix.
+        root = tempfile.mkdtemp(prefix='gate-hook-')
+        self.addCleanup(shutil.rmtree, root, True)
+        source = ('import test from "node:test";\n'
+                  'test("hook throw", (t) => {\n'
+                  '  t.after(() => { throw new Error("hook exploded"); });\n'
+                  '});\n')
+        with open(os.path.join(root, 'test_zz_hook_failure.mjs'), 'w', encoding='utf-8') as handle:
+            handle.write(source)
+        part = self.gate.js_suites(root)
+        self.assertFalse(part['ok'])
+        lines = self.gate.detail_lines(part)
+        joined = '\n'.join(lines)
+        self.assertIn('hook exploded', joined)
+        self.assertIn('test_zz_hook_failure.mjs:3', joined)
+        for line in lines:
+            self.assertNotRegex(line, r'node:(internal|async_hooks)')
 
 
 if __name__ == '__main__':

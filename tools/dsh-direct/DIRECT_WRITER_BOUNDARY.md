@@ -91,6 +91,14 @@ generation in `doc.writer` changes per lease while the document still validates 
 preserved lease neither writes nor releases; and the reservation is present inside the rename and gone
 afterwards.
 
+The ninth case covers the park window itself, reproduced with the same `renameSync` the release path
+uses. If the stale owner dies between parking and restoring, the successor's record survives under
+`<lock>.release-<owner>`, the lock name is free again, and the successor fails closed
+(`direct_writer_lost`) instead of writing; a third writer that took the freed name is never unlinked
+and its ledger is never overwritten. That is a cancellation, not a double write. It is also why the
+lock is not claimed to be an atomic fence: what a crash in that window costs is the successor's
+operation, and the record of it is kept.
+
 Host behavior in contention tests is a counting fixture, not a real model request. No canary/productive
 prompt is issued. Existing T336 tests use real temp Git/PowerShell artifact checks, not live acceptance.
 

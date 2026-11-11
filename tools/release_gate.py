@@ -639,9 +639,24 @@ HIGH_LINE = re.compile(
     r'(^FAIL:|^ERROR:|^FAILED \(|AssertionError|^not ok |^# Subtest|^  FAIL |'
     r'ModuleNotFoundError|ImportError|^Error:|^error:|unexplained|ENOENT|EACCES|'
     r'EPERM|^Could not|^cannot |exit code|'
+    # node:test's own reporters indent their failure block: `  Error: …` under a `✖ <name>`
+    # line. Requiring column 0 matched neither, so a failure thrown from a hook reached the
+    # annotation as four `at node:internal/…` frames and nothing else (run 42982214704).
+    r'^\s*Error:|^\s*✖ |'
     # The hygiene scanner's own rows: the rule name that fired is here and nowhere else.
     r'^\s*(LEAK|REVIEW|STALE|excused)\s)')
 LOW_LINE = re.compile(r'(Traceback|^\s+File "|^\s+\w+Error|\^)')
+
+# A stack frame that is inside Node itself says nothing about which fixture broke; a frame
+# pointing at a file of this repository names the throwing line. Distinguish them instead
+# of treating every `at …` line as equal value.
+INTERNAL_FRAME = re.compile(r'^\s*at\s+(?:async\s+)?[^\s(]*\s*\(?node:')
+SOURCE_FRAME = re.compile(r'^\s*at\s+(?:async\s+)?[^\s(]*\s*\(?(?!node:)[^()\s]*:\d+:\d+\)?')
+
+# Reporter bookkeeping that names no test and no failure: counts, the section header, TAP
+# protocol lines. Kept out of the diagnosis so a real assertion can hold the budget.
+SUITE_NOISE = re.compile(r'^[xi✖ℹ✔⚠]\s+(tests|suites|pass|fail|cancelled|skipped|todo|duration_ms)\b'
+                         r'|^[xi✖ℹ]\s+failing tests:$|^(ok|not ok) \d+\s*$|^TAP version')
 
 # What a node:test failure block says about the mismatch, which neither pattern above
 # matches: the reporter indents `error:`, `expected:`, `actual:` and `code:` under its
@@ -674,6 +689,13 @@ POSIX_PATH = re.compile(r'(?<![\w:/])/(?:[\w.@+\-]+/)+[\w.@+\-]*')
 # `-v` puts the reason inside the skip line: `test_x (...) ... skipped 'why'`.
 SKIP_REASON = re.compile(r"skipped '([^']+)'")
 
+# Decoration a reader does not need and a non-UTF-8 console cannot print.
+ANNOTATION_GLYPHS = str.maketrans({'✖': 'x', '✗': 'x', '✔': 'ok', 'ℹ': 'i', '⚠': '!',
+                                   '›': '>', '…': '...', '—': '-', '–': '-'})
+# `…/dir/test_x.mjs:3:25` -> `test_x.mjs:3:25`. Kept whole only when both line and column
+# are present, so a bare drive-letter path is still scrubbed by ABSOLUTE_PATH below.
+FILE_REF = re.compile(r'[^\s()]*[\\/]([^\\/\s():]+):(\d+):(\d+)')
+
 
 def skip_summary(part, keep=3):
     """Why tests were skipped, most frequent first, or None."""
@@ -693,7 +715,15 @@ def scrub(text):
     Drive-letter paths first (that rule also swallows the account segment inside one),
     then an account segment on its own for a path that appears without a drive letter,
     then POSIX paths.
+
+    Reporter decoration is transliterated too: `✖`/`ℹ` carry no meaning a reader needs, and
+    a console whose encoding cannot represent them turns the annotation into a traceback
+    instead of a diagnosis.
     """
+    text = text.translate(ANNOTATION_GLYPHS)
+    # A stack frame's directory is machine-specific; its file and line are the diagnosis.
+    # Scrubbing the whole thing left `file:///<path>` and threw away `test_x.mjs:3:25`.
+    text = FILE_REF.sub(r'\1:\2:\3', text)
     text = USER_SEGMENT.sub(r'\1<user>', ABSOLUTE_PATH.sub('<path>', text))
     return POSIX_PATH.sub('<path>', text)
 
@@ -710,6 +740,18 @@ def explaining_lines(text):
         elif LOW_LINE.search(stripped):
             low.append(stripped)
     return high, low
+
+
+def frame_lines(text, keep=2):
+    """Frames that point into a file of this repository, in the order printed."""
+    picked = []
+    for line in (text or '').splitlines():
+        stripped = line.rstrip()
+        if SOURCE_FRAME.search(stripped) and not INTERNAL_FRAME.search(stripped):
+            picked.append(stripped)
+            if len(picked) == keep:
+                break
+    return picked
 
 
 def suite_lines(part, limit=SUITE_REPORT_SUITES):
@@ -741,16 +783,43 @@ def suite_lines(part, limit=SUITE_REPORT_SUITES):
         lines.append(scrub(header[:SUITE_LINE_CHARS]))
         text = suite.get('output') or ''
         high, low = explaining_lines(text)
-        picked = ([str(suite['problem'])] if suite.get('problem') else []) + high
-        carried = high + low
-        for line in text.splitlines():
-            if SUITE_DETAIL.search(line.rstrip()) and line.rstrip() not in carried:
-                picked.append(line.rstrip())
+        # Priority, not a tail: a section header (`x failing tests:`) or the test's own name
+        # alone answers nothing, and Node's internal frames answer less. The assertion line,
+        # the mismatch, and the frame that points at the suite come first.
+        labels = [line for line in high if not SUITE_NOISE.search(line.strip())]
+        detail = [line for line in high if SUITE_DETAIL.search(line)]
+        extras = [line.rstrip() for line in text.splitlines()
+                  if SUITE_DETAIL.search(line.rstrip())
+                  and line.rstrip() not in high and line.rstrip() not in low]
+        # `actual:`/`expected:` describe the mismatch and beat a stack frame; `code:` names
+        # the error class and beats nothing. Stable sort, so equal ranks stay in print order.
+        def rank(line):
+            match = SUITE_DETAIL.match(line.strip())
+            key = ''
+            if match:
+                key = (match.group(1) or match.group(2) or '').lower()
+            return {'actual': 0, 'received': 0, 'expected': 1, 'error': 2, 'code': 3}.get(key, 4)
+        extras = sorted(extras, key=rank)
+        candidates = ([str(suite['problem'])] if suite.get('problem') else [])
+        picked = []
+        # Deduplicate before the budget is applied: node repeats the test name in its own
+        # failure summary, and spending two of four slots on the same line is what pushed
+        # the assertion out of the annotation.
+        for line in candidates + labels + detail + extras + frame_lines(text, keep=1) + low:
+            if line and line not in picked:
+                picked.append(line)
         if not picked:
-            picked = [line.strip() for line in text.splitlines() if line.strip()]
-            picked = picked[-SUITE_SNIPPET_LINES:]
-        if not picked:
-            picked = ['no output retained for this suite']
+            if not text.strip():
+                picked = ['no output retained for this suite']
+            else:
+                # Last resort only: a tail that is nothing but `node:internal` frames is not
+                # a diagnosis, and printing it as one is how run 42982214704 lost its
+                # assertion.
+                tail = [line.strip() for line in text.splitlines() if line.strip()]
+                tail = [line for line in tail if not INTERNAL_FRAME.search(line)]
+                picked = tail[-SUITE_SNIPPET_LINES:] or [
+                    'stack frames inside Node only; the suite printed no failing assertion '
+                    '(see the job log)']
         lines.extend(scrub(line[:SUITE_LINE_CHARS]) for line in picked[:SUITE_SNIPPET_LINES])
     hidden = len(failing) - len(failing[:limit])
     if hidden > 0:

@@ -7,7 +7,7 @@
 // written.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { acquireWriter } from './tools/dsh-direct/writer_lock.mjs';
@@ -135,4 +135,35 @@ test('T352 the lock is held across the atomic rename and gone afterwards', async
   // A second process-facing acquisition succeeds only after the first lease is released.
   const again = acquireWriter(dir);
   again.release();
+});
+
+// T353: the park window itself. A stale owner's `release()` renames the lock aside and only
+// then compares it, so a successor's record can sit in the parked file while the lock name is
+// free. This reproduces exactly that on-disk state with the same statement the release path
+// uses, and pins what the successors get: the record survives as evidence, the successor whose
+// bytes were taken fails closed rather than writing, and a third writer's lock is never
+// unlinked by anyone.
+test('T352 a crash inside the park window cancels the successor but never writes twice', async t => {
+  const dir = scratch(t);
+  const { store, taskId } = seed(t, dir);
+  const successor = acquireWriter(dir); // B holds the record
+  const parked = lockPath(dir) + '.release-' + successor.owner;
+  renameSync(lockPath(dir), parked); // what a stale A's `renameSync` does before it compares
+  const third = acquireWriter(dir); // the name is free, so a third writer takes it
+  // The successor no longer owns anything on disk, so it refuses instead of writing over C.
+  assert.throws(() => successor.assertHeld(), { code: 'direct_writer_lost' });
+  const ledger = readFileSync(join(dir, 'tasks.json'));
+  // Either refusal is the correct one: the store cannot acquire while C holds the name
+  // (`held`), and the successor cannot write without its own record (`lost`). What matters
+  // is that neither reaches the ledger.
+  assert.throws(() => store.stage(taskId, 'successor_write'),
+    (error) => ['direct_writer_held', 'direct_writer_lost'].includes(error.code));
+  assert.deepEqual(readFileSync(join(dir, 'tasks.json')), ledger, 'no second writer reached the ledger');
+  // The taken record is still on disk, and the third writer's lock was never removed.
+  assert.equal(readFileSync(parked, 'utf8'), JSON.stringify({ version: 2, owner: successor.owner,
+    generation: successor.generation, pid: process.pid }) + '\n');
+  third.assertHeld();
+  assert.equal(JSON.parse(bodyOf(dir)).owner, third.owner);
+  third.release();
+  assert.equal(existsSync(lockPath(dir)), false);
 });
